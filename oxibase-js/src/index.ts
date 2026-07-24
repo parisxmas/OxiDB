@@ -75,7 +75,40 @@ export interface OxibaseAuth {
   resendVerification(email: string): Promise<{ error: string | null }>;
   /** Complete a reset started from an emailed link. */
   resetPassword(token: string, password: string): Promise<{ error: string | null }>;
+  /**
+   * Start a social sign-in. Returns the provider's consent URL and, in a
+   * browser, navigates to it. The provider sends the user back to
+   * `redirectTo`, which must be listed in the project's allowed redirect URLs;
+   * call {@link getSessionFromUrl} on that page to pick the session up.
+   */
+  signInWithOAuth(opts: {
+    provider: OAuthProvider;
+    redirectTo?: string;
+    /** Set false to get the URL back without navigating (default true). */
+    navigate?: boolean;
+  }): { url: string; error: string | null };
+  /**
+   * Sign in with an ID token the app already obtained from the provider —
+   * Google Identity Services in the browser, for instance. No redirect.
+   */
+  signInWithIdToken(opts: { provider: "google"; token: string }): Promise<AuthResult>;
+  /**
+   * Complete a redirect sign-in: read `#access_token`/`#refresh_token` from the
+   * current URL (or `url`), adopt the session, and strip the fragment so the
+   * tokens do not linger in the address bar or history.
+   */
+  getSessionFromUrl(url?: string): AuthResult | null;
+  /** Which sign-in methods this project offers (public; no auth required). */
+  getSettings(): Promise<{
+    password: boolean;
+    providers: OAuthProvider[];
+    googleClientId: string | null;
+    error: string | null;
+  }>;
 }
+
+/** Social identity providers OxiBase can sign end-users in with. */
+export type OAuthProvider = "google" | "github";
 
 export interface SqlResult {
   columns?: string[];
@@ -358,6 +391,85 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     resetPasswordForEmail: (email) => authPost("recover", { email }),
     resendVerification: (email) => authPost("resend", { email }),
     resetPassword: (t, password) => authPost("reset", { token: t, password }),
+
+    signInWithOAuth: ({ provider, redirectTo, navigate = true }) => {
+      if (!authBase) {
+        return { url: "", error: "auth requires the `authUrl` option (the control-plane base)" };
+      }
+      if (!ref) return { url: "", error: "auth requires a project `ref`" };
+      // Default to the current page, which is also the most common allow-list
+      // entry; outside a browser it must be given explicitly.
+      const target = redirectTo ?? (typeof location !== "undefined" ? location.href : "");
+      if (!target) return { url: "", error: "redirectTo is required outside a browser" };
+      const url =
+        authEndpoint(`authorize/${encodeURIComponent(provider)}`) +
+        `?redirect_to=${encodeURIComponent(target)}`;
+      if (navigate && typeof location !== "undefined") location.assign(url);
+      return { url, error: null };
+    },
+
+    signInWithIdToken: async ({ provider, token: credential }) => {
+      if (!authBase) return { error: "auth requires the `authUrl` option (the control-plane base)" };
+      if (!ref) return { error: "auth requires a project `ref`" };
+      let r: Response;
+      try {
+        r = await baseFetch(authEndpoint(`oauth/${encodeURIComponent(provider)}`), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ credential }),
+        });
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : String(e) };
+      }
+      const body = (await r.json().catch(() => null)) as
+        | { user?: { email: string }; token?: string; refresh_token?: string; message?: string }
+        | null;
+      if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
+      token = body.token;
+      refreshToken = body.refresh_token ?? "";
+      realtimeReset();
+      return { user: body.user, token, refreshToken, error: null };
+    },
+
+    getSessionFromUrl: (url) => {
+      const href = url ?? (typeof location !== "undefined" ? location.href : "");
+      const hash = href.slice(href.indexOf("#") + 1);
+      if (!href.includes("#") || !hash) return null;
+      const params = new URLSearchParams(hash);
+      const err = params.get("error");
+      if (err) return { error: err };
+      const access = params.get("access_token");
+      if (!access) return null;
+      token = access;
+      refreshToken = params.get("refresh_token") ?? "";
+      realtimeReset();
+      // Drop the fragment: a session in the address bar ends up in history,
+      // bookmarks and anything the user pastes.
+      if (!url && typeof history !== "undefined" && typeof location !== "undefined") {
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+      return { token, refreshToken, error: null };
+    },
+
+    getSettings: async () => {
+      const empty = { password: true, providers: [] as OAuthProvider[], googleClientId: null };
+      if (!authBase || !ref) return { ...empty, error: "auth requires `authUrl` and a project `ref`" };
+      try {
+        const r = await baseFetch(authEndpoint("settings"));
+        const b = (await r.json().catch(() => null)) as
+          | { password?: boolean; providers?: OAuthProvider[]; google_client_id?: string | null; message?: string }
+          | null;
+        if (!r.ok) return { ...empty, error: b?.message ?? `HTTP ${r.status}` };
+        return {
+          password: b?.password ?? true,
+          providers: b?.providers ?? [],
+          googleClientId: b?.google_client_id ?? null,
+          error: null,
+        };
+      } catch (e) {
+        return { ...empty, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
   };
 
   // ── Realtime (`.subscribe`) ──────────────────────────────────────────────

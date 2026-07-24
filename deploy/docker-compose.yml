@@ -51,7 +51,9 @@ services:
       OXIBASE_UPSTREAM: "data-plane:4444"
       OXIDB_SEAL_KEY: "${OXIDB_SEAL_KEY}"
       OXIDB_PLATFORM_SECRET: "${OXIDB_PLATFORM_SECRET}"
-      OXIDB_PLATFORM_BASE_URL: "${OXIBASE_PUBLIC_URL}"   # for the `url` field in project responses
+      # Public origin — the `url` field in project responses, emailed links, and
+      # the OAuth callback URL each project registers with its provider.
+      OXIDB_PLATFORM_BASE_URL: "${OXIBASE_PUBLIC_URL}"
       OXIDB_PLATFORM_SIGNUP_RATE: "${OXIDB_PLATFORM_SIGNUP_RATE:-5}"
       # Max projects a single developer account may create (default 100).
       OXIDB_PLATFORM_MAX_PROJECTS: "${OXIDB_PLATFORM_MAX_PROJECTS:-100}"

@@ -11,6 +11,7 @@ use oxidb_http::message::{HttpRequest, HttpResponse};
 use serde_json::{Value, json};
 
 use crate::crypto::{self, Claims};
+use crate::oauth;
 use crate::{State, now_secs, resp};
 
 const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
@@ -111,80 +112,33 @@ pub fn config() -> HttpResponse {
     )
 }
 
-struct GoogleIdentity {
-    email: String,
-    sub: String,
-    name: Option<String>,
-}
-
-/// Pure validation of the claims Google returns for an ID token: the audience
-/// must be *our* client ID, the issuer must be Google, and the email must be
-/// verified. Split out from the network fetch so it is unit-testable.
-fn check_google_claims(v: &Value, client_id: &str) -> Result<GoogleIdentity, String> {
-    if v.get("aud").and_then(|x| x.as_str()) != Some(client_id) {
-        return Err("token audience mismatch".into());
-    }
-    let iss = v.get("iss").and_then(|x| x.as_str()).unwrap_or("");
-    if iss != "accounts.google.com" && iss != "https://accounts.google.com" {
-        return Err("unexpected token issuer".into());
-    }
-    let verified = match v.get("email_verified") {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "true",
-        _ => false,
-    };
-    if !verified {
-        return Err("Google email is not verified".into());
-    }
-    let email = v
-        .get("email")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or("no email in Google token")?
-        .to_lowercase();
-    let sub = v
-        .get("sub")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let name = v.get("name").and_then(|x| x.as_str()).map(String::from);
-    Ok(GoogleIdentity { email, sub, name })
-}
-
-/// Verify a Google ID token by asking Google's `tokeninfo` endpoint (Google
-/// checks the RS256 signature + expiry against its rotating keys), then apply
-/// [`check_google_claims`]. Suitable for a developer console's low sign-in
-/// volume; local JWKS verification is the path if this ever needs to scale.
-fn verify_google_credential(credential: &str, client_id: &str) -> Result<GoogleIdentity, String> {
-    let url = format!("https://oauth2.googleapis.com/tokeninfo?id_token={credential}");
-    let body = match ureq::get(&url).call() {
-        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
-        // Google returns 400 for a bad/expired token.
-        Err(ureq::Error::Status(_, _)) => return Err("invalid Google credential".into()),
-        Err(e) => return Err(format!("could not reach Google to verify: {e}")),
-    };
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    check_google_claims(&v, client_id)
-}
-
 /// `POST /platform/v1/auth/google` — developer sign-in with Google. Body:
 /// `{ "credential": "<Google ID token>" }`. Find-or-create by verified email.
 pub fn auth_google(req: &HttpRequest, state: &State) -> HttpResponse {
     let Some(client_id) = google_client_id() else {
-        return resp(501, json!({ "message": "Google sign-in is not configured" }));
+        return resp(
+            501,
+            json!({ "message": "Google sign-in is not configured" }),
+        );
     };
     let body = parse_body(req);
     let Some(credential) = str_field(&body, "credential") else {
-        return resp(400, json!({ "message": "credential (Google ID token) required" }));
+        return resp(
+            400,
+            json!({ "message": "credential (Google ID token) required" }),
+        );
     };
-    let ident = match verify_google_credential(&credential, &client_id) {
+    let ident = match oauth::verify_google_id_token(&credential, &client_id) {
         Ok(i) => i,
         Err(e) => return resp(401, json!({ "message": e })),
     };
 
     // Existing account → sign in. Identity is already proven by Google, so no
     // rate limit on the login path.
-    match state.upstream.find("accounts", &json!({ "email": ident.email })) {
+    match state
+        .upstream
+        .find("accounts", &json!({ "email": ident.email }))
+    {
         Ok(existing) if !existing.is_empty() => {
             return resp(
                 200,
@@ -198,7 +152,10 @@ pub fn auth_google(req: &HttpRequest, state: &State) -> HttpResponse {
     // New account — apply the signup guards (per-IP rate limit, optional invite
     // code, global account ceiling).
     if !signup_allowed(&client_ip(req)) {
-        return resp(429, json!({ "message": "signup rate limit exceeded; slow down" }));
+        return resp(
+            429,
+            json!({ "message": "signup rate limit exceeded; slow down" }),
+        );
     }
     if let Some(code) = signup_code() {
         if str_field(&body, "code").as_deref() != Some(code.as_str()) {
@@ -211,7 +168,7 @@ pub fn auth_google(req: &HttpRequest, state: &State) -> HttpResponse {
     let doc = json!({
         "email": ident.email,
         "provider": "google",
-        "google_sub": ident.sub,
+        "google_sub": ident.subject,
         "name": ident.name,
         "created_at": now_secs(),
     });
@@ -347,7 +304,17 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
     resp(
         200,
         project_view(
-            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md, ms,
+            project_ref,
+            &slug,
+            &name,
+            created_at,
+            key_iat,
+            &priv_scalar,
+            true,
+            mc,
+            mt,
+            md,
+            ms,
         ),
     )
 }
@@ -364,11 +331,17 @@ pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
     let Some(doc) = doc else {
         return resp(404, json!({ "message": "project not found" }));
     };
-    let project_ref = doc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let project_ref = doc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     let Some(pub_b64) = doc.get("pubkey").and_then(|v| v.as_str()) else {
         return resp(200, json!({ "keys": [] }));
     };
-    let Some(pub_point) = base64::engine::general_purpose::STANDARD.decode(pub_b64).ok() else {
+    let Some(pub_point) = base64::engine::general_purpose::STANDARD
+        .decode(pub_b64)
+        .ok()
+    else {
         return resp(500, json!({ "message": "malformed key" }));
     };
     let kid = format!(
@@ -398,7 +371,10 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
     // another's, and a single client can't flood the user table.
     let actor = format!("{project_ref}:{}", client_ip(req));
     if !signup_allowed(&actor) {
-        return resp(429, json!({ "message": "signup rate limit exceeded; slow down" }));
+        return resp(
+            429,
+            json!({ "message": "signup rate limit exceeded; slow down" }),
+        );
     }
     let body = parse_body(req);
     let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
@@ -418,7 +394,10 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
     };
     // Normalize to the canonical ref so a caller using the slug and one using the
     // ref address the same user directory / sessions.
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     // Hard ceiling on a project's user directory (defense in depth over the rate
     // limit) — `OXIDB_PLATFORM_MAX_USERS` per project.
     if state
@@ -427,12 +406,15 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
         .unwrap_or(0)
         >= max_users_per_project()
     {
-        return resp(403, json!({ "message": "user limit reached for this project" }));
+        return resp(
+            403,
+            json!({ "message": "user limit reached for this project" }),
+        );
     }
-    match state
-        .upstream
-        .find("users", &json!({ "project_ref": project_ref, "email": email }))
-    {
+    match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+    ) {
         Ok(u) if !u.is_empty() => {
             return resp(409, json!({ "message": "email already registered" }));
         }
@@ -506,11 +488,14 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
-    let user = match state
-        .upstream
-        .find("users", &json!({ "project_ref": project_ref, "email": email }))
-    {
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+    let user = match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+    ) {
         Ok(mut u) => u.pop(),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
@@ -556,12 +541,15 @@ pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> 
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     let hash = crypto::sha256_hex(refresh.as_bytes());
-    let row = match state
-        .upstream
-        .find("refresh_tokens", &json!({ "project_ref": project_ref, "token_hash": hash }))
-    {
+    let row = match state.upstream.find(
+        "refresh_tokens",
+        &json!({ "project_ref": project_ref, "token_hash": hash }),
+    ) {
         Ok(mut v) => v.pop(),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
@@ -779,7 +767,10 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
     const CEIL: u64 = 10_000_000;
     // Storage is bytes, not a count — allow up to 100 GiB.
     if mc > 100_000 || mt > 100_000 || md > CEIL || ms > 107_374_182_400 {
-        return resp(400, json!({ "message": "limit out of range (0 = unlimited)" }));
+        return resp(
+            400,
+            json!({ "message": "limit out of range (0 = unlimited)" }),
+        );
     }
     let query = json!({ "ref": project_ref });
     let patch = json!({ "$set": { "max_collections": mc, "max_tables": mt, "max_documents": md, "max_storage_bytes": ms } });
@@ -798,7 +789,17 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
     resp(
         200,
         project_view(
-            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md, ms,
+            project_ref,
+            &slug,
+            &name,
+            created_at,
+            key_iat,
+            &priv_scalar,
+            true,
+            mc,
+            mt,
+            md,
+            ms,
         ),
     )
 }
@@ -1024,49 +1025,15 @@ fn login_clear(email: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_google_claims, slugify};
-    use serde_json::json;
-
-    #[test]
-    fn google_claims_accepts_verified_matching_audience() {
-        let v = json!({
-            "aud": "cid.apps.googleusercontent.com",
-            "iss": "https://accounts.google.com",
-            "email": "Dev@Example.com",
-            "email_verified": "true",
-            "sub": "1234567890",
-            "name": "Dev"
-        });
-        let id = check_google_claims(&v, "cid.apps.googleusercontent.com").unwrap();
-        assert_eq!(id.email, "dev@example.com"); // lowercased
-        assert_eq!(id.sub, "1234567890");
-    }
-
-    #[test]
-    fn google_claims_rejects_wrong_audience_unverified_or_bad_issuer() {
-        let base = json!({
-            "aud": "cid.apps.googleusercontent.com",
-            "iss": "https://accounts.google.com",
-            "email": "dev@example.com",
-            "email_verified": true,
-            "sub": "1"
-        });
-        // audience for a different client
-        assert!(check_google_claims(&base, "someone-else").is_err());
-        // unverified email
-        let mut unv = base.clone();
-        unv["email_verified"] = json!(false);
-        assert!(check_google_claims(&unv, "cid.apps.googleusercontent.com").is_err());
-        // forged issuer
-        let mut iss = base.clone();
-        iss["iss"] = json!("evil.example.com");
-        assert!(check_google_claims(&iss, "cid.apps.googleusercontent.com").is_err());
-    }
+    use super::slugify;
 
     #[test]
     fn slugify_basics() {
         assert_eq!(slugify("My Cool App").as_deref(), Some("my-cool-app"));
-        assert_eq!(slugify("  Hello,  World!  ").as_deref(), Some("hello-world"));
+        assert_eq!(
+            slugify("  Hello,  World!  ").as_deref(),
+            Some("hello-world")
+        );
         assert_eq!(slugify("Aa_Bb-Cc.99").as_deref(), Some("aa-bb-cc-99"));
         assert_eq!(slugify("test123").as_deref(), Some("test123"));
         assert_eq!(slugify("---"), None);
@@ -1121,7 +1088,8 @@ pub fn end_user_verify(req: &HttpRequest, state: &State, project_ref: &str) -> H
         .split('&')
         .find_map(|kv| kv.strip_prefix("token="))
         .unwrap_or("");
-    let page = |status: u16, title: &str, detail: &str| HttpResponse {
+    let page = |status: u16, title: &str, detail: &str| {
+        HttpResponse {
         status,
         status_text: if status == 200 { "OK" } else { "Bad Request" },
         content_type: "text/html; charset=utf-8".into(),
@@ -1131,38 +1099,57 @@ pub fn end_user_verify(req: &HttpRequest, state: &State, project_ref: &str) -> H
         )
         .into_bytes(),
         content_length_override: None,
+    }
     };
     if token.is_empty() {
         return page(400, "Missing token", "The verification link is incomplete.");
     }
     let hash = crypto::sha256_hex(token.as_bytes());
-    let user = match state
-        .upstream
-        .find("users", &json!({ "project_ref": project_ref, "verify_hash": hash }))
-    {
+    let user = match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "verify_hash": hash }),
+    ) {
         Ok(mut v) => v.pop(),
         Err(_) => return page(502, "Temporarily unavailable", "Please try again shortly."),
     };
     let Some(user) = user else {
-        return page(400, "Invalid link", "This verification link is unknown or already used.");
+        return page(
+            400,
+            "Invalid link",
+            "This verification link is unknown or already used.",
+        );
     };
     if now_secs() > user.get("verify_exp").and_then(|v| v.as_u64()).unwrap_or(0) {
-        return page(400, "Link expired", "Request a new verification email and try again.");
+        return page(
+            400,
+            "Link expired",
+            "Request a new verification email and try again.",
+        );
     }
-    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or_default();
+    let email = user
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let _ = state.upstream.update(
         "users",
         &json!({ "project_ref": project_ref, "email": email }),
         &json!({ "$set": { "verified": true }, "$unset": { "verify_hash": "", "verify_exp": "" } }),
     );
-    page(200, "Email verified ✓", "Your address is confirmed — you can sign in now.")
+    page(
+        200,
+        "Email verified ✓",
+        "Your address is confirmed — you can sign in now.",
+    )
 }
 
 /// `POST /platform/v1/projects/{ref}/auth/resend` — send a fresh verification
 /// link. Same per-IP rate limit as signup (it sends email on demand).
 pub fn end_user_resend(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
     if state.mailer.is_none() {
-        return resp(501, json!({ "message": "email is not configured on this server" }));
+        return resp(
+            501,
+            json!({ "message": "email is not configured on this server" }),
+        );
     }
     let actor = client_ip(req);
     if !signup_allowed(&actor) {
@@ -1173,12 +1160,23 @@ pub fn end_user_resend(req: &HttpRequest, state: &State, project_ref: &str) -> H
         return resp(400, json!({ "message": "email required" }));
     };
     // Always 200 — never confirm whether an address exists.
-    let neutral = resp(200, json!({ "message": "if that address is registered, a link was sent" }));
-    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else { return neutral };
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let neutral = resp(
+        200,
+        json!({ "message": "if that address is registered, a link was sent" }),
+    );
+    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else {
+        return neutral;
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     let user = state
         .upstream
-        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .find(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+        )
         .ok()
         .and_then(|mut v| v.pop());
     if let Some(user) = user
@@ -1200,7 +1198,10 @@ pub fn end_user_resend(req: &HttpRequest, state: &State, project_ref: &str) -> H
 /// page when the address exists.
 pub fn end_user_recover(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
     if state.mailer.is_none() {
-        return resp(501, json!({ "message": "email is not configured on this server" }));
+        return resp(
+            501,
+            json!({ "message": "email is not configured on this server" }),
+        );
     }
     let actor = client_ip(req);
     if !signup_allowed(&actor) {
@@ -1210,12 +1211,23 @@ pub fn end_user_recover(req: &HttpRequest, state: &State, project_ref: &str) -> 
     let Some(email) = str_field(&body, "email") else {
         return resp(400, json!({ "message": "email required" }));
     };
-    let neutral = resp(200, json!({ "message": "if that address is registered, a reset link was sent" }));
-    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else { return neutral };
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let neutral = resp(
+        200,
+        json!({ "message": "if that address is registered, a reset link was sent" }),
+    );
+    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else {
+        return neutral;
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     let exists = state
         .upstream
-        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .find(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+        )
         .ok()
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -1227,7 +1239,12 @@ pub fn end_user_recover(req: &HttpRequest, state: &State, project_ref: &str) -> 
             &json!({ "$set": { "reset_hash": hash, "reset_exp": exp } }),
         );
         if let Some(mailer) = &state.mailer {
-            let link = format!("{}/reset?ref={}&token={}", public_base(), project_ref, plain);
+            let link = format!(
+                "{}/reset?ref={}&token={}",
+                public_base(),
+                project_ref,
+                plain
+            );
             mailer.send_async(
                 email.clone(),
                 "Reset your password".into(),
@@ -1258,22 +1275,35 @@ pub fn end_user_reset(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
     let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else {
         return resp(404, json!({ "message": "project not found" }));
     };
-    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     let hash = crypto::sha256_hex(token.as_bytes());
-    let user = match state
-        .upstream
-        .find("users", &json!({ "project_ref": project_ref, "reset_hash": hash }))
-    {
+    let user = match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "reset_hash": hash }),
+    ) {
         Ok(mut v) => v.pop(),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let Some(user) = user else {
-        return resp(400, json!({ "message": "invalid or already-used reset link" }));
+        return resp(
+            400,
+            json!({ "message": "invalid or already-used reset link" }),
+        );
     };
     if now_secs() > user.get("reset_exp").and_then(|v| v.as_u64()).unwrap_or(0) {
-        return resp(400, json!({ "message": "reset link expired — request a new one" }));
+        return resp(
+            400,
+            json!({ "message": "reset link expired — request a new one" }),
+        );
     }
-    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let email = user
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let pw_hash = match crypto::hash_password(&password) {
         Ok(h) => h,
         Err(e) => return resp(500, json!({ "message": e })),
@@ -1286,10 +1316,537 @@ pub fn end_user_reset(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         return resp(502, json!({ "message": format!("upstream: {e}") }));
     }
     // A reset invalidates every live session of the account.
-    let _ = state
+    let _ = state.upstream.delete(
+        "refresh_tokens",
+        &json!({ "project_ref": project_ref, "email": email }),
+    );
+    resp(
+        200,
+        json!({ "message": "password updated — you can sign in now" }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-project end-user OAuth (social sign-in)
+//
+// The project's developer registers an OAuth app with the provider and stores
+// its credentials here; the *app's users* then sign in with them. Client
+// secrets are sealed with the seal key, exactly like the project signing key,
+// and are never returned by any endpoint.
+//
+// The callback hands the session to the app by fragment on a **pre-registered**
+// redirect URL: with tokens in the URL, an unchecked `redirect_to` would be a
+// token-exfiltration hole, so `redirect_urls` is mandatory configuration.
+// ---------------------------------------------------------------------------
+
+/// Read a single query parameter (percent-decoded).
+fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    req.query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(prefix.as_str()))
+        .map(urldecode)
+}
+
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn redirect(location: &str) -> HttpResponse {
+    HttpResponse {
+        status: 302,
+        status_text: "Found",
+        content_type: "text/plain; charset=utf-8".into(),
+        headers: vec![
+            ("Location".into(), location.to_string()),
+            // A session is being handed over — never let it sit in a cache.
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: Vec::new(),
+        content_length_override: None,
+    }
+}
+
+/// A project's provider credentials, `(client_id, client_secret)`, unsealed.
+fn provider_credentials(state: &State, pdoc: &Value, provider: &str) -> Option<(String, String)> {
+    let cfg = pdoc.get("oauth")?.get(provider)?;
+    let client_id = cfg.get("client_id")?.as_str()?.to_string();
+    let sealed_b64 = cfg.get("secret_enc")?.as_str()?;
+    let sealed = base64::engine::general_purpose::STANDARD
+        .decode(sealed_b64)
+        .ok()?;
+    let secret = crypto::unseal(&state.seal_key, &sealed)?;
+    Some((client_id, String::from_utf8(secret).ok()?))
+}
+
+/// Just the (public) client id — the Google ID-token path needs no secret.
+fn provider_client_id(pdoc: &Value, provider: &str) -> Option<String> {
+    pdoc.get("oauth")?
+        .get(provider)?
+        .get("client_id")?
+        .as_str()
+        .map(String::from)
+}
+
+fn redirect_urls(pdoc: &Value) -> Vec<String> {
+    pdoc.get("oauth")
+        .and_then(|o| o.get("redirect_urls"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The URL a provider must be configured to call back to. Derived, not stored,
+/// so it can never drift from the route that actually serves it.
+fn callback_url(project_ref: &str, provider: &str) -> String {
+    format!(
+        "{}/platform/v1/projects/{project_ref}/auth/callback/{provider}",
+        public_base()
+    )
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/providers` — owner view of the
+/// provider configuration. Reports whether a secret is set, never its value.
+pub fn auth_providers_get(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let pdoc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let view = |name: &str| {
+        json!({
+            "client_id": provider_client_id(&pdoc, name),
+            "secret_set": provider_credentials(state, &pdoc, name).is_some(),
+            "callback_url": callback_url(project_ref, name),
+        })
+    };
+    resp(
+        200,
+        json!({
+            "google": view("google"),
+            "github": view("github"),
+            "redirect_urls": redirect_urls(&pdoc),
+        }),
+    )
+}
+
+/// `PATCH /platform/v1/projects/{ref}/auth/providers` — configure providers.
+/// Body: `{ "google": {"client_id": "…", "client_secret": "…"},
+///          "github": {…}, "redirect_urls": ["https://app.example.com/*"] }`.
+/// Omitted keys are left alone; an explicit `null` clears a provider.
+pub fn auth_providers_set(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    match owned_project(state, project_ref, &owner) {
+        Ok(Some(_)) => {}
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+    let body = parse_body(req);
+    let mut set = serde_json::Map::new();
+
+    for name in ["google", "github"] {
+        match body.get(name) {
+            None => {}
+            Some(Value::Null) => {
+                set.insert(format!("oauth.{name}"), Value::Null);
+            }
+            Some(cfg) => {
+                let Some(client_id) = str_field(cfg, "client_id") else {
+                    return resp(
+                        400,
+                        json!({ "message": format!("{name}.client_id is required") }),
+                    );
+                };
+                let mut entry = json!({ "client_id": client_id });
+                if let Some(secret) = str_field(cfg, "client_secret") {
+                    entry.as_object_mut().unwrap().insert(
+                        "secret_enc".into(),
+                        json!(b64std(&crypto::seal(&state.seal_key, secret.as_bytes()))),
+                    );
+                }
+                set.insert(format!("oauth.{name}"), entry);
+            }
+        }
+    }
+
+    if let Some(urls) = body.get("redirect_urls") {
+        let Some(list) = urls.as_array() else {
+            return resp(400, json!({ "message": "redirect_urls must be an array" }));
+        };
+        let mut clean = Vec::new();
+        for u in list {
+            let Some(s) = u.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            // Reject entries that could never match, so a typo surfaces here
+            // instead of as a mysterious "redirect not allowed" later.
+            if !oauth::redirect_allowed(&[s.to_string()], &s.replace('*', "x")) {
+                return resp(
+                    400,
+                    json!({ "message": format!("unusable redirect URL: {s} — must be an absolute http(s) URL, and a '*' may only follow a path (https://app.example.com/*)") }),
+                );
+            }
+            clean.push(json!(s));
+        }
+        set.insert("oauth.redirect_urls".into(), Value::Array(clean));
+    }
+
+    if set.is_empty() {
+        return resp(400, json!({ "message": "nothing to update" }));
+    }
+    if let Err(e) = state.upstream.update(
+        "projects",
+        &json!({ "ref": project_ref }),
+        &json!({ "$set": Value::Object(set) }),
+    ) {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    auth_providers_get(req, state, project_ref)
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/settings` — **public**: what an app's
+/// sign-in page needs to render itself. No secrets; the Google client id is
+/// public by design (it ships in the browser for the ID-token flow).
+pub fn auth_settings(state: &State, project_ref: &str) -> HttpResponse {
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let enabled: Vec<&str> = ["google", "github"]
+        .into_iter()
+        .filter(|p| provider_credentials(state, &pdoc, p).is_some())
+        .collect();
+    resp(
+        200,
+        json!({
+            "password": true,
+            "providers": enabled,
+            "google_client_id": provider_client_id(&pdoc, "google"),
+        }),
+    )
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/authorize/{provider}?redirect_to=…`
+/// — start a sign-in: redirect the browser to the provider's consent screen.
+pub fn oauth_authorize(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    provider_name: &str,
+) -> HttpResponse {
+    let Some(p) = oauth::provider(provider_name) else {
+        return resp(404, json!({ "message": "unknown provider" }));
+    };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+    let Some((client_id, _)) = provider_credentials(state, &pdoc, p.name) else {
+        return resp(
+            501,
+            json!({ "message": format!("{} sign-in is not configured for this project", p.name) }),
+        );
+    };
+    let Some(redirect_to) = query_param(req, "redirect_to") else {
+        return resp(400, json!({ "message": "redirect_to is required" }));
+    };
+    if !oauth::redirect_allowed(&redirect_urls(&pdoc), &redirect_to) {
+        // Deliberately not echoed into a redirect: at this point there is no
+        // trusted URL to send the user to.
+        return resp(
+            403,
+            json!({ "message": "redirect_to is not in this project's allowed redirect URLs" }),
+        );
+    }
+    if public_base().is_empty() {
+        return resp(
+            501,
+            json!({ "message": "OXIDB_PLATFORM_BASE_URL must be set for OAuth callbacks" }),
+        );
+    }
+    let state_blob = oauth::sign_state(
+        &state.platform_secret,
+        &oauth::state_payload(project_ref, p.name, &redirect_to, now_secs()),
+    );
+    redirect(&oauth::authorize_url(
+        &p,
+        &client_id,
+        &callback_url(project_ref, p.name),
+        &state_blob,
+    ))
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/callback/{provider}?code=…&state=…`
+/// — the provider sends the user back here. Exchange the code, resolve the
+/// identity, issue a session, bounce to the app.
+pub fn oauth_callback(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    provider_name: &str,
+) -> HttpResponse {
+    let Some(p) = oauth::provider(provider_name) else {
+        return resp(404, json!({ "message": "unknown provider" }));
+    };
+    let Some(state_blob) = query_param(req, "state") else {
+        return resp(400, json!({ "message": "missing state" }));
+    };
+    // The state is verified *before* anything else is trusted — it is what makes
+    // this callback ours rather than an attacker-initiated one, and it carries
+    // the already-validated redirect target.
+    let claims = match oauth::verify_state(&state.platform_secret, &state_blob, now_secs()) {
+        Ok(v) => v,
+        Err(e) => {
+            return resp(
+                400,
+                json!({ "message": format!("invalid sign-in state: {e}") }),
+            );
+        }
+    };
+    let redirect_to = claims
+        .get("redirect_to")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if claims.get("ref").and_then(|v| v.as_str()) != Some(project_ref)
+        || claims.get("provider").and_then(|v| v.as_str()) != Some(p.name)
+    {
+        return resp(
+            400,
+            json!({ "message": "sign-in state does not match this project" }),
+        );
+    }
+
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+    // Re-check the target against the *current* allow-list, not just the one in
+    // force when the flow started: removing a URL from the list has to stop
+    // sessions going there immediately, not ten minutes from now.
+    if !oauth::redirect_allowed(&redirect_urls(&pdoc), &redirect_to) {
+        return resp(
+            403,
+            json!({ "message": "redirect_to is no longer in this project's allowed redirect URLs" }),
+        );
+    }
+
+    // From here, failures go back to the app as `#error=…`: the user is in a
+    // browser mid-flow, not calling an API.
+    let fail = |msg: &str| redirect(&oauth::redirect_with_error(&redirect_to, msg));
+
+    if let Some(err) = query_param(req, "error") {
+        return fail(&err);
+    }
+    let Some(code) = query_param(req, "code") else {
+        return fail("no authorization code returned");
+    };
+    let Some((client_id, client_secret)) = provider_credentials(state, &pdoc, p.name) else {
+        return fail("provider is not configured");
+    };
+    let ident = match oauth::identity_from_code(
+        &p,
+        &client_id,
+        &client_secret,
+        &code,
+        &callback_url(project_ref, p.name),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            // The detail is for the operator; the user gets a generic failure.
+            eprintln!("[oxibase] {} sign-in failed for {project_ref}: {e}", p.name);
+            return fail("sign-in failed");
+        }
+    };
+
+    match oauth_session(req, state, &pdoc, project_ref, &ident) {
+        Ok((access, refresh)) => redirect(&oauth::redirect_with_session(
+            &redirect_to,
+            &access,
+            &refresh,
+            access_expiry_secs(),
+        )),
+        Err(e) => fail(&e),
+    }
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/oauth/google` — sign in with a Google
+/// ID token the app already holds (Google Identity Services in the browser).
+/// Needs only the project's client id, so it works with no client secret.
+pub fn end_user_oauth_google(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let Some(credential) = str_field(&body, "credential") else {
+        return resp(
+            400,
+            json!({ "message": "credential (Google ID token) required" }),
+        );
+    };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+    let Some(client_id) = provider_client_id(&pdoc, "google") else {
+        return resp(
+            501,
+            json!({ "message": "Google sign-in is not configured for this project" }),
+        );
+    };
+    let ident = match oauth::verify_google_id_token(&credential, &client_id) {
+        Ok(i) => i,
+        Err(e) => return resp(401, json!({ "message": e })),
+    };
+    match oauth_session(req, state, &pdoc, project_ref, &ident) {
+        Ok((token, refresh)) => resp(
+            200,
+            json!({ "user": { "email": ident.email }, "token": token, "refresh_token": refresh }),
+        ),
+        Err(e) => resp(403, json!({ "message": e })),
+    }
+}
+
+/// Find-or-create the end user behind a proven identity, then issue a session.
+///
+/// Linking is by **verified email**: an address a provider vouched for belongs
+/// to the same person as the password account with that address, so signing in
+/// with Google after signing up with a password lands in one account instead of
+/// two. That is only safe because unverified provider emails are refused in
+/// `oauth` before they ever reach here.
+fn oauth_session(
+    req: &HttpRequest,
+    state: &State,
+    pdoc: &Value,
+    project_ref: &str,
+    ident: &oauth::Identity,
+) -> Result<(String, String), String> {
+    let query = json!({ "project_ref": project_ref, "email": ident.email });
+    let existing = state
         .upstream
-        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
-    resp(200, json!({ "message": "password updated — you can sign in now" }))
+        .find("users", &query)
+        .map_err(|_| "temporarily unavailable".to_string())?
+        .into_iter()
+        .next();
+
+    match existing {
+        Some(user) => {
+            // Record the identity on first use of a provider, and mark the
+            // account verified — the provider just proved the address.
+            let known = user
+                .get("providers")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .any(|p| p.as_str() == Some(ident.provider.as_str()))
+                })
+                .unwrap_or(false);
+            if !known || user.get("verified").and_then(|v| v.as_bool()) != Some(true) {
+                let mut providers: Vec<Value> = user
+                    .get("providers")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if !known {
+                    providers.push(json!(ident.provider));
+                }
+                let _ = state.upstream.update(
+                    "users",
+                    &query,
+                    &json!({ "$set": {
+                        "providers": providers,
+                        "verified": true,
+                        format!("{}_sub", ident.provider): ident.subject,
+                    }}),
+                );
+            }
+        }
+        None => {
+            // New user — the same guards the password signup path applies.
+            let actor = format!("{project_ref}:{}", client_ip(req));
+            if !signup_allowed(&actor) {
+                return Err("signup rate limit exceeded; slow down".into());
+            }
+            if state
+                .upstream
+                .count("users", &json!({ "project_ref": project_ref }))
+                .unwrap_or(0)
+                >= max_users_per_project()
+            {
+                return Err("user limit reached for this project".into());
+            }
+            let doc = json!({
+                "project_ref": project_ref,
+                "email": ident.email,
+                "name": ident.name,
+                "providers": [ident.provider],
+                format!("{}_sub", ident.provider): ident.subject,
+                // No `pw_hash`: the account has no password until someone runs
+                // the reset flow for it.
+                "verified": true,
+                "created_at": now_secs(),
+            });
+            state
+                .upstream
+                .insert("users", &doc)
+                .map_err(|_| "could not create the user".to_string())?;
+        }
+    }
+
+    issue_session(state, pdoc, project_ref, &ident.email).ok_or("failed to mint token".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,7 +1904,10 @@ fn owned_user<'a>(
     }
     let exists = state
         .upstream
-        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .find(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+        )
         .ok()
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -1359,18 +1919,24 @@ fn owned_user<'a>(
 
 /// `DELETE /platform/v1/projects/{ref}/users/{email}` — remove a user and
 /// their sessions.
-pub fn delete_user(req: &HttpRequest, state: &State, project_ref: &str, email: &str) -> HttpResponse {
+pub fn delete_user(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    email: &str,
+) -> HttpResponse {
     let email = match owned_user(req, state, project_ref, email) {
         Ok(e) => e,
         Err(r) => return r,
     };
-    let _ = state
-        .upstream
-        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
-    match state
-        .upstream
-        .delete("users", &json!({ "project_ref": project_ref, "email": email }))
-    {
+    let _ = state.upstream.delete(
+        "refresh_tokens",
+        &json!({ "project_ref": project_ref, "email": email }),
+    );
+    match state.upstream.delete(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+    ) {
         Ok(_) => resp(200, json!({ "deleted": email })),
         Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
     }
@@ -1409,9 +1975,10 @@ pub fn admin_set_user_password(
     ) {
         return resp(502, json!({ "message": format!("upstream: {e}") }));
     }
-    let _ = state
-        .upstream
-        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
+    let _ = state.upstream.delete(
+        "refresh_tokens",
+        &json!({ "project_ref": project_ref, "email": email }),
+    );
     resp(200, json!({ "message": "password updated" }))
 }
 
@@ -1504,7 +2071,10 @@ pub fn project_types(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
-    let name = doc.get("name").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let name = doc
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
     match crate::typegen::generate(&state.upstream, project_ref, name) {
         Ok(ts) => HttpResponse {
             status: 200,

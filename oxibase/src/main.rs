@@ -20,6 +20,7 @@ mod crypto;
 mod gelf;
 mod handlers;
 mod mail;
+mod oauth;
 mod typegen;
 mod upstream;
 
@@ -142,6 +143,28 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects", r, "auth", "refresh"]) => {
             handlers::end_user_refresh(req, state, r)
         }
+        // Public: what sign-in methods this project offers.
+        ("GET", ["platform", "v1", "projects", r, "auth", "settings"]) => {
+            handlers::auth_settings(state, r)
+        }
+        // Social sign-in — browser redirect flow (Google, GitHub) …
+        ("GET", ["platform", "v1", "projects", r, "auth", "authorize", p]) => {
+            handlers::oauth_authorize(req, state, r, p)
+        }
+        ("GET", ["platform", "v1", "projects", r, "auth", "callback", p]) => {
+            handlers::oauth_callback(req, state, r, p)
+        }
+        // … and the Google ID-token flow for apps that already run GIS.
+        ("POST", ["platform", "v1", "projects", r, "auth", "oauth", "google"]) => {
+            handlers::end_user_oauth_google(req, state, r)
+        }
+        // Owner-only provider configuration.
+        ("GET", ["platform", "v1", "projects", r, "auth", "providers"]) => {
+            handlers::auth_providers_get(req, state, r)
+        }
+        ("PATCH", ["platform", "v1", "projects", r, "auth", "providers"]) => {
+            handlers::auth_providers_set(req, state, r)
+        }
         ("GET", ["platform", "v1", "projects", r, "auth", "verify"]) => {
             handlers::end_user_verify(req, state, r)
         }
@@ -154,12 +177,8 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects", r, "auth", "reset"]) => {
             handlers::end_user_reset(req, state, r)
         }
-        ("GET", ["platform", "v1", "projects", r, "users"]) => {
-            handlers::list_users(req, state, r)
-        }
-        ("GET", ["platform", "v1", "projects", r, "logs"]) => {
-            handlers::project_logs(req, state, r)
-        }
+        ("GET", ["platform", "v1", "projects", r, "users"]) => handlers::list_users(req, state, r),
+        ("GET", ["platform", "v1", "projects", r, "logs"]) => handlers::project_logs(req, state, r),
         ("GET", ["platform", "v1", "projects", r, "types"]) => {
             handlers::project_types(req, state, r)
         }
@@ -206,7 +225,10 @@ pub fn resp(status: u16, body: Value) -> HttpResponse {
         content_length_override: None,
     }
     .with_header("Access-Control-Allow-Origin", "*")
-    .with_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+    .with_header(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PATCH, DELETE, OPTIONS",
+    )
     .with_header(
         "Access-Control-Allow-Headers",
         "Content-Type, Authorization",

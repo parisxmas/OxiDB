@@ -6,6 +6,7 @@ import {
   setProjectUserPassword,
   verifyProjectUser,
 } from "./api.ts";
+import { ProvidersPanel } from "./ProvidersPanel.tsx";
 
 /** Users tab: the project's end users (signup via `oxibase.auth`). */
 export function UsersPanel({ projectRef }: { projectRef: string }) {
@@ -143,6 +144,8 @@ export function UsersPanel({ projectRef }: { projectRef: string }) {
           </table>
         </div>
       )}
+
+      <ProvidersPanel projectRef={projectRef} />
     </div>
   );
 }

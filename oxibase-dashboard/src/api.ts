@@ -112,6 +112,38 @@ export function updateProjectLimits(
   return req<Project>("PATCH", `/projects/${encodeURIComponent(ref)}/limits`, limits);
 }
 
+// ── Social sign-in providers (Users tab) ────────────────────────────────────
+
+export interface ProviderConfig {
+  client_id: string | null;
+  /** Whether a client secret is stored. The value itself is never returned. */
+  secret_set: boolean;
+  /** The URL to register with the provider — derived by the control plane. */
+  callback_url: string;
+}
+
+export interface AuthProviders {
+  google: ProviderConfig;
+  github: ProviderConfig;
+  redirect_urls: string[];
+}
+
+export function getAuthProviders(ref: string): Promise<AuthProviders> {
+  return req<AuthProviders>("GET", `/projects/${encodeURIComponent(ref)}/auth/providers`);
+}
+
+/** Configure providers. Omitted keys are left alone; `null` clears one. */
+export function setAuthProviders(
+  ref: string,
+  patch: {
+    google?: { client_id: string; client_secret?: string } | null;
+    github?: { client_id: string; client_secret?: string } | null;
+    redirect_urls?: string[];
+  },
+): Promise<AuthProviders> {
+  return req<AuthProviders>("PATCH", `/projects/${encodeURIComponent(ref)}/auth/providers`, patch);
+}
+
 // ── End-user management (Users tab) ─────────────────────────────────────────
 
 export interface ProjectUser {

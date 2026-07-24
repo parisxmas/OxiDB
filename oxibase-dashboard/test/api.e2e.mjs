@@ -2,7 +2,10 @@
 // Mirrors src/api.ts's calls (signup -> create -> list -> get -> rotate ->
 // delete) against a running oxibase. Exits 0 on success, 1 on first failure.
 //
-//   OXIBASE_URL=http://127.0.0.1:4460 node test/api.e2e.mjs
+//   OXIBASE_URL=http://127.0.0.1:4460 \
+//   OXIDB_PLATFORM_SECRET=<the control plane's secret> node test/api.e2e.mjs
+
+import { devToken } from "../../oxibase/test/lib.mjs";
 
 const BASE = process.env.OXIBASE_URL || "http://127.0.0.1:4460";
 let token = null;
@@ -34,9 +37,16 @@ const email = `dev${Date.now() % 100000}@example.com`;
 
 console.log("# OxiBase dashboard API contract");
 {
-  const r = await req("POST", "/signup", { email, password: "password1" }, false);
-  ok(r.status === 201 && r.data.token, "signup -> 201 + token");
-  token = r.data.token;
+  // Developer sign-in is Google-only, so the test mints the session token the
+  // control plane would have issued, with the deployment's platform secret.
+  const secret = process.env.OXIDB_PLATFORM_SECRET;
+  if (!secret) {
+    console.error("set OXIDB_PLATFORM_SECRET (the control plane's signing secret)");
+    process.exit(2);
+  }
+  token = devToken(email, secret);
+  const r = await req("GET", "/projects");
+  ok(r.status === 200, "minted developer session is accepted");
 }
 {
   const r = await req("GET", "/projects");

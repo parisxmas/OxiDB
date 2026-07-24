@@ -87,6 +87,33 @@ In the OxiBase dashboard these are the **Collections** and **SQL Tables** tabs.
 - **service_role key** (role `admin`) — server-side only; full read/write,
   bypasses rules. Never ship it to a browser in production.
 
+## End-user auth
+
+Your app's own users sign in against the project. Pass `authUrl` (the control
+plane) to `createClient`, then:
+
+```js
+// email + password
+await oxibase.auth.signUp({ email, password });
+await oxibase.auth.signInWithPassword({ email, password });
+
+// social sign-in — configure the provider in the console's Users tab first
+const { providers } = await oxibase.auth.getSettings();     // ["google", "github"]
+oxibase.auth.signInWithOAuth({ provider: "github", redirectTo: "https://app/callback" });
+
+// on the page the provider sent them back to:
+const session = oxibase.auth.getSessionFromUrl();           // adopts + cleans the URL
+
+// or, with a Google ID token you already hold:
+await oxibase.auth.signInWithIdToken({ provider: "google", token: credential });
+
+oxibase.auth.getSession();   // { token, refreshToken } | null
+oxibase.auth.signOut();      // back to the client's original key
+```
+
+Every `.from()` / `.sql()` call then runs as that user, so security rules see
+their identity. Access tokens refresh automatically on a 401.
+
 ## Example app
 
 [`examples/notes`](examples/notes) — a tiny React app that does full CRUD against

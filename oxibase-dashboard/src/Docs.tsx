@@ -304,6 +304,35 @@ await oxibase.auth.resetPasswordForEmail(email);
 
 // managing users: the console's Users tab lists your project's users,
 // with per-user verify / set-password / delete`}</Code>
+          <p>
+            <strong>Social sign-in</strong> (Google, GitHub) is per project. In the console&apos;s{" "}
+            <em>Users</em> tab, register an OAuth app with the provider, paste its client ID and
+            secret, copy the shown redirect URI into the provider&apos;s settings, and list the URLs
+            your app may be sent back to. Then:
+          </p>
+          <Code title="sign in with a provider">{`// which methods does this project offer? (public — no key needed)
+const { providers } = await oxibase.auth.getSettings();   // e.g. ["github"]
+
+// start the flow: this navigates to the provider's consent screen
+oxibase.auth.signInWithOAuth({
+  provider: "github",
+  redirectTo: "https://app.example.com/callback",  // must be an allowed URL
+});
+
+// …on that page, adopt the session the provider round-trip handed back:
+const session = oxibase.auth.getSessionFromUrl();
+if (session?.error) showMessage(session.error);      // e.g. "access_denied"
+else if (session) showApp();                         // signed in
+
+// already running Google Identity Services? skip the redirect entirely:
+await oxibase.auth.signInWithIdToken({ provider: "google", token: credential });`}</Code>
+          <p className="muted small">
+            The session arrives in the URL <em>fragment</em>, so it never reaches a server log, and{" "}
+            <code>getSessionFromUrl()</code> strips it from the address bar once adopted. A user who
+            signs in with a provider is matched to an existing account by <strong>verified</strong>{" "}
+            email — signing up with a password and later using Google lands in one account, not two.
+            Only addresses the provider says it verified are accepted.
+          </p>
 
           {/* ── 7 ─────────────────────────────────────────────────────────── */}
           <h2 id="rules">7 · Security rules</h2>
