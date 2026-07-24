@@ -49,6 +49,9 @@ export interface AuthResult {
   token?: string;
   /** Long-lived refresh token used to renew the access token without re-login. */
   refreshToken?: string;
+  /** True when the server requires email verification before sign-in — no
+   *  session was started; the user must click the link in their inbox. */
+  verificationRequired?: boolean;
   error: string | null;
 }
 
@@ -67,6 +70,12 @@ export interface OxibaseAuth {
   signOut(): void;
   /** The current session, or `null` when running as the original key. */
   getSession(): { token: string; refreshToken: string } | null;
+  /** Email a password-reset link (always resolves — no user enumeration). */
+  resetPasswordForEmail(email: string): Promise<{ error: string | null }>;
+  /** Re-send the signup verification email. */
+  resendVerification(email: string): Promise<{ error: string | null }>;
+  /** Complete a reset started from an emailed link. */
+  resetPassword(token: string, password: string): Promise<{ error: string | null }>;
 }
 
 export interface SqlResult {
@@ -291,12 +300,41 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       return { error: e instanceof Error ? e.message : String(e) };
     }
     const body = (await r.json().catch(() => null)) as
-      | { user?: { email: string }; token?: string; refresh_token?: string; message?: string }
+      | {
+          user?: { email: string };
+          token?: string;
+          refresh_token?: string;
+          message?: string;
+          verification_required?: boolean;
+        }
       | null;
+    if (r.ok && body?.verification_required) {
+      // Registered, but no session until the emailed link is clicked.
+      return { user: body.user, verificationRequired: true, error: null };
+    }
     if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
     token = body.token; // subsequent .from()/.sql() run as this user
     refreshToken = body.refresh_token ?? "";
     return { user: body.user, token: body.token, refreshToken, error: null };
+  }
+
+  // POST an auth action body; unwrap { message } errors.
+  async function authPost(action: string, payload: unknown): Promise<{ error: string | null }> {
+    if (!authBase) return { error: "auth requires the `authUrl` option (the control-plane base)" };
+    if (!ref) return { error: "auth requires a project `ref`" };
+    let r: Response;
+    try {
+      r = await baseFetch(authEndpoint(action), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+    if (r.ok) return { error: null };
+    const b = (await r.json().catch(() => null)) as { message?: string } | null;
+    return { error: b?.message ?? `HTTP ${r.status}` };
   }
 
   const auth: OxibaseAuth = {
@@ -318,6 +356,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       realtimeReset();
     },
     getSession: () => (refreshToken ? { token, refreshToken } : null),
+    resetPasswordForEmail: (email) => authPost("recover", { email }),
+    resendVerification: (email) => authPost("resend", { email }),
+    resetPassword: (t, password) => authPost("reset", { token: t, password }),
   };
 
   // ── Realtime (`.subscribe`) ──────────────────────────────────────────────

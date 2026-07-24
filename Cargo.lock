@@ -2475,9 +2475,11 @@ dependencies = [
  "p256",
  "rand 0.9.2",
  "rmp-serde",
+ "rustls",
  "serde_json",
  "sha2",
  "ureq",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

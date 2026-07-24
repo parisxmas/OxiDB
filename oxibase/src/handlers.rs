@@ -443,14 +443,38 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
         Ok(h) => h,
         Err(e) => return resp(500, json!({ "message": e })),
     };
-    let doc = json!({
+    // With email configured, new users must verify their address before they
+    // can sign in (the Supabase model). Without SMTP the old immediate-session
+    // behavior is kept.
+    let verify = state.mailer.is_some();
+    let mut doc = json!({
         "project_ref": project_ref,
         "email": email,
         "pw_hash": pw_hash,
         "created_at": now_secs(),
+        "verified": !verify,
     });
+    let mut token_plain = String::new();
+    if verify {
+        let (plain, hash, exp) = one_time_token(24 * 3600);
+        token_plain = plain;
+        let obj = doc.as_object_mut().unwrap();
+        obj.insert("verify_hash".into(), json!(hash));
+        obj.insert("verify_exp".into(), json!(exp));
+    }
     if let Err(e) = state.upstream.insert("users", &doc) {
         return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    if verify {
+        send_verification_email(state, project_ref, &email, &token_plain);
+        return resp(
+            201,
+            json!({
+                "user": { "email": email },
+                "verification_required": true,
+                "message": "check your inbox — a verification link was sent"
+            }),
+        );
     }
     match issue_session(state, &pdoc, project_ref, &email) {
         Some((token, refresh)) => resp(
@@ -499,6 +523,19 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         return resp(401, json!({ "message": "invalid credentials" }));
     }
     login_clear(&lock_key);
+    // Rows without a `verified` field predate email verification — treated as
+    // verified (grandfathered).
+    let unverified = user
+        .as_ref()
+        .and_then(|u| u.get("verified"))
+        .and_then(|v| v.as_bool())
+        == Some(false);
+    if unverified {
+        return resp(
+            403,
+            json!({ "message": "email not verified — check your inbox (or request a new link via /auth/resend)" }),
+        );
+    }
     match issue_session(state, &pdoc, project_ref, &email) {
         Some((token, refresh)) => resp(200, json!({ "token": token, "refresh_token": refresh })),
         None => resp(500, json!({ "message": "failed to mint token" })),
@@ -1035,5 +1072,367 @@ mod tests {
         assert_eq!(slugify("---"), None);
         assert_eq!(slugify(""), None);
         assert_eq!(slugify("日本語"), None); // no ascii alphanumerics → nothing usable
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email verification + password reset (SMTP via the deployment's mail server)
+// ---------------------------------------------------------------------------
+
+/// A one-time token: `(plaintext, sha256-hex, expiry)`. Only the hash is
+/// stored, so a metadata-store leak never exposes usable links.
+fn one_time_token(ttl_secs: u64) -> (String, String, u64) {
+    let bytes: [u8; 32] = rand::random();
+    let plain: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hash = crypto::sha256_hex(plain.as_bytes());
+    (plain, hash, now_secs() + ttl_secs)
+}
+
+/// The public origin links are built on (`OXIDB_PLATFORM_BASE_URL`).
+fn public_base() -> String {
+    std::env::var("OXIDB_PLATFORM_BASE_URL")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn send_verification_email(state: &State, project_ref: &str, email: &str, token: &str) {
+    let Some(mailer) = &state.mailer else { return };
+    let link = format!(
+        "{}/platform/v1/projects/{}/auth/verify?token={}",
+        public_base(),
+        project_ref,
+        token
+    );
+    mailer.send_async(
+        email.to_string(),
+        "Verify your email address".into(),
+        format!(
+            "Welcome!\n\nConfirm this address to activate your account:\n\n  {link}\n\nThe link is valid for 24 hours. If you didn't sign up, ignore this message.\n"
+        ),
+    );
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/verify?token=…` — the link from the
+/// verification email. Responds with a small human-readable HTML page.
+pub fn end_user_verify(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let token = req
+        .query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("token="))
+        .unwrap_or("");
+    let page = |status: u16, title: &str, detail: &str| HttpResponse {
+        status,
+        status_text: if status == 200 { "OK" } else { "Bad Request" },
+        content_type: "text/html; charset=utf-8".into(),
+        headers: Vec::new(),
+        body: format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title><body style=\"font-family:system-ui;display:grid;place-items:center;min-height:90vh\"><div style=\"text-align:center\"><h2>{title}</h2><p>{detail}</p></div>"
+        )
+        .into_bytes(),
+        content_length_override: None,
+    };
+    if token.is_empty() {
+        return page(400, "Missing token", "The verification link is incomplete.");
+    }
+    let hash = crypto::sha256_hex(token.as_bytes());
+    let user = match state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "verify_hash": hash }))
+    {
+        Ok(mut v) => v.pop(),
+        Err(_) => return page(502, "Temporarily unavailable", "Please try again shortly."),
+    };
+    let Some(user) = user else {
+        return page(400, "Invalid link", "This verification link is unknown or already used.");
+    };
+    if now_secs() > user.get("verify_exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+        return page(400, "Link expired", "Request a new verification email and try again.");
+    }
+    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or_default();
+    let _ = state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$set": { "verified": true }, "$unset": { "verify_hash": "", "verify_exp": "" } }),
+    );
+    page(200, "Email verified ✓", "Your address is confirmed — you can sign in now.")
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/resend` — send a fresh verification
+/// link. Same per-IP rate limit as signup (it sends email on demand).
+pub fn end_user_resend(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    if state.mailer.is_none() {
+        return resp(501, json!({ "message": "email is not configured on this server" }));
+    }
+    let actor = client_ip(req);
+    if !signup_allowed(&actor) {
+        return resp(429, json!({ "message": "rate limit exceeded; slow down" }));
+    }
+    let body = parse_body(req);
+    let Some(email) = str_field(&body, "email") else {
+        return resp(400, json!({ "message": "email required" }));
+    };
+    // Always 200 — never confirm whether an address exists.
+    let neutral = resp(200, json!({ "message": "if that address is registered, a link was sent" }));
+    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else { return neutral };
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let user = state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .ok()
+        .and_then(|mut v| v.pop());
+    if let Some(user) = user
+        && user.get("verified").and_then(|v| v.as_bool()) == Some(false)
+    {
+        let (plain, hash, exp) = one_time_token(24 * 3600);
+        let _ = state.upstream.update(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+            &json!({ "$set": { "verify_hash": hash, "verify_exp": exp } }),
+        );
+        send_verification_email(state, project_ref, &email, &plain);
+    }
+    neutral
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/recover` — start a password reset.
+/// Always 200 (no user enumeration); sends a link to the dashboard's reset
+/// page when the address exists.
+pub fn end_user_recover(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    if state.mailer.is_none() {
+        return resp(501, json!({ "message": "email is not configured on this server" }));
+    }
+    let actor = client_ip(req);
+    if !signup_allowed(&actor) {
+        return resp(429, json!({ "message": "rate limit exceeded; slow down" }));
+    }
+    let body = parse_body(req);
+    let Some(email) = str_field(&body, "email") else {
+        return resp(400, json!({ "message": "email required" }));
+    };
+    let neutral = resp(200, json!({ "message": "if that address is registered, a reset link was sent" }));
+    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else { return neutral };
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let exists = state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .ok()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if exists {
+        let (plain, hash, exp) = one_time_token(3600);
+        let _ = state.upstream.update(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+            &json!({ "$set": { "reset_hash": hash, "reset_exp": exp } }),
+        );
+        if let Some(mailer) = &state.mailer {
+            let link = format!("{}/reset?ref={}&token={}", public_base(), project_ref, plain);
+            mailer.send_async(
+                email.clone(),
+                "Reset your password".into(),
+                format!(
+                    "A password reset was requested for this address.\n\nSet a new password here:\n\n  {link}\n\nThe link is valid for 1 hour. If you didn't request this, ignore this message — your password is unchanged.\n"
+                ),
+            );
+        }
+    }
+    neutral
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/reset` — complete a password reset:
+/// `{ token, password }`. Consumes the token, revokes every session (refresh
+/// token) of the user, and marks the address verified (the link proves it).
+pub fn end_user_reset(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let (Some(token), Some(password)) = (str_field(&body, "token"), str_field(&body, "password"))
+    else {
+        return resp(400, json!({ "message": "token and password required" }));
+    };
+    if password.len() < MIN_PASSWORD_LEN {
+        return resp(
+            400,
+            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
+        );
+    }
+    let Ok(Some(pdoc)) = project_by_ref(state, project_ref) else {
+        return resp(404, json!({ "message": "project not found" }));
+    };
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    let hash = crypto::sha256_hex(token.as_bytes());
+    let user = match state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "reset_hash": hash }))
+    {
+        Ok(mut v) => v.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let Some(user) = user else {
+        return resp(400, json!({ "message": "invalid or already-used reset link" }));
+    };
+    if now_secs() > user.get("reset_exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+        return resp(400, json!({ "message": "reset link expired — request a new one" }));
+    }
+    let email = user.get("email").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let pw_hash = match crypto::hash_password(&password) {
+        Ok(h) => h,
+        Err(e) => return resp(500, json!({ "message": e })),
+    };
+    if let Err(e) = state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$set": { "pw_hash": pw_hash, "verified": true }, "$unset": { "reset_hash": "", "reset_exp": "" } }),
+    ) {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    // A reset invalidates every live session of the account.
+    let _ = state
+        .upstream
+        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
+    resp(200, json!({ "message": "password updated — you can sign in now" }))
+}
+
+// ---------------------------------------------------------------------------
+// User management (developer console — owner-authenticated)
+// ---------------------------------------------------------------------------
+
+/// `GET /platform/v1/projects/{ref}/users` — the project's end users.
+pub fn list_users(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    match owned_project(state, project_ref, &owner) {
+        Ok(Some(_)) => {}
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+    match state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref }))
+    {
+        Ok(users) => {
+            let out: Vec<Value> = users
+                .iter()
+                .map(|u| {
+                    json!({
+                        "email": u.get("email"),
+                        "created_at": u.get("created_at"),
+                        // Absent field = pre-verification row = verified.
+                        "verified": u.get("verified").and_then(|v| v.as_bool()).unwrap_or(true),
+                    })
+                })
+                .collect();
+            resp(200, json!(out))
+        }
+        Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+}
+
+/// Shared owner gate for the per-user admin endpoints.
+fn owned_user<'a>(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    email: &'a str,
+) -> Result<&'a str, HttpResponse> {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return Err(r),
+    };
+    match owned_project(state, project_ref, &owner) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(resp(404, json!({ "message": "project not found" }))),
+        Err(e) => return Err(resp(502, json!({ "message": format!("upstream: {e}") }))),
+    }
+    let exists = state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+        .ok()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !exists {
+        return Err(resp(404, json!({ "message": "user not found" })));
+    }
+    Ok(email)
+}
+
+/// `DELETE /platform/v1/projects/{ref}/users/{email}` — remove a user and
+/// their sessions.
+pub fn delete_user(req: &HttpRequest, state: &State, project_ref: &str, email: &str) -> HttpResponse {
+    let email = match owned_user(req, state, project_ref, email) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let _ = state
+        .upstream
+        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
+    match state
+        .upstream
+        .delete("users", &json!({ "project_ref": project_ref, "email": email }))
+    {
+        Ok(_) => resp(200, json!({ "deleted": email })),
+        Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+}
+
+/// `POST /platform/v1/projects/{ref}/users/{email}/password` — operator sets a
+/// user's password (`{ password }`). Revokes the user's sessions.
+pub fn admin_set_user_password(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    email: &str,
+) -> HttpResponse {
+    let email = match owned_user(req, state, project_ref, email) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let body = parse_body(req);
+    let Some(password) = str_field(&body, "password") else {
+        return resp(400, json!({ "message": "password required" }));
+    };
+    if password.len() < MIN_PASSWORD_LEN {
+        return resp(
+            400,
+            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
+        );
+    }
+    let pw_hash = match crypto::hash_password(&password) {
+        Ok(h) => h,
+        Err(e) => return resp(500, json!({ "message": e })),
+    };
+    if let Err(e) = state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$set": { "pw_hash": pw_hash } }),
+    ) {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    let _ = state
+        .upstream
+        .delete("refresh_tokens", &json!({ "project_ref": project_ref, "email": email }));
+    resp(200, json!({ "message": "password updated" }))
+}
+
+/// `POST /platform/v1/projects/{ref}/users/{email}/verify` — operator marks a
+/// user's address verified (support path when email is unreachable).
+pub fn admin_verify_user(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+    email: &str,
+) -> HttpResponse {
+    let email = match owned_user(req, state, project_ref, email) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$set": { "verified": true }, "$unset": { "verify_hash": "", "verify_exp": "" } }),
+    ) {
+        Ok(_) => resp(200, json!({ "message": "verified" })),
+        Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
     }
 }

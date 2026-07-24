@@ -19,6 +19,7 @@
 mod crypto;
 mod gelf;
 mod handlers;
+mod mail;
 mod upstream;
 
 use std::sync::Arc;
@@ -40,6 +41,8 @@ pub struct State {
     pub upstream: Upstream,
     pub platform_secret: String,
     pub seal_key: [u8; 32],
+    /// Outbound email (verification / password reset). `None` = flows disabled.
+    pub mailer: Option<mail::Mailer>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -65,10 +68,15 @@ fn main() {
         eprintln!("[oxibase]          (is {upstream_addr} up? it will retry on first write)");
     }
 
+    let mailer = mail::Mailer::from_env();
+    if mailer.is_some() {
+        eprintln!("[oxibase] SMTP configured — email verification + password reset enabled");
+    }
     let state = Arc::new(State {
         upstream,
         platform_secret,
         seal_key: crypto::derive_key(&seal_material),
+        mailer,
     });
 
     gelf::init(); // arm GELF (OXIDB_GELF_ADDR) — logs every request; no-op if unset
@@ -132,6 +140,30 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         }
         ("POST", ["platform", "v1", "projects", r, "auth", "refresh"]) => {
             handlers::end_user_refresh(req, state, r)
+        }
+        ("GET", ["platform", "v1", "projects", r, "auth", "verify"]) => {
+            handlers::end_user_verify(req, state, r)
+        }
+        ("POST", ["platform", "v1", "projects", r, "auth", "resend"]) => {
+            handlers::end_user_resend(req, state, r)
+        }
+        ("POST", ["platform", "v1", "projects", r, "auth", "recover"]) => {
+            handlers::end_user_recover(req, state, r)
+        }
+        ("POST", ["platform", "v1", "projects", r, "auth", "reset"]) => {
+            handlers::end_user_reset(req, state, r)
+        }
+        ("GET", ["platform", "v1", "projects", r, "users"]) => {
+            handlers::list_users(req, state, r)
+        }
+        ("DELETE", ["platform", "v1", "projects", r, "users", email]) => {
+            handlers::delete_user(req, state, r, email)
+        }
+        ("POST", ["platform", "v1", "projects", r, "users", email, "password"]) => {
+            handlers::admin_set_user_password(req, state, r, email)
+        }
+        ("POST", ["platform", "v1", "projects", r, "users", email, "verify"]) => {
+            handlers::admin_verify_user(req, state, r, email)
         }
         ("DELETE", ["platform", "v1", "projects", r]) => handlers::delete_project(req, state, r),
         ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {

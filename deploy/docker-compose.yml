@@ -62,6 +62,13 @@ services:
       OXIDB_PROJECT_MAX_DOCUMENTS: "${OXIDB_PROJECT_MAX_DOCUMENTS:-10000}"
       # Google OAuth Web client ID — developer console sign-in (public value).
       OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
+      # SMTP submission (the deployment's mail server) — enables end-user email
+      # verification + password reset. Empty host = email flows off.
+      OXIBASE_SMTP_HOST: "${OXIBASE_SMTP_HOST:-}"
+      OXIBASE_SMTP_PORT: "${OXIBASE_SMTP_PORT:-465}"
+      OXIBASE_SMTP_USER: "${OXIBASE_SMTP_USER:-}"
+      OXIBASE_SMTP_PASSWORD: "${OXIBASE_SMTP_PASSWORD:-}"
+      OXIBASE_MAIL_FROM: "${OXIBASE_MAIL_FROM:-}"
       # GELF: emit a message per control-plane request to the data plane's GELF
       # port (e.g. data-plane:12201). Empty = off.
       OXIDB_GELF_ADDR: "${OXIBASE_GELF_ADDR:-}"

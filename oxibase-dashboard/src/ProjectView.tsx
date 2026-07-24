@@ -2,12 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 import { type Project, getProject, updateProjectLimits } from "./api.ts";
 import { listCollections, runSql, countDocuments, listBuckets } from "./dataApi.ts";
 import { FilesBrowser, fmtBytes } from "./FilesBrowser.tsx";
+import { UsersPanel } from "./UsersPanel.tsx";
 import { DataBrowser } from "./DataBrowser.tsx";
 import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
 import { RulesEditor } from "./RulesEditor.tsx";
 
-type Tab = "collections" | "sqltables" | "sql" | "files" | "rules";
+type Tab = "collections" | "sqltables" | "sql" | "files" | "users" | "rules";
 
 export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack: () => void }) {
   const [project, setProject] = useState<Project | null>(null);
@@ -53,6 +54,9 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
           <button className={tab === "files" ? "tab active" : "tab"} onClick={() => setTab("files")}>
             Files
           </button>
+          <button className={tab === "users" ? "tab active" : "tab"} onClick={() => setTab("users")}>
+            Users
+          </button>
           <button className={tab === "rules" ? "tab active" : "tab"} onClick={() => setTab("rules")}>
             Rules
           </button>
@@ -73,6 +77,8 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
         <SqlRunner projectRef={projectRef} apiKey={key} />
       ) : tab === "files" ? (
         <FilesBrowser projectRef={projectRef} apiKey={key} />
+      ) : tab === "users" ? (
+        <UsersPanel projectRef={projectRef} />
       ) : (
         <RulesEditor projectRef={projectRef} apiKey={key} />
       )}

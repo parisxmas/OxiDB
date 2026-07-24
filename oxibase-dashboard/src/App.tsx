@@ -3,6 +3,7 @@ import { isAuthed, logout, currentEmail } from "./api.ts";
 import { Auth } from "./Auth.tsx";
 import { Console } from "./Console.tsx";
 import { Docs } from "./Docs.tsx";
+import { ResetPassword } from "./ResetPassword.tsx";
 
 export default function App() {
   const [authed, setAuthed] = useState(isAuthed());
@@ -17,6 +18,11 @@ export default function App() {
 
   if (path.startsWith("/docs")) {
     return <Docs onOpenConsole={() => go("/")} />;
+  }
+
+  // Public landing page of password-reset emails — no sign-in.
+  if (path.startsWith("/reset")) {
+    return <ResetPassword />;
   }
 
   if (!authed) {

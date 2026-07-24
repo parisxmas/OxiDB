@@ -111,3 +111,56 @@ export function updateProjectLimits(
 ): Promise<Project> {
   return req<Project>("PATCH", `/projects/${encodeURIComponent(ref)}/limits`, limits);
 }
+
+// ── End-user management (Users tab) ─────────────────────────────────────────
+
+export interface ProjectUser {
+  email: string;
+  created_at: number;
+  verified: boolean;
+}
+
+export function listProjectUsers(ref: string): Promise<ProjectUser[]> {
+  return req("GET", `/projects/${encodeURIComponent(ref)}/users`);
+}
+
+export function deleteProjectUser(ref: string, email: string): Promise<unknown> {
+  return req("DELETE", `/projects/${encodeURIComponent(ref)}/users/${encodeURIComponent(email)}`);
+}
+
+export function setProjectUserPassword(
+  ref: string,
+  email: string,
+  password: string,
+): Promise<unknown> {
+  return req(
+    "POST",
+    `/projects/${encodeURIComponent(ref)}/users/${encodeURIComponent(email)}/password`,
+    { password },
+  );
+}
+
+export function verifyProjectUser(ref: string, email: string): Promise<unknown> {
+  return req(
+    "POST",
+    `/projects/${encodeURIComponent(ref)}/users/${encodeURIComponent(email)}/verify`,
+  );
+}
+
+/** Complete an end-user password reset (public — token from the email link). */
+export async function completePasswordReset(
+  ref: string,
+  token: string,
+  password: string,
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/platform/v1/projects/${encodeURIComponent(ref)}/auth/reset`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, password }),
+    },
+  );
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`);
+}

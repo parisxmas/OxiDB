@@ -284,6 +284,27 @@ await oxibase.from("posts").insert({ owner: "ada@example.com", body: "hi" });
 oxibase.auth.getSession();   // { token, refreshToken } | null
 oxibase.auth.signOut();      // back to the anon key
 // expired tokens refresh automatically on 401 (refresh tokens rotate)`}</Code>
+          <p>
+            <strong>Email verification</strong>: on this deployment, new users must confirm their
+            address before they can sign in — <code>signUp</code> returns{" "}
+            <code>verificationRequired: true</code> (no session yet), the user clicks the emailed
+            link, and <code>signInWithPassword</code> works from then on.{" "}
+            <strong>Password reset</strong> is two calls — the emailed link lands on a hosted form,
+            so most apps only need the first:
+          </p>
+          <Code title="verification + reset">{`// after signUp:
+const { verificationRequired } = await oxibase.auth.signUp({ email, password });
+if (verificationRequired) showMessage("Check your inbox to activate your account");
+
+// didn't get the mail?
+await oxibase.auth.resendVerification(email);
+
+// "Forgot password?" — always resolves (no account enumeration)
+await oxibase.auth.resetPasswordForEmail(email);
+// the emailed link opens a hosted set-new-password page; sessions are revoked
+
+// managing users: the console's Users tab lists your project's users,
+// with per-user verify / set-password / delete`}</Code>
 
           {/* ── 7 ─────────────────────────────────────────────────────────── */}
           <h2 id="rules">7 · Security rules</h2>

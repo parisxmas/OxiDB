@@ -25,3 +25,7 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 # Minimal blocking HTTPS client (pure-Rust rustls TLS) — used only to verify
 # Google ID tokens against Google's `tokeninfo` endpoint for developer sign-in.
 ureq = "2"
+# SMTP submission to the deployment's mail server (implicit TLS, port 465) —
+# verification + password-reset email. Same rustls ureq already pulls in.
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "0.26"
