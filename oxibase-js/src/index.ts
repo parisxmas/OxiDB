@@ -409,9 +409,12 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     },
     getSession: () => (refreshToken ? { token, refreshToken } : null),
     setSession: (session) => {
+      // Rehydrating the same session (a reload, a re-render) is not an
+      // identity change and must not disturb a live connection.
+      const unchanged = session.token === token;
       token = session.token;
       refreshToken = session.refreshToken ?? "";
-      realtimeReset();
+      if (!unchanged) realtimeReset();
     },
     resetPasswordForEmail: (email) => authPost("recover", { email }),
     resendVerification: (email) => authPost("resend", { email }),
@@ -548,10 +551,22 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       ws = null;
       wsReady = false;
       acks = [];
-      try {
-        w.close();
-      } catch {
-        /* already closed */
+      const close = () => {
+        try {
+          w.close();
+        } catch {
+          /* already closed */
+        }
+      };
+      if (w.readyState === 0) {
+        // Still handshaking. Closing now makes the browser log "closed before
+        // the connection is established" — an alarming message for what is
+        // just a session being adopted while the first socket was in flight.
+        // Let it finish, then close it quietly.
+        w.addEventListener("open", close, { once: true });
+        w.addEventListener("error", () => {}, { once: true });
+      } else {
+        close();
       }
       if (subsById.size > 0) wsConnect();
     }
