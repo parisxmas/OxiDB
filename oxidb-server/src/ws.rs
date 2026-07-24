@@ -592,7 +592,16 @@ fn handle_command(
     let db: Arc<OxiDb> = match (&conn.pinned, cmd.get("db").and_then(|v| v.as_str())) {
         (Some((_, db)), None) => Arc::clone(db),
         (Some((name, db)), Some(requested)) => {
-            if requested == name {
+            // The pin holds the canonical ref, but a client may name its
+            // project either way — `auth` itself accepts a slug. Resolve
+            // before comparing, so addressing a project by the same name it
+            // authenticated with is not an error.
+            let resolved = state
+                .db_manager
+                .as_ref()
+                .and_then(|mgr| crate::tenant_auth::resolve_tenant(mgr, requested))
+                .unwrap_or_else(|| requested.to_string());
+            if &resolved == name {
                 Arc::clone(db)
             } else {
                 return json!({"ok": false, "error": format!("connection is bound to database {name:?}")});

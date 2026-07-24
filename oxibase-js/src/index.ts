@@ -36,7 +36,9 @@ export interface OxibaseOptions {
   /**
    * WebSocket endpoint for `.subscribe()`. Defaults to the data-plane URL with
    * the scheme flipped to ws(s) and `/ws` appended (the standard deployment's
-   * proxy path). Point it at `ws://host:<OXIDB_WS_PORT>` for a direct server.
+   * proxy path) — one socket per deployment, with the project selected inside
+   * it, so `tenantInPath` does not apply. Point it at
+   * `ws://host:<OXIDB_WS_PORT>` for a direct server.
    */
   realtimeUrl?: string;
 }
@@ -517,9 +519,11 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   // One shared WebSocket, lazily opened. The server processes commands
   // sequentially per connection, so plain-`ok` replies are matched FIFO to the
   // commands that caused them. Change events carry a subscription id.
-  const wsUrl =
-    opts.realtimeUrl ??
-    base.replace(/^http/, "ws") + (opts.tenantInPath && ref ? `/${encodeURIComponent(ref)}` : "") + "/ws";
+  // The realtime endpoint is one socket for the whole deployment, not one per
+  // project: the tenant is selected *inside* the connection by the `db` field
+  // of the auth frame below. So the project must not be pasted into the path
+  // here even under `tenantInPath` — that yields a URL nothing serves.
+  const wsUrl = opts.realtimeUrl ?? base.replace(/^http/, "ws") + "/ws";
 
   interface SubEntry {
     collection: string;
