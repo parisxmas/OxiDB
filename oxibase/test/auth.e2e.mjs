@@ -221,9 +221,12 @@ let stateBlob;
 // OXIBASE_MAIL_SINK the control plane appends each message to a file, so the
 // test can read back the link it just triggered.
 const SINK = process.env.OXIBASE_MAIL_SINK;
+let magicAvailable = false;
 {
   const s = await api("GET", `/projects/${ref}/auth/settings`, { auth: false });
-  ok(s.data.magic_link === !!SINK, `settings: magic_link reflects the mail transport (${!!SINK})`);
+  ok(typeof s.data.magic_link === "boolean", "settings: advertises whether magic links work");
+  magicAvailable = s.data.magic_link;
+  if (SINK) ok(magicAvailable === true, "settings: magic links enabled by the mail transport");
 }
 {
   const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
@@ -314,13 +317,18 @@ if (SINK) {
     body: { refresh_token: params.get("refresh_token") },
   });
   ok(refreshed.status === 200 && refreshed.data.token, "magic link: the session refreshes");
-} else {
+} else if (!magicAvailable) {
   const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
     auth: false,
     body: { email: "someone@example.com", redirect_to: "https://app.example.com/callback" },
   });
   ok(r.status === 501, "magic link: reports email is not configured (no mail transport)");
   console.log("  … set OXIBASE_MAIL_SINK to exercise the full round trip");
+} else {
+  // A real mail transport is configured but this run cannot read the mailbox.
+  // Requesting a link here would send actual mail to a made-up address, so the
+  // send path is left alone.
+  console.log("  … live mail transport without a sink — skipping the send (would email for real)");
 }
 
 // ── cleanup ─────────────────────────────────────────────────────────────────
