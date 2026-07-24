@@ -95,7 +95,8 @@ fn transfer_for_update(
 
         let (first, second) = if from < to { (from, to) } else { (to, from) };
         let locked = (|| -> Result<Vec<serde_json::Value>, Error> {
-            let mut a = db.tx_find_for_update(tx, "accounts", &json!({"id": first}), LOCK_TIMEOUT)?;
+            let mut a =
+                db.tx_find_for_update(tx, "accounts", &json!({"id": first}), LOCK_TIMEOUT)?;
             let b = db.tx_find_for_update(tx, "accounts", &json!({"id": second}), LOCK_TIMEOUT)?;
             a.extend(b);
             if with_fee {
@@ -276,7 +277,11 @@ fn run_mode(
                         from_i
                     } else {
                         let t = rng.below(n_accounts as u64);
-                        if t == from_i { (t + 1) % n_accounts as u64 } else { t }
+                        if t == from_i {
+                            (t + 1) % n_accounts as u64
+                        } else {
+                            t
+                        }
                     };
                     let from = format!("acct-{from_i}");
                     let to = format!("acct-{to_i}");
@@ -285,9 +290,25 @@ fn run_mode(
 
                     let t0 = Instant::now();
                     let committed = if for_update {
-                        transfer_for_update(&db, &from, &to, amount, with_fee, max_retries, &mut stats)
+                        transfer_for_update(
+                            &db,
+                            &from,
+                            &to,
+                            amount,
+                            with_fee,
+                            max_retries,
+                            &mut stats,
+                        )
                     } else {
-                        transfer_with_retries(&db, &from, &to, amount, with_fee, max_retries, &mut stats)
+                        transfer_with_retries(
+                            &db,
+                            &from,
+                            &to,
+                            amount,
+                            with_fee,
+                            max_retries,
+                            &mut stats,
+                        )
                     };
                     if committed {
                         stats.latencies_us.push(t0.elapsed().as_micros() as u64);
@@ -345,7 +366,14 @@ fn hot_account_contention_sweep() {
     );
     println!(
         "{:>10} | {:>9} | {:>9} | {:>9} | {:>13} | {:>9} | {:>9} | {:>9} | {:>8}",
-        "mode", "hot_ratio", "commits", "tx/s", "conflicts/tx", "p50 µs", "p99 µs", "max µs",
+        "mode",
+        "hot_ratio",
+        "commits",
+        "tx/s",
+        "conflicts/tx",
+        "p50 µs",
+        "p99 µs",
+        "max µs",
         "give-ups"
     );
     println!("{}", "-".repeat(108));
@@ -353,7 +381,13 @@ fn hot_account_contention_sweep() {
     for &for_update in &[false, true] {
         for &hot_ratio in &[0.0, 0.1, 0.5, 1.0] {
             let mut stats = run_mode(
-                &db, hot_ratio, for_update, workers, duration, n_accounts, max_retries,
+                &db,
+                hot_ratio,
+                for_update,
+                workers,
+                duration,
+                n_accounts,
+                max_retries,
             );
             stats.latencies_us.sort_unstable();
 

@@ -156,9 +156,11 @@ fn run_victim() -> ! {
     // Hammer the seal path against the writers — the race the design must win.
     {
         let db = Arc::clone(&db);
-        thread::spawn(move || loop {
-            let _ = db.sync_all();
-            thread::sleep(Duration::from_millis(3));
+        thread::spawn(move || {
+            loop {
+                let _ = db.sync_all();
+                thread::sleep(Duration::from_millis(3));
+            }
         });
     }
 

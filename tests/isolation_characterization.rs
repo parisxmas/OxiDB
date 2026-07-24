@@ -104,10 +104,20 @@ fn p4_lost_update_prevented() {
         .unwrap();
     assert_eq!((b1, b2), (100, 100));
     // …and both write a derived value.
-    db.tx_update(t1, "acc", &json!({"id": "x"}), &json!({"$set": {"bal": b1 - 10}}))
-        .unwrap();
-    db.tx_update(t2, "acc", &json!({"id": "x"}), &json!({"$set": {"bal": b2 - 20}}))
-        .unwrap();
+    db.tx_update(
+        t1,
+        "acc",
+        &json!({"id": "x"}),
+        &json!({"$set": {"bal": b1 - 10}}),
+    )
+    .unwrap();
+    db.tx_update(
+        t2,
+        "acc",
+        &json!({"id": "x"}),
+        &json!({"$set": {"bal": b2 - 20}}),
+    )
+    .unwrap();
 
     db.commit_transaction(t1).unwrap();
     let r2 = db.commit_transaction(t2);
@@ -118,7 +128,10 @@ fn p4_lost_update_prevented() {
     let bal = db.find_one("acc", &json!({"id": "x"})).unwrap().unwrap()["bal"]
         .as_i64()
         .unwrap();
-    assert_eq!(bal, 90, "only t1's update applied; t2's -20 must not be lost-update-merged");
+    assert_eq!(
+        bal, 90,
+        "only t1's update applied; t2's -20 must not be lost-update-merged"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -148,10 +161,20 @@ fn a5b_write_skew_item_reads_prevented() {
     assert_eq!(total(t2), 100);
     // Each withdraws 60 from a DIFFERENT account (100 - 60 >= 0 holds
     // for each in isolation; both together would violate it).
-    db.tx_update(t1, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": -60}}))
-        .unwrap();
-    db.tx_update(t2, "acc", &json!({"id": "y"}), &json!({"$inc": {"bal": -60}}))
-        .unwrap();
+    db.tx_update(
+        t1,
+        "acc",
+        &json!({"id": "x"}),
+        &json!({"$inc": {"bal": -60}}),
+    )
+    .unwrap();
+    db.tx_update(
+        t2,
+        "acc",
+        &json!({"id": "y"}),
+        &json!({"$inc": {"bal": -60}}),
+    )
+    .unwrap();
 
     db.commit_transaction(t1).unwrap();
     let r2 = db.commit_transaction(t2);
@@ -181,8 +204,10 @@ fn a5b_write_skew_item_reads_prevented() {
 #[ignore]
 fn phantom_write_skew_admitted() {
     let (_d, db) = fresh_db();
-    db.insert("orders", json!({"id": 1, "status": "open"})).unwrap();
-    db.insert("orders", json!({"id": 2, "status": "open"})).unwrap();
+    db.insert("orders", json!({"id": 1, "status": "open"}))
+        .unwrap();
+    db.insert("orders", json!({"id": 2, "status": "open"}))
+        .unwrap();
 
     let t1 = db.begin_transaction();
     let t2 = db.begin_transaction();
@@ -194,7 +219,11 @@ fn phantom_write_skew_admitted() {
         .tx_find(t2, "orders", &json!({"status": "open"}))
         .unwrap()
         .len();
-    assert_eq!((open1, open2), (2, 2), "both see 2 open — room for 1 more each");
+    assert_eq!(
+        (open1, open2),
+        (2, 2),
+        "both see 2 open — room for 1 more each"
+    );
     db.tx_insert(t1, "orders", json!({"id": 3, "status": "open"}))
         .unwrap();
     db.tx_insert(t2, "orders", json!({"id": 4, "status": "open"}))
@@ -204,8 +233,15 @@ fn phantom_write_skew_admitted() {
     let r2 = db.commit_transaction(t2);
     let open_now = db.find("orders", &json!({"status": "open"})).unwrap().len();
 
-    eprintln!("[phantom-skew] r1={:?} r2={:?} open_now={open_now}", r1.is_ok(), r2.is_ok());
-    assert!(r1.is_ok() && r2.is_ok(), "PINNED: both commits succeed (phantom)");
+    eprintln!(
+        "[phantom-skew] r1={:?} r2={:?} open_now={open_now}",
+        r1.is_ok(),
+        r2.is_ok()
+    );
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "PINNED: both commits succeed (phantom)"
+    );
     assert_eq!(
         open_now, 4,
         "PINNED: predicate constraint violated via phantom — OxiDB's OCC \
@@ -225,27 +261,43 @@ fn phantom_write_skew_admitted() {
 #[ignore]
 fn phantom_write_skew_mitigated_by_counter_doc() {
     let (_d, db) = fresh_db();
-    db.insert("orders", json!({"id": 1, "status": "open"})).unwrap();
-    db.insert("orders", json!({"id": 2, "status": "open"})).unwrap();
-    db.insert("meta", json!({"id": "open_orders", "count": 2})).unwrap();
+    db.insert("orders", json!({"id": 1, "status": "open"}))
+        .unwrap();
+    db.insert("orders", json!({"id": 2, "status": "open"}))
+        .unwrap();
+    db.insert("meta", json!({"id": "open_orders", "count": 2}))
+        .unwrap();
 
     let t1 = db.begin_transaction();
     let t2 = db.begin_transaction();
     let count_of = |tx: u64| -> i64 {
-        db.tx_find(tx, "meta", &json!({"id": "open_orders"})).unwrap()[0]["count"]
+        db.tx_find(tx, "meta", &json!({"id": "open_orders"}))
+            .unwrap()[0]["count"]
             .as_i64()
             .unwrap()
     };
     // Both check the materialized constraint (< 3) and stake their claim
     // by bumping the counter — the shared read+write is what OCC needs.
     assert!(count_of(t1) < 3);
-    db.tx_insert(t1, "orders", json!({"id": 3, "status": "open"})).unwrap();
-    db.tx_update(t1, "meta", &json!({"id": "open_orders"}), &json!({"$inc": {"count": 1}}))
+    db.tx_insert(t1, "orders", json!({"id": 3, "status": "open"}))
         .unwrap();
+    db.tx_update(
+        t1,
+        "meta",
+        &json!({"id": "open_orders"}),
+        &json!({"$inc": {"count": 1}}),
+    )
+    .unwrap();
     assert!(count_of(t2) < 3);
-    db.tx_insert(t2, "orders", json!({"id": 4, "status": "open"})).unwrap();
-    db.tx_update(t2, "meta", &json!({"id": "open_orders"}), &json!({"$inc": {"count": 1}}))
+    db.tx_insert(t2, "orders", json!({"id": 4, "status": "open"}))
         .unwrap();
+    db.tx_update(
+        t2,
+        "meta",
+        &json!({"id": "open_orders"}),
+        &json!({"$inc": {"count": 1}}),
+    )
+    .unwrap();
 
     db.commit_transaction(t1).unwrap();
     let r2 = db.commit_transaction(t2);
@@ -255,7 +307,10 @@ fn phantom_write_skew_mitigated_by_counter_doc() {
     );
 
     let open_now = db.find("orders", &json!({"status": "open"})).unwrap().len();
-    assert_eq!(open_now, 3, "constraint holds: t2's insert died with its tx");
+    assert_eq!(
+        open_now, 3,
+        "constraint holds: t2's insert died with its tx"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -279,10 +334,20 @@ fn a5a_read_skew_observable_but_not_actionable() {
 
     // Concurrent committed swap: x -30, y +30.
     let t2 = db.begin_transaction();
-    db.tx_update(t2, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": -30}}))
-        .unwrap();
-    db.tx_update(t2, "acc", &json!({"id": "y"}), &json!({"$inc": {"bal": 30}}))
-        .unwrap();
+    db.tx_update(
+        t2,
+        "acc",
+        &json!({"id": "x"}),
+        &json!({"$inc": {"bal": -30}}),
+    )
+    .unwrap();
+    db.tx_update(
+        t2,
+        "acc",
+        &json!({"id": "y"}),
+        &json!({"$inc": {"bal": 30}}),
+    )
+    .unwrap();
     db.commit_transaction(t2).unwrap();
 
     // PINNED (observation): t1 sees the fresh y=80 next to its stale
@@ -290,7 +355,10 @@ fn a5a_read_skew_observable_but_not_actionable() {
     let y1 = db.tx_find(t1, "acc", &json!({"id": "y"})).unwrap()[0]["bal"]
         .as_i64()
         .unwrap();
-    assert_eq!(y1, 80, "PINNED: mid-tx reads see latest committed (no snapshot)");
+    assert_eq!(
+        y1, 80,
+        "PINNED: mid-tx reads see latest committed (no snapshot)"
+    );
 
     // PINNED (the guarantee): t1 tries to act on its inconsistent view —
     // commit must abort, because its read-set contains x@old-version.
@@ -317,8 +385,13 @@ fn read_your_own_writes_pinned_not_visible_mid_tx() {
     db.insert("acc", json!({"id": "x", "bal": 100})).unwrap();
 
     let t1 = db.begin_transaction();
-    db.tx_update(t1, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": -40}}))
-        .unwrap();
+    db.tx_update(
+        t1,
+        "acc",
+        &json!({"id": "x"}),
+        &json!({"$inc": {"bal": -40}}),
+    )
+    .unwrap();
     let seen = db.tx_find(t1, "acc", &json!({"id": "x"})).unwrap()[0]["bal"]
         .as_i64()
         .unwrap();
@@ -389,8 +462,12 @@ fn g1b_intermediate_reads_admitted_for_observers() {
     while start.elapsed() < std::time::Duration::from_secs(3) {
         let docs = db.find("pair", &json!({})).unwrap();
         if docs.len() == 2 {
-            let va = docs.iter().find(|d| d["id"] == "a").unwrap()["v"].as_i64().unwrap();
-            let vb = docs.iter().find(|d| d["id"] == "b").unwrap()["v"].as_i64().unwrap();
+            let va = docs.iter().find(|d| d["id"] == "a").unwrap()["v"]
+                .as_i64()
+                .unwrap();
+            let vb = docs.iter().find(|d| d["id"] == "b").unwrap()["v"]
+                .as_i64()
+                .unwrap();
             checks += 1;
             if va != vb {
                 torn += 1;

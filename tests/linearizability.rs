@@ -29,7 +29,7 @@
 //! Run with:
 //!   cargo test --release --test linearizability -- --ignored --nocapture
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,8 +46,8 @@ const TXNS_PER_WORKER: usize = 250;
 #[derive(Default, Clone)]
 struct TxnRecord {
     id: u64,
-    appends: Vec<(u64, u64)>,        // (key, value)
-    reads: Vec<(u64, Vec<u64>)>,     // (key, observed list of values)
+    appends: Vec<(u64, u64)>,    // (key, value)
+    reads: Vec<(u64, Vec<u64>)>, // (key, observed list of values)
 }
 
 fn key_id(k: u64) -> String {
@@ -85,7 +85,12 @@ fn run_txn(
             if is_append {
                 let v = value_ctr.fetch_add(1, Ordering::SeqCst);
                 if db
-                    .tx_update(tx, "reg", &json!({"id": key_id(key)}), &json!({"$push": {"log": v}}))
+                    .tx_update(
+                        tx,
+                        "reg",
+                        &json!({"id": key_id(key)}),
+                        &json!({"$push": {"log": v}}),
+                    )
                     .is_err()
                 {
                     ok = false;
@@ -201,7 +206,8 @@ fn history_is_serializable() {
     let dir = tempdir().unwrap();
     let db = Arc::new(OxiDb::open(dir.path()).unwrap());
     for k in 0..KEYS {
-        db.insert("reg", json!({"id": key_id(k), "log": []})).unwrap();
+        db.insert("reg", json!({"id": key_id(k), "log": []}))
+            .unwrap();
     }
     db.create_index("reg", "id").unwrap();
 
@@ -243,8 +249,16 @@ fn history_is_serializable() {
     // Ground truth: each key's final append order.
     let mut final_lists: HashMap<u64, Vec<u64>> = HashMap::new();
     for k in 0..KEYS {
-        let doc = db.find_one("reg", &json!({"id": key_id(k)})).unwrap().unwrap();
-        let list: Vec<u64> = doc["log"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
+        let doc = db
+            .find_one("reg", &json!({"id": key_id(k)}))
+            .unwrap()
+            .unwrap();
+        let list: Vec<u64> = doc["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect();
         final_lists.insert(k, list);
     }
     let writer_of: HashMap<u64, u64> = records
@@ -269,13 +283,23 @@ fn history_is_serializable() {
     let mut in_final: HashSet<u64> = HashSet::new();
     for list in final_lists.values() {
         for &v in list {
-            assert!(in_final.insert(v), "value {v} appears twice in final lists (double-apply)");
+            assert!(
+                in_final.insert(v),
+                "value {v} appears twice in final lists (double-apply)"
+            );
         }
     }
     for (&v, _) in &appended {
-        assert!(in_final.contains(&v), "acked append {v} lost from final state");
+        assert!(
+            in_final.contains(&v),
+            "acked append {v} lost from final state"
+        );
     }
-    assert_eq!(appended.len(), in_final.len(), "phantom value in final state");
+    assert_eq!(
+        appended.len(),
+        in_final.len(),
+        "phantom value in final state"
+    );
 
     // ── Invariant 2: every observed read is a PREFIX of its key's final
     //    list — append-only histories can't reorder or drop a value. ──

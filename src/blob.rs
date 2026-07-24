@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
-use serde::{Deserialize, Serialize};
 use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 
 use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
@@ -637,7 +637,10 @@ impl BlobStore {
         // MD5 is broken for signatures; an ETag is not one. It identifies bytes.
         // Callers who want an integrity guarantee want a checksum, not this.
         let etag: String = etag_override.unwrap_or_else(|| {
-            Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+            Md5::digest(data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
         });
         let created_at = now_rfc3339();
 

@@ -26,8 +26,8 @@ use serde_json::json;
 use std::sync::Mutex;
 use tempfile::tempdir;
 
-use oxidb::wal::fault;
 use oxidb::OxiDb;
+use oxidb::wal::fault;
 
 /// The fault seam is a PROCESS-GLOBAL static, so these tests must not
 /// run concurrently — one test's armed fault would be consumed by
@@ -53,8 +53,10 @@ fn fsync_failure_is_not_acknowledged_and_not_recovered() {
         let db = OxiDb::open(dir.path()).unwrap();
 
         // Baseline: two durable inserts (real fsyncs).
-        db.insert("ledger", json!({"id": 1, "v": "committed"})).unwrap();
-        db.insert("ledger", json!({"id": 2, "v": "committed"})).unwrap();
+        db.insert("ledger", json!({"id": 1, "v": "committed"}))
+            .unwrap();
+        db.insert("ledger", json!({"id": 2, "v": "committed"}))
+            .unwrap();
         assert_eq!(count(&db, "ledger"), 2);
 
         // Arm the WAL to fail its next fsync, then attempt an insert.
@@ -69,7 +71,8 @@ fn fsync_failure_is_not_acknowledged_and_not_recovered() {
         );
 
         // The engine must keep working after a transient fsync error.
-        db.insert("ledger", json!({"id": 4, "v": "committed"})).unwrap();
+        db.insert("ledger", json!({"id": 4, "v": "committed"}))
+            .unwrap();
 
         // Shut down cleanly — a final checkpoint fsyncs the surviving state.
         db.shutdown();
@@ -117,10 +120,20 @@ fn fsync_failure_rejects_whole_transaction() {
 
         // A transfer transaction whose commit fsync will fail.
         let tx = db.begin_transaction();
-        db.tx_update(tx, "acc", &json!({"id": "a"}), &json!({"$inc": {"bal": -50}}))
-            .unwrap();
-        db.tx_update(tx, "acc", &json!({"id": "b"}), &json!({"$inc": {"bal": 50}}))
-            .unwrap();
+        db.tx_update(
+            tx,
+            "acc",
+            &json!({"id": "a"}),
+            &json!({"$inc": {"bal": -50}}),
+        )
+        .unwrap();
+        db.tx_update(
+            tx,
+            "acc",
+            &json!({"id": "b"}),
+            &json!({"$inc": {"bal": 50}}),
+        )
+        .unwrap();
 
         fault::fail_fsync_at(1);
         let r = db.commit_transaction(tx);

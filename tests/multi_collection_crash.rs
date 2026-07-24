@@ -44,7 +44,10 @@ const FEE: i64 = 1;
 const WORKERS: usize = 6;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 struct Rng(u64);
@@ -67,10 +70,14 @@ impl Rng {
 
 fn setup(db: &OxiDb) {
     for i in 0..N_ACCOUNTS {
-        db.insert("accounts", json!({"id": format!("acct-{i}"), "bal": START_BALANCE}))
-            .unwrap();
+        db.insert(
+            "accounts",
+            json!({"id": format!("acct-{i}"), "bal": START_BALANCE}),
+        )
+        .unwrap();
     }
-    db.insert("accounts", json!({"id": "fee", "bal": 0})).unwrap();
+    db.insert("accounts", json!({"id": "fee", "bal": 0}))
+        .unwrap();
     db.create_index("accounts", "id").unwrap();
     db.create_unique_index("receipts", "uid").unwrap();
     db.create_index("trades", "uid").unwrap();
@@ -86,14 +93,45 @@ fn fill_order(db: &OxiDb, uid: &str, taker: &str, maker: &str, amount: i64) -> R
     let debit = amount + FEE;
     let steps = (|| -> Result<(), Error> {
         db.tx_insert(tx, "receipts", json!({"uid": uid}))?;
-        db.tx_update(tx, "accounts", &json!({"id": taker}), &json!({"$inc": {"bal": -debit}}))?;
-        db.tx_update(tx, "accounts", &json!({"id": maker}), &json!({"$inc": {"bal": amount}}))?;
-        db.tx_update(tx, "accounts", &json!({"id": "fee"}), &json!({"$inc": {"bal": FEE}}))?;
-        db.tx_insert(tx, "trades", json!({"uid": uid, "taker": taker, "maker": maker, "amount": amount}))?;
+        db.tx_update(
+            tx,
+            "accounts",
+            &json!({"id": taker}),
+            &json!({"$inc": {"bal": -debit}}),
+        )?;
+        db.tx_update(
+            tx,
+            "accounts",
+            &json!({"id": maker}),
+            &json!({"$inc": {"bal": amount}}),
+        )?;
+        db.tx_update(
+            tx,
+            "accounts",
+            &json!({"id": "fee"}),
+            &json!({"$inc": {"bal": FEE}}),
+        )?;
+        db.tx_insert(
+            tx,
+            "trades",
+            json!({"uid": uid, "taker": taker, "maker": maker, "amount": amount}),
+        )?;
         db.tx_insert(tx, "orders", json!({"uid": uid, "status": "filled"}))?;
-        db.tx_insert(tx, "journal", json!({"uid": uid, "acct": taker, "delta": -debit}))?;
-        db.tx_insert(tx, "journal", json!({"uid": uid, "acct": maker, "delta": amount}))?;
-        db.tx_insert(tx, "journal", json!({"uid": uid, "acct": "fee", "delta": FEE}))?;
+        db.tx_insert(
+            tx,
+            "journal",
+            json!({"uid": uid, "acct": taker, "delta": -debit}),
+        )?;
+        db.tx_insert(
+            tx,
+            "journal",
+            json!({"uid": uid, "acct": maker, "delta": amount}),
+        )?;
+        db.tx_insert(
+            tx,
+            "journal",
+            json!({"uid": uid, "acct": "fee", "delta": FEE}),
+        )?;
         Ok(())
     })();
     if let Err(e) = steps {
@@ -161,22 +199,42 @@ fn check(db: &OxiDb, acked: &HashSet<String>, round: usize) {
     let receipts = db.find("receipts", &json!({})).unwrap();
     let journal = db.find("journal", &json!({})).unwrap();
 
-    let trade_uids: HashSet<String> =
-        trades.iter().map(|d| d["uid"].as_str().unwrap().to_string()).collect();
-    let order_uids: HashSet<String> =
-        orders.iter().map(|d| d["uid"].as_str().unwrap().to_string()).collect();
-    let receipt_uids: HashSet<String> =
-        receipts.iter().map(|d| d["uid"].as_str().unwrap().to_string()).collect();
+    let trade_uids: HashSet<String> = trades
+        .iter()
+        .map(|d| d["uid"].as_str().unwrap().to_string())
+        .collect();
+    let order_uids: HashSet<String> = orders
+        .iter()
+        .map(|d| d["uid"].as_str().unwrap().to_string())
+        .collect();
+    let receipt_uids: HashSet<String> = receipts
+        .iter()
+        .map(|d| d["uid"].as_str().unwrap().to_string())
+        .collect();
 
     // Uniqueness: exactly one trade / order / receipt per uid.
-    assert_eq!(trade_uids.len(), trades.len(), "round {round}: duplicate trade uid");
-    assert_eq!(order_uids.len(), orders.len(), "round {round}: duplicate order uid");
-    assert_eq!(receipt_uids.len(), receipts.len(), "round {round}: duplicate receipt uid");
+    assert_eq!(
+        trade_uids.len(),
+        trades.len(),
+        "round {round}: duplicate trade uid"
+    );
+    assert_eq!(
+        order_uids.len(),
+        orders.len(),
+        "round {round}: duplicate order uid"
+    );
+    assert_eq!(
+        receipt_uids.len(),
+        receipts.len(),
+        "round {round}: duplicate receipt uid"
+    );
 
     // Journal lines per uid (must be exactly 3 for a present order).
     let mut journal_lines: HashMap<String, u32> = HashMap::new();
     for d in &journal {
-        *journal_lines.entry(d["uid"].as_str().unwrap().to_string()).or_default() += 1;
+        *journal_lines
+            .entry(d["uid"].as_str().unwrap().to_string())
+            .or_default() += 1;
     }
 
     // ── All-collections-or-none: every uid seen anywhere must be
@@ -209,7 +267,10 @@ fn check(db: &OxiDb, acked: &HashSet<String>, round: usize) {
 
     // Journal double-entry: all deltas sum to zero.
     let journal_sum: i64 = journal.iter().map(|d| d["delta"].as_i64().unwrap()).sum();
-    assert_eq!(journal_sum, 0, "round {round}: journal doesn't balance (Σ deltas != 0)");
+    assert_eq!(
+        journal_sum, 0,
+        "round {round}: journal doesn't balance (Σ deltas != 0)"
+    );
 
     // Money conservation.
     let accounts = db.find("accounts", &json!({})).unwrap();
@@ -223,8 +284,8 @@ fn check(db: &OxiDb, acked: &HashSet<String>, round: usize) {
     // Balance reproducible from the journal: bal(acct) == initial + Σ journal deltas.
     let mut net: HashMap<String, i64> = HashMap::new();
     for d in &journal {
-        *net.entry(d["acct"].as_str().unwrap().to_string()).or_default() +=
-            d["delta"].as_i64().unwrap();
+        *net.entry(d["acct"].as_str().unwrap().to_string())
+            .or_default() += d["delta"].as_i64().unwrap();
     }
     for a in &accounts {
         let id = a["id"].as_str().unwrap();

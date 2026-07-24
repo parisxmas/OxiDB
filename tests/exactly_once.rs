@@ -85,17 +85,24 @@ fn transfer_idempotent(db: &OxiDb, request_id: &str, from: &str, to: &str) -> bo
 }
 
 fn setup(db: &OxiDb) {
-    db.insert("accounts", json!({"id": "a", "bal": 1000})).unwrap();
+    db.insert("accounts", json!({"id": "a", "bal": 1000}))
+        .unwrap();
     db.insert("accounts", json!({"id": "b", "bal": 0})).unwrap();
     db.create_index("accounts", "id").unwrap();
     db.create_unique_index("receipts", "request_id").unwrap();
 }
 
 fn balances(db: &OxiDb) -> (i64, i64) {
-    let a = db.find_one("accounts", &json!({"id": "a"})).unwrap().unwrap()["bal"]
+    let a = db
+        .find_one("accounts", &json!({"id": "a"}))
+        .unwrap()
+        .unwrap()["bal"]
         .as_i64()
         .unwrap();
-    let b = db.find_one("accounts", &json!({"id": "b"})).unwrap().unwrap()["bal"]
+    let b = db
+        .find_one("accounts", &json!({"id": "b"}))
+        .unwrap()
+        .unwrap()["bal"]
         .as_i64()
         .unwrap();
     (a, b)
@@ -117,9 +124,18 @@ fn sequential_retries_apply_exactly_once() {
     let db = OxiDb::open(dir.path()).unwrap();
     setup(&db);
 
-    assert!(transfer_idempotent(&db, "req-1", "a", "b"), "first attempt applies");
-    assert!(!transfer_idempotent(&db, "req-1", "a", "b"), "retry is a no-op");
-    assert!(!transfer_idempotent(&db, "req-1", "a", "b"), "second retry is a no-op");
+    assert!(
+        transfer_idempotent(&db, "req-1", "a", "b"),
+        "first attempt applies"
+    );
+    assert!(
+        !transfer_idempotent(&db, "req-1", "a", "b"),
+        "retry is a no-op"
+    );
+    assert!(
+        !transfer_idempotent(&db, "req-1", "a", "b"),
+        "second retry is a no-op"
+    );
 
     assert_eq!(balances(&db), (1000 - AMOUNT, AMOUNT), "moved exactly once");
     assert_eq!(receipt_count(&db, "req-1"), 1, "exactly one receipt");

@@ -209,7 +209,11 @@ fn run_victim() -> ! {
                     from_i
                 } else {
                     let t = rng.below(n_accounts as u64);
-                    if t == from_i { (t + 1) % n_accounts as u64 } else { t }
+                    if t == from_i {
+                        (t + 1) % n_accounts as u64
+                    } else {
+                        t
+                    }
                 };
                 let from = format!("acct-{from_i}");
                 let to = format!("acct-{to_i}");
@@ -297,7 +301,8 @@ fn check_state(db: &OxiDb, acked: &HashSet<String>, n_accounts: usize, round: us
         let initial = if id == "fee" { 0 } else { STARTING_BALANCE };
         let expected = initial + net.get(id).copied().unwrap_or(0);
         assert_eq!(
-            balance, expected,
+            balance,
+            expected,
             "round {round}: account {id} balance {balance} != initial {initial} + journal net \
              {} — a transaction was applied partially",
             net.get(id).copied().unwrap_or(0)
