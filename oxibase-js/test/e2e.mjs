@@ -146,6 +146,14 @@ await oxibase.from("notes").insert({ body: "second note", done: false });
   const failed = authed.auth.getSessionFromUrl("https://app.example.com/done#error=access_denied");
   ok(failed?.error === "access_denied", "auth.getSessionFromUrl: surfaces a declined sign-in");
   ok(authed.auth.getSessionFromUrl("https://app.example.com/done") === null, "auth.getSessionFromUrl: null when there is no fragment");
+
+  // A persisted session can be restored after a reload — without this, every
+  // refresh of a real app silently signs the user out.
+  authed.auth.signOut();
+  ok(authed.auth.getSession() === null, "auth.signOut: back to the anon key");
+  authed.auth.setSession({ token: "restored.tok", refreshToken: "restored.ref" });
+  const restored = authed.auth.getSession();
+  ok(restored?.token === "restored.tok" && restored?.refreshToken === "restored.ref", "auth.setSession: restores a persisted session");
 }
 
 // cleanup

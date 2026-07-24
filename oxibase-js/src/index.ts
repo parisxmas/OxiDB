@@ -69,6 +69,13 @@ export interface OxibaseAuth {
   signOut(): void;
   /** The current session, or `null` when running as the original key. */
   getSession(): { token: string; refreshToken: string } | null;
+  /**
+   * Adopt a session obtained earlier — the counterpart of {@link getSession},
+   * for apps that persist it (localStorage, a cookie, a native store) and need
+   * the client to resume as that user after a reload. The access token is used
+   * as-is; if it has expired, the first call refreshes it automatically.
+   */
+  setSession(session: { token: string; refreshToken?: string }): void;
   /** Email a password-reset link (always resolves — no user enumeration). */
   resetPasswordForEmail(email: string): Promise<{ error: string | null }>;
   /** Re-send the signup verification email. */
@@ -399,6 +406,11 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       realtimeReset();
     },
     getSession: () => (refreshToken ? { token, refreshToken } : null),
+    setSession: (session) => {
+      token = session.token;
+      refreshToken = session.refreshToken ?? "";
+      realtimeReset();
+    },
     resetPasswordForEmail: (email) => authPost("recover", { email }),
     resendVerification: (email) => authPost("resend", { email }),
     resetPassword: (t, password) => authPost("reset", { token: t, password }),
