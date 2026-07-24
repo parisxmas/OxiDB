@@ -479,8 +479,16 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     };
 
     // ── Authorization (role) gate ─────────────────────────────────────
+    // The schema profile matters here: `/rest/v1/{x}` is one URL over three
+    // engines, and only the document one has per-row rules to fall back on.
+    let tsdb_profile = req
+        .headers
+        .get("accept-profile")
+        .or_else(|| req.headers.get("content-profile"))
+        .map(|s| s.as_str())
+        == Some("tsdb");
     if let Some(role) = enforced_role {
-        if !rest_permitted(role, req.method.as_str(), segments.as_slice()) {
+        if !rest_permitted(role, req.method.as_str(), segments.as_slice(), tsdb_profile) {
             return with_rest_cors(json_response(
                 403,
                 "Forbidden",
@@ -1282,7 +1290,7 @@ fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)>
 ///   management (those are admin-only).
 /// - **Read** — only read-only endpoints (any `GET`, plus the read-only
 ///   `aggregate` POST).
-fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
+fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], tsdb_profile: bool) -> bool {
     use auth::Role::*;
     if role == Admin {
         return true;
@@ -1318,14 +1326,92 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
         // per-collection security rules (`check_access`) can decide — the
         // Supabase RLS model. A collection with no rule denies these writes by
         // default (see `rules::check_access`).
-        Read | Authenticated => matches!(
-            (method, segments),
-            ("GET", _)
-                | ("HEAD", ["api", "storage", ..])
-                | ("POST", ["api", _, "aggregate"])
-                | ("POST", ["api", "sql"])
-                | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
-        ),
+        Read | Authenticated => {
+            // A write to `/rest/v1/{x}` under the **tsdb** profile is not
+            // governed by anything: the time-series engine has no per-row
+            // rules, so letting it through would mean the browser-safe anon key
+            // could append arbitrary points to a project's series. Reads stay
+            // open; writing needs a service_role key, like storage.
+            if tsdb_profile && method != "GET" {
+                return false;
+            }
+            matches!(
+                (method, segments),
+                ("GET", _)
+                    | ("HEAD", ["api", "storage", ..])
+                    | ("POST", ["api", _, "aggregate"])
+                    | ("POST", ["api", "sql"])
+                    | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::rest_permitted;
+    use crate::auth::Role;
+
+    #[test]
+    fn browser_keys_may_read_but_never_write_time_series() {
+        for role in [Role::Read, Role::Authenticated] {
+            // Reading a series is fine — that is what a dashboard does.
+            assert!(rest_permitted(role, "GET", &["rest", "v1", "cpu"], true));
+            // Writing is not: the time-series engine has no per-row rules, so
+            // nothing would adjudicate a write from a key that ships in a
+            // browser. (Regression: this used to be allowed, letting anyone
+            // holding a published anon key append points to a project.)
+            assert!(!rest_permitted(role, "POST", &["rest", "v1", "cpu"], true));
+            assert!(!rest_permitted(role, "PATCH", &["rest", "v1", "cpu"], true));
+            assert!(!rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "cpu"],
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn document_writes_are_still_delegated_to_the_rules() {
+        // Without the tsdb profile the same URL is the document engine, whose
+        // per-collection rules decide — so the gate must let it through.
+        for role in [Role::Read, Role::Authenticated] {
+            assert!(rest_permitted(
+                role,
+                "POST",
+                &["rest", "v1", "notes"],
+                false
+            ));
+            assert!(rest_permitted(
+                role,
+                "PATCH",
+                &["rest", "v1", "notes"],
+                false
+            ));
+            assert!(rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "notes"],
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn service_role_keys_may_write_time_series() {
+        assert!(rest_permitted(
+            Role::ReadWrite,
+            "POST",
+            &["rest", "v1", "cpu"],
+            true
+        ));
+        assert!(rest_permitted(
+            Role::Admin,
+            "POST",
+            &["rest", "v1", "cpu"],
+            true
+        ));
     }
 }
 
