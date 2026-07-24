@@ -75,7 +75,7 @@ const PRESETS: { label: string; hint: string; rules: Rules }[] = [
   { label: "Public", hint: "anyone can read & write", rules: { read: "true", create: "true", update: "true", delete: "true" } },
   { label: "Public read-only", hint: "anyone reads, nobody writes", rules: { read: "true", create: "false", update: "false", delete: "false" } },
   { label: "Signed-in only", hint: "must be authenticated", rules: { read: "auth != null", create: "auth != null", update: "auth != null", delete: "auth != null" } },
-  { label: "Owner only", hint: "reads public, owner writes", rules: { read: "true", create: "auth != null", update: "auth.username == doc.owner", delete: "auth.username == doc.owner" } },
+  { label: "Owner only", hint: "reads public, you may only write your own rows", rules: { read: "true", create: "auth.username == doc.owner", update: "auth.username == doc.owner", delete: "auth.username == doc.owner" } },
 ];
 
 export function RulesEditor({ projectRef, apiKey }: { projectRef: string; apiKey: string }) {

@@ -331,6 +331,45 @@ if (SINK) {
   console.log("  … live mail transport without a sink — skipping the send (would email for real)");
 }
 
+// ── per-user admin routes ───────────────────────────────────────────────────
+{
+  // Every address contains "@", which encodeURIComponent turns into %40 — so
+  // these routes only work if the server decodes the path segment. They were
+  // 404-ing for every real email until it did.
+  const email = `admin-probe-${process.pid}@example.com`;
+  const signup = await api("POST", `/projects/${ref}/auth/signup`, {
+    auth: false,
+    body: { email, password: "hunter2hunter2" },
+  });
+  ok(signup.status === 201, "admin routes: user created");
+
+  const verified = await api("POST", `/projects/${ref}/users/${encodeURIComponent(email)}/verify`);
+  ok(verified.status === 200, `admin routes: verify by encoded email (${verified.status})`);
+  // A 200 is not proof: the write has to have landed on a row. Addressed by
+  // slug, these updates used to match nothing and still report success.
+  const listed = await api("GET", `/projects/${ref}/users`);
+  ok(
+    listed.data.find((u) => u.email === email)?.verified === true,
+    "admin routes: verify actually changed the user",
+  );
+
+  const pw = await api("POST", `/projects/${ref}/users/${encodeURIComponent(email)}/password`, {
+    body: { password: "newpassword123" },
+  });
+  ok(pw.status === 200, "admin routes: set password by encoded email");
+
+  const login = await api("POST", `/projects/${ref}/auth/login`, {
+    auth: false,
+    body: { email, password: "newpassword123" },
+  });
+  ok(login.status === 200 && login.data.token, "admin routes: the user can sign in afterwards");
+
+  const gone = await api("DELETE", `/projects/${ref}/users/${encodeURIComponent(email)}`);
+  ok(gone.status === 200, "admin routes: delete by encoded email");
+  const users = await api("GET", `/projects/${ref}/users`);
+  ok(!users.data.some((u) => u.email === email), "admin routes: the user is gone");
+}
+
 // ── cleanup ─────────────────────────────────────────────────────────────────
 {
   const r = await api("DELETE", `/projects/${ref}`);

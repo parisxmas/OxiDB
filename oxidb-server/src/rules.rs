@@ -12,7 +12,8 @@
 //! | `true` / `false` | Allow / deny |
 //! | `auth != null` | Authenticated user |
 //! | `auth.role == 'admin'` | Role check |
-//! | `auth.username == doc.owner` | Document ownership |
+//! | `auth.username == doc.owner` | Document ownership (on create, `doc` is the row being created) |
+//! | `auth.username == newDoc.owner` | The incoming row, when an update rule must compare it with the stored one |
 //! | `A && B`, `A \|\| B` | Logical AND / OR |
 //!
 //! # Commands
@@ -187,19 +188,21 @@ fn validate_atom(tok: &str) -> Result<(), String> {
             )),
         };
     }
-    if let Some(field) = t.strip_prefix("doc.") {
-        let ok = !field.is_empty()
-            && field
-                .split('.')
-                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'));
-        return if ok {
-            Ok(())
-        } else {
-            Err(format!("invalid document field `doc.{field}`"))
-        };
+    for prefix in ["doc.", "newDoc."] {
+        if let Some(field) = t.strip_prefix(prefix) {
+            let ok = !field.is_empty()
+                && field.split('.').all(|seg| {
+                    !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_')
+                });
+            return if ok {
+                Ok(())
+            } else {
+                Err(format!("invalid document field `{prefix}{field}`"))
+            };
+        }
     }
     Err(format!(
-        "unknown term `{t}` — use auth, auth.username, auth.role, doc.<field>, a 'string', true/false/null, or a number"
+        "unknown term `{t}` — use auth, auth.username, auth.role, doc.<field>, newDoc.<field>, a 'string', true/false/null, or a number"
     ))
 }
 
@@ -306,6 +309,16 @@ pub fn check_access(
         Operation::Create => &rules.create,
         Operation::Update => &rules.update,
         Operation::Delete => &rules.delete,
+    };
+
+    // On create there is no existing row, so `doc.` means the row being
+    // created — otherwise every ownership rule (`auth.username == doc.owner`)
+    // compares against null and denies the very insert it was written to
+    // permit. `newDoc.` stays available for update rules that compare the
+    // incoming row against the stored one.
+    let doc = match op {
+        Operation::Create => new_doc,
+        _ => doc,
     };
 
     if eval_rule_expr(expr, auth, doc, new_doc) {
@@ -558,6 +571,85 @@ fn is_truthy(val: &Value) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod create_ownership_tests {
+    use super::{Operation, eval_rule_expr, validate_rule_expr};
+    use crate::rules::AuthContext;
+    use serde_json::json;
+
+    fn user(email: &str) -> AuthContext {
+        AuthContext::from_claims(email, "authenticated")
+    }
+
+    /// The rule a real app writes: you may only create rows that are yours.
+    /// It has to see the row being created — there is no stored one yet.
+    #[test]
+    fn ownership_on_create_reads_the_incoming_row() {
+        let expr = "auth.username == doc.owner";
+        assert!(
+            validate_rule_expr(expr).is_ok(),
+            "the expression must be accepted"
+        );
+
+        let incoming = json!({ "owner": "ada@example.com", "note": "hi" });
+        // Mirrors check_access's binding for Create: `doc` is the new row.
+        assert!(
+            eval_rule_expr(
+                expr,
+                &user("ada@example.com"),
+                Some(&incoming),
+                Some(&incoming)
+            ),
+            "creating a row you own must be allowed"
+        );
+        assert!(
+            !eval_rule_expr(
+                expr,
+                &user("kai@example.com"),
+                Some(&incoming),
+                Some(&incoming)
+            ),
+            "creating a row owned by someone else must be refused"
+        );
+        // Before the fix this was the *only* outcome: with no stored row,
+        // `doc.owner` was null and the rule denied everyone.
+        assert!(
+            !eval_rule_expr(expr, &user("ada@example.com"), None, Some(&incoming)),
+            "with no document bound at all, nothing matches"
+        );
+    }
+
+    #[test]
+    fn new_doc_is_a_valid_namespace() {
+        // The evaluator always understood `newDoc.`; the validator rejected it,
+        // so it could never be saved.
+        assert!(validate_rule_expr("auth.username == newDoc.owner").is_ok());
+        assert!(validate_rule_expr("newDoc.").is_err());
+        assert!(validate_rule_expr("unknownThing.owner").is_err());
+    }
+
+    #[test]
+    fn update_rules_can_compare_the_stored_row_with_the_incoming_one() {
+        let stored = json!({ "owner": "ada@example.com" });
+        let incoming = json!({ "owner": "kai@example.com" });
+        // "the row must stay mine" — an ownership transfer is refused.
+        let expr = "auth.username == newDoc.owner";
+        assert!(!eval_rule_expr(
+            expr,
+            &user("ada@example.com"),
+            Some(&stored),
+            Some(&incoming)
+        ));
+        assert!(eval_rule_expr(
+            "auth.username == doc.owner",
+            &user("ada@example.com"),
+            Some(&stored),
+            Some(&incoming)
+        ));
+        let _ = Operation::Update;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -737,12 +829,12 @@ mod tests {
         // Typos / unknown terms / malformed shapes — must be rejected, not
         // silently treated as a falsy unknown at eval time.
         for bad in [
-            "dytjuer",                       // bare unknown term (the reported case)
-            "auth.name == 'x'",              // auth has only username/role
-            "auth.username = doc.owner",     // single '=' is not a comparison → unknown atom
-            "doc. == 'x'",                   // empty doc field
-            "",                              // empty
-            "admin && foo",                  // unknown atoms around &&
+            "dytjuer",                   // bare unknown term (the reported case)
+            "auth.name == 'x'",          // auth has only username/role
+            "auth.username = doc.owner", // single '=' is not a comparison → unknown atom
+            "doc. == 'x'",               // empty doc field
+            "",                          // empty
+            "admin && foo",              // unknown atoms around &&
         ] {
             assert!(validate_rule_expr(bad).is_err(), "should reject: {bad:?}");
         }
@@ -761,8 +853,16 @@ mod tests {
         let alice = AuthContext::from_claims("alice", "authenticated");
         match read_access(&db, "tasks", &alice) {
             ReadAccess::Filter(expr) => {
-                assert!(row_visible(&expr, &alice, &json!({ "owner": "alice", "t": 1 })));
-                assert!(!row_visible(&expr, &alice, &json!({ "owner": "bob", "t": 2 })));
+                assert!(row_visible(
+                    &expr,
+                    &alice,
+                    &json!({ "owner": "alice", "t": 1 })
+                ));
+                assert!(!row_visible(
+                    &expr,
+                    &alice,
+                    &json!({ "owner": "bob", "t": 2 })
+                ));
             }
             _ => panic!("row-dependent read rule must yield a per-row Filter"),
         }
@@ -775,11 +875,17 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(read_access(&db, "board", &alice), ReadAccess::All));
-        assert!(matches!(read_access(&db, "board", &anon()), ReadAccess::None));
+        assert!(matches!(
+            read_access(&db, "board", &anon()),
+            ReadAccess::None
+        ));
 
         // No rules → All; admin bypasses → All.
         assert!(matches!(read_access(&db, "open", &anon()), ReadAccess::All));
-        assert!(matches!(read_access(&db, "tasks", &admin_auth()), ReadAccess::All));
+        assert!(matches!(
+            read_access(&db, "tasks", &admin_auth()),
+            ReadAccess::All
+        ));
     }
 
     #[test]

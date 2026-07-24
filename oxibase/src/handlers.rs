@@ -2203,12 +2203,18 @@ pub fn list_users(req: &HttpRequest, state: &State, project_ref: &str) -> HttpRe
 }
 
 /// Shared owner gate for the per-user admin endpoints.
-fn owned_user<'a>(
+/// Resolve the `{email}` path segment of a per-user admin route to a user of
+/// `project_ref` that `req`'s caller owns.
+///
+/// The segment arrives **percent-encoded** — every address contains `@`, which
+/// `encodeURIComponent` turns into `%40` — so it has to be decoded before it
+/// can match anything stored.
+fn owned_user(
     req: &HttpRequest,
     state: &State,
     project_ref: &str,
-    email: &'a str,
-) -> Result<&'a str, HttpResponse> {
+    email: &str,
+) -> Result<(String, String), HttpResponse> {
     let owner = match authenticate(req, state) {
         Ok(c) => c.sub,
         Err(r) => return Err(r),
@@ -2219,6 +2225,7 @@ fn owned_user<'a>(
         Err(e) => return Err(resp(502, json!({ "message": format!("upstream: {e}") }))),
     };
     let project_ref = project_ref.as_str();
+    let email = urldecode(email);
     let exists = state
         .upstream
         .find(
@@ -2231,7 +2238,9 @@ fn owned_user<'a>(
     if !exists {
         return Err(resp(404, json!({ "message": "user not found" })));
     }
-    Ok(email)
+    // Both, deliberately: the path may name the project by slug, and a write
+    // keyed on a slug matches nothing while still reporting success.
+    Ok((project_ref.to_string(), email))
 }
 
 /// `DELETE /platform/v1/projects/{ref}/users/{email}` — remove a user and
@@ -2242,10 +2251,11 @@ pub fn delete_user(
     project_ref: &str,
     email: &str,
 ) -> HttpResponse {
-    let email = match owned_user(req, state, project_ref, email) {
-        Ok(e) => e,
+    let (project_ref, email) = match owned_user(req, state, project_ref, email) {
+        Ok(v) => v,
         Err(r) => return r,
     };
+    let project_ref = project_ref.as_str();
     let _ = state.upstream.delete(
         "refresh_tokens",
         &json!({ "project_ref": project_ref, "email": email }),
@@ -2267,10 +2277,11 @@ pub fn admin_set_user_password(
     project_ref: &str,
     email: &str,
 ) -> HttpResponse {
-    let email = match owned_user(req, state, project_ref, email) {
-        Ok(e) => e,
+    let (project_ref, email) = match owned_user(req, state, project_ref, email) {
+        Ok(v) => v,
         Err(r) => return r,
     };
+    let project_ref = project_ref.as_str();
     let body = parse_body(req);
     let Some(password) = str_field(&body, "password") else {
         return resp(400, json!({ "message": "password required" }));
@@ -2307,10 +2318,11 @@ pub fn admin_verify_user(
     project_ref: &str,
     email: &str,
 ) -> HttpResponse {
-    let email = match owned_user(req, state, project_ref, email) {
-        Ok(e) => e,
+    let (project_ref, email) = match owned_user(req, state, project_ref, email) {
+        Ok(v) => v,
         Err(r) => return r,
     };
+    let project_ref = project_ref.as_str();
     match state.upstream.update(
         "users",
         &json!({ "project_ref": project_ref, "email": email }),
