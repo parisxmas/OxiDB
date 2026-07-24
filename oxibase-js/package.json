@@ -1,7 +1,7 @@
 {
   "name": "oxibase-js",
   "version": "0.1.0",
-  "description": "Supabase-compatible JavaScript client for OxiBase — createClient(url, key).from('table')... over the PostgREST data plane, plus a .sql() escape hatch to the SQL engine.",
+  "description": "JavaScript client for OxiBase — createClient(url, key).from('table')... over the PostgREST data plane, plus .sql(), .subscribe() realtime and .storage.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -17,7 +17,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node test/e2e.mjs"
   },
-  "keywords": ["oxibase", "oxidb", "supabase", "postgrest", "database", "client"],
+  "keywords": ["oxibase", "oxidb", "postgrest", "database", "client"],
   "license": "SEE LICENSE IN ../LICENSE",
   "dependencies": {
     "@supabase/postgrest-js": "^1.19.4"

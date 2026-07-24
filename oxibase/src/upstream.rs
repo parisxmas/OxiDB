@@ -77,6 +77,25 @@ impl Upstream {
             .map_err(|e| e.to_string())
     }
 
+    /// One raw wire request (any command), returning its `data` payload.
+    pub fn raw_call(&self, request: &Value) -> Result<Value, String> {
+        self.pool.with(|c| c.call(request)).map_err(|e| e.to_string())
+    }
+
+    /// Collection names of an arbitrary database.
+    pub fn list_collections_in(&self, db: &str) -> Result<Vec<String>, String> {
+        self.raw_call(&serde_json::json!({ "cmd": "list_collections", "db": db }))
+            .map(|d| {
+                d.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+    }
+
     /// Sorted, limited find in an arbitrary database (raw wire `find` with
     /// options) — used to read the shared request-log sink in the default db.
     pub fn find_sorted_in(
@@ -86,6 +105,7 @@ impl Upstream {
         query: &Value,
         sort: &Value,
         limit: u64,
+        skip: u64,
     ) -> Result<Vec<Value>, String> {
         self.pool
             .with(|c| {
@@ -96,6 +116,7 @@ impl Upstream {
                     "query": query,
                     "sort": sort,
                     "limit": limit,
+                    "skip": skip,
                 }))
                 .map(|d| d.as_array().cloned().unwrap_or_default())
             })

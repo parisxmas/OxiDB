@@ -50,8 +50,8 @@ async function call<T>(
 /**
  * A collection the engine manages for its own bookkeeping (alerts, security
  * rules, TTL/retention, profiling, full-text index …). These use a leading
- * underscore by convention and aren't the developer's data, so — like Supabase
- * hides its internal schemas — we keep them out of the dashboard.
+ * underscore by convention and aren't the developer's data, so
+ * the dashboard keeps them out of sight.
  */
 export const isSystemCollection = (name: string): boolean => name.startsWith("_");
 
@@ -428,6 +428,20 @@ export function deleteObject(
   objKey: string,
 ): Promise<unknown> {
   return call("DELETE", ref, objectPath(bucket, objKey), key);
+}
+
+/** Consistent backup of the whole project database, as a tar Blob
+ *  (service_role key required). */
+export async function downloadBackup(ref: string, key: string): Promise<Blob> {
+  const res = await fetch(withDb(ref, "/api/backup"), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+  return res.blob();
 }
 
 // Table names come from SHOW TABLES (engine-validated identifiers), but quote

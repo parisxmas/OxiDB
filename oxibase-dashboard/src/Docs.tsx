@@ -73,7 +73,7 @@ export function Docs({ onOpenConsole }: { onOpenConsole: () => void }) {
         <main className="docs-body">
           <h1>Using OxiBase from JavaScript</h1>
           <p className="lead">
-            OxiBase is a Supabase-style backend on the OxiDB engine: every project is an isolated
+            OxiBase is a complete backend platform on the OxiDB engine: every project is an isolated
             database with a REST data plane (PostgREST-compatible), a SQL engine, a time-series
             engine, per-project API keys, end-user auth, and security rules. This tutorial takes you
             from an empty project to a working app, from the browser or Node (18+, for built-in{" "}
@@ -113,8 +113,8 @@ export function Docs({ onOpenConsole }: { onOpenConsole: () => void }) {
           {/* ── 2 ─────────────────────────────────────────────────────────── */}
           <h2 id="install">2 · Install &amp; connect</h2>
           <p>
-            The client is <code>oxibase-js</code> — a thin layer over the real{" "}
-            <code>@supabase/postgrest-js</code> builder, so the query API is exactly Supabase&apos;s.
+            The client is <code>oxibase-js</code> — a thin client over OxiBase&apos;s
+            PostgREST-compatible API, with a full-featured query builder.
             It is not on npm yet; install it straight from this site:
           </p>
           <Code title="shell (Node / bundlers)">{`npm install https://oxibase.baltavista.com/oxibase-js.tgz`}</Code>
@@ -140,17 +140,16 @@ const oxibase = createClient(
   { ref: "YOUR_PROJECT_REF" },
 );`}</Code>
           <p className="note">
-            No SDK? Everything below is plain HTTP — §8 shows the same operations with raw{" "}
-            <code>fetch</code>, and the pure-npm <code>@supabase/postgrest-js</code> works too (it is
-            what <code>oxibase-js</code> wraps).
+            No SDK? Everything below is plain HTTP — §10 shows the same operations with raw{" "}
+            <code>fetch</code>, and any PostgREST client library works too.
           </p>
 
           {/* ── 3 ─────────────────────────────────────────────────────────── */}
           <h2 id="documents">3 · Documents (CRUD + queries)</h2>
           <p>
             The document engine stores schemaless JSON in <strong>collections</strong> —
-            auto-created on first insert. <code>.from()</code> is the Supabase query builder,
-            unchanged:
+            auto-created on first insert. <code>.from()</code> is a full PostgREST query
+            builder:
           </p>
           <Code title="insert / select / update / delete">{`// insert one (or an array for many)
 const { data, error } = await oxibase
@@ -262,8 +261,8 @@ const { data } = await tsdb.from("cpu")
           {/* ── 6 ─────────────────────────────────────────────────────────── */}
           <h2 id="auth">6 · End-user auth</h2>
           <p>
-            Your app&apos;s own users (not you, the developer) sign up <em>against the project</em> —
-            the Supabase <code>supabase.auth</code> analog. Pass <code>authUrl</code> (the control
+            Your app&apos;s own users (not you, the developer) sign up <em>against the project</em>.
+            Pass <code>authUrl</code> (the control
             plane, same origin on this deployment) and start from the anon key:
           </p>
           <Code title="signup / login / session">{`const oxibase = createClient("https://oxibase.baltavista.com", ANON_KEY, {
@@ -330,7 +329,7 @@ await oxibase.auth.resetPasswordForEmail(email);
           {/* ── 8 ─────────────────────────────────────────────────────────── */}
           <h2 id="realtime">8 · Realtime subscriptions</h2>
           <p>
-            Live changes push over a WebSocket — the Supabase realtime analog.{" "}
+            Live changes push over a WebSocket.{" "}
             <code>oxibase.subscribe(collection, callback)</code> opens one shared connection
             (authenticated with your key or the signed-in user&apos;s session), reconnects
             automatically, and delivers <code>insert</code> / <code>update</code> /{" "}
@@ -364,7 +363,7 @@ sub.unsubscribe();`}</Code>
           {/* ── 9 ─────────────────────────────────────────────────────────── */}
           <h2 id="storage">9 · File storage</h2>
           <p>
-            Every project has an isolated blob store — the Supabase Storage analog. Buckets are
+            Every project has an isolated blob store for files. Buckets are
             created on first upload (or explicitly); objects keep their MIME type and get an ETag.
             Reads work with the anon key; <strong>uploads and deletes need the service_role key</strong>{" "}
             (do them server-side), and each project has a storage quota (visible in the console).

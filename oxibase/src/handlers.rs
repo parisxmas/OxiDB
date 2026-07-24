@@ -1457,19 +1457,21 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let slug = doc_slug(&doc, project_ref);
-    let limit: u64 = req
-        .query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("limit="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100)
-        .min(500);
+    let qp = |key: &str| {
+        req.query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let limit = qp("limit=").unwrap_or(50).min(500);
+    let offset = qp("offset=").unwrap_or(0).min(100_000);
     let rows = match state.upstream.find_sorted_in(
         "oxidb",
         "_msgpack_logs",
         &json!({ "db": { "$in": [project_ref, slug] } }),
         &json!({ "ts": -1 }),
         limit,
+        offset,
     ) {
         Ok(r) => r,
         Err(e) if e.contains("not found") => Vec::new(), // sink not created yet
@@ -1488,4 +1490,33 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
         })
         .collect();
     resp(200, json!(out))
+}
+
+/// `GET /platform/v1/projects/{ref}/types` — generated TypeScript definitions
+/// for the project (SQL tables exact, collections inferred). `text/typescript`.
+pub fn project_types(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let doc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let name = doc.get("name").and_then(|v| v.as_str()).unwrap_or(project_ref);
+    match crate::typegen::generate(&state.upstream, project_ref, name) {
+        Ok(ts) => HttpResponse {
+            status: 200,
+            status_text: "OK",
+            content_type: "text/typescript; charset=utf-8".into(),
+            headers: vec![(
+                "Content-Disposition".to_string(),
+                format!("attachment; filename=\"{project_ref}-types.ts\""),
+            )],
+            body: ts.into_bytes(),
+            content_length_override: None,
+        },
+        Err(e) => resp(502, json!({ "message": format!("type generation: {e}") })),
+    }
 }

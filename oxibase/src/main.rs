@@ -20,6 +20,7 @@ mod crypto;
 mod gelf;
 mod handlers;
 mod mail;
+mod typegen;
 mod upstream;
 
 use std::sync::Arc;
@@ -158,6 +159,9 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         }
         ("GET", ["platform", "v1", "projects", r, "logs"]) => {
             handlers::project_logs(req, state, r)
+        }
+        ("GET", ["platform", "v1", "projects", r, "types"]) => {
+            handlers::project_types(req, state, r)
         }
         ("DELETE", ["platform", "v1", "projects", r, "users", email]) => {
             handlers::delete_user(req, state, r, email)

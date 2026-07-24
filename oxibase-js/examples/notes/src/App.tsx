@@ -183,7 +183,7 @@ function Addresses() {
   );
 }
 
-/** Document engine — the `deneme` collection, Supabase-style `.from()`. */
+/** Document engine — the `deneme` collection via `.from()`. */
 function Deneme() {
   const [docs, setDocs] = useState<Doc[]>([]);
   const [error, setError] = useState<string | null>(null);

@@ -11,12 +11,41 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.39.10 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.39.10</h3>
+        <span class="version-date">2026-07-23</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; OxiBase, a multi-tenant backend on top of OxiDB</h4>
+        <ul>
+          <li><strong>A multi-tenant control plane.</strong> Provision isolated tenant projects, each with its own database and ES256/JWKS API keys (anon + service_role). Per-project <strong>end-user auth</strong> (sign-up / sign-in with rotating refresh tokens), path-based tenant addressing (<code>&lt;host&gt;/&lt;project&gt;/rest/v1/&hellip;</code>) so no wildcard cert is needed, and a static dashboard. Developer sign-in is Google-only.</li>
+          <li><strong>Row-level security.</strong> A read rule that references <code>doc.&lt;field&gt;</code> is enforced per returned row &mdash; an unfiltered <code>select</code> returns only the caller's own rows. Security-rule expressions are validated before they are saved, so a typo can no longer become a silent fail-closed &ldquo;deny all&rdquo;.</li>
+          <li><strong>Per-project resource quotas.</strong> Collection, SQL-table and total-document caps, owned by the control plane and enforced in the data plane at creation/insert time; shown and editable in the dashboard.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; observability</h4>
+        <ul>
+          <li><strong>Request logging to OxiDB itself.</strong> The server can ship a structured message per request to OxiDB's own <strong>GELF</strong> ingest port, or to a lighter <strong>MessagePack</strong> log port (compact binary, no per-field auto-indexing) &mdash; so a load test's every operation lands in a queryable collection.</li>
+          <li><strong>WASM OPFS persistence.</strong> The in-browser build can snapshot its database to the Origin Private File System and restore it on reload, so data survives page refreshes.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Changed &mdash; memory: one shared document cache</h4>
+        <ul>
+          <li><strong>Resident memory no longer scales with the number of collections.</strong> The deserialized-value and encoded-bytes caches were per-collection, each with its own budget, so a many-collection / multi-tenant workload multiplied RAM. They are now a single process-global cache under one budget. On a 20-tenant, 100-collection, 500k-document load test this cut resident memory from <strong>~1.3&nbsp;GiB to ~307&nbsp;MiB</strong> at the same throughput. Tune with <code>OXIDB_DOC_CACHE_SIZE</code> / <code>OXIDB_DOC_BYTES_CACHE_SIZE</code>.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.38.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.38.0</h3>
         <span class="version-date">2026-07-19</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Changed &mdash; disk-first document storage is the default</h4>

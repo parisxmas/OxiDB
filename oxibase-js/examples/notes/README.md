@@ -6,7 +6,7 @@ with [`oxibase-js`](../../):
 - **`addressses`** — a SQL-engine table (`id` PK, `name`, `surname`, `address`,
   `birthdate`), used through the `oxibase.sql()` extension with parameterized
   statements (`INSERT … VALUES (?, …)`).
-- **`deneme`** — a document collection, used through the Supabase-style
+- **`deneme`** — a document collection, used through the
   `oxibase.from("deneme").select()/insert()/delete()` builder.
 
 ## Run
@@ -35,7 +35,7 @@ over REST is RBAC-gated: the anon key (role `read`) can only `SELECT`, never
 service_role key acceptable **only for a localhost demo**; never ship it in a
 real browser bundle.
 
-For a document-only app the Supabase model applies unchanged: use the anon key
+For a document-only app, use the anon key
 plus a security rule on the collection (`setup.mjs` shows how — it installs a
 public rule with the service_role key, server-side).
 

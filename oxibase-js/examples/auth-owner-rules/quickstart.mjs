@@ -1,6 +1,6 @@
 // Per-project end-user auth + owner-only security rules with oxibase-js.
 //
-// A project's own users sign up against the project (Supabase GoTrue analog):
+// A project's own users sign up against the project:
 // `oxibase.auth.signUp/signInWithPassword` mints a token signed with the
 // PROJECT's key, carrying the user's identity. The data plane verifies it with
 // the project's public key, and rules see `auth.username` (the email) and

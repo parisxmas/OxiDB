@@ -1,15 +1,17 @@
 # oxibase-js
 
-A **Supabase-compatible** JavaScript/TypeScript client for [OxiBase](../oxibase).
+The JavaScript/TypeScript client for [OxiBase](../oxibase).
 
-OxiBase's data plane implements the PostgREST wire grammar (ADR-0019), so the
-data API *is* the real [`@supabase/postgrest-js`](https://github.com/supabase/postgrest-js)
-query builder. `createClient(url, key).from("table")` behaves exactly like
-`supabase.from("table")`. On top of that, oxibase-js adds:
+OxiBase's data plane implements the PostgREST wire grammar (ADR-0019), so
+`createClient(url, key).from("table")` gives you a full-featured PostgREST
+query builder. On top of that, oxibase-js adds:
 
 - **per-project targeting** — every request carries `?db=<ref>`
 - **bearer auth** — the project's `anon` or `service_role` key
-- **`.sql()`** — an OxiBase extension for the standalone SQL engine
+- **`.sql()`** — the standalone SQL engine
+- **`.subscribe()`** — realtime change events over WebSocket
+- **`.storage`** — per-project file storage
+- **`.auth`** — end-user sign-up / sign-in with sessions
 
 ## Install
 
@@ -17,7 +19,7 @@ query builder. `createClient(url, key).from("table")` behaves exactly like
 npm install oxibase-js
 ```
 
-## Use it like Supabase
+## Quick start
 
 ```ts
 import { createClient } from "oxibase-js";
@@ -28,7 +30,7 @@ const oxibase = createClient(
   { ref: "your-project-ref" },
 );
 
-// The full PostgREST / Supabase query builder:
+// The full PostgREST query builder:
 const { data, error } = await oxibase
   .from("notes")
   .select("*")
@@ -88,7 +90,7 @@ In the OxiBase dashboard these are the **Collections** and **SQL Tables** tabs.
 ## Example app
 
 [`examples/notes`](examples/notes) — a tiny React app that does full CRUD against
-an OxiBase project with this client, exactly the way a Supabase quickstart does.
+an OxiBase project with this client.
 
 ## Develop
 

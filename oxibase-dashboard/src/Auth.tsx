@@ -126,8 +126,8 @@ export function Auth({ onAuthed, onDocs }: { onAuthed: () => void; onDocs: () =>
         <div className="card auth-card info-panel">
           <h3 style={{ marginTop: 0 }}>What is OxiBase?</h3>
           <p className="muted small">
-            A multi-tenant <strong>backend-as-a-service built on OxiDB</strong> — the
-            Supabase model, with OxiDB as the engine instead of Postgres.
+            A multi-tenant <strong>backend-as-a-service built on OxiDB</strong> —
+            isolated projects, instant APIs, auth, and per-row security on one engine.
           </p>
           <ul className="info-list">
             <li>
@@ -139,7 +139,7 @@ export function Auth({ onAuthed, onDocs }: { onAuthed: () => void; onDocs: () =>
               <strong>Instant REST API.</strong> Each collection and SQL table is served at{" "}
               <code>/rest/v1/…</code> with a <strong>PostgREST-compatible</strong> grammar
               (filters, ordering, pagination, resource embeds), so{" "}
-              <code>@supabase/postgrest-js</code> and PostgREST clients work unmodified.
+              standard PostgREST clients work unmodified.
             </li>
             <li>
               <strong>Asymmetric per-project keys.</strong> Each project signs tokens with

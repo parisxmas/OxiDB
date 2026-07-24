@@ -483,6 +483,44 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ));
     }
 
+    // ── On-demand backup download (`POST /api/backup`) ────────────────
+    // Runs the document engine's consistent backup for the TARGET database
+    // (`?db=<ref>` — the whole point for OxiBase projects) into a temp file,
+    // streams the tar back, and removes the file. Stateless: nothing to
+    // retain or expire server-side. Admin-only (the service_role key).
+    if let ("POST", ["api", "backup"]) = (req.method.as_str(), segments.as_slice()) {
+        let name = db_name.as_deref().unwrap_or("default");
+        let tmp = std::env::temp_dir().join(format!(
+            "oxidb-backup-{}-{}.tar.gz",
+            name.replace(['/', '\\', '.'], "_"),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp); // stale leftover from a crash
+        let result = state.db.backup(&tmp);
+        let resp = match result {
+            Ok(info) => match std::fs::read(&tmp) {
+                Ok(bytes) => HttpResponse {
+                    status: 200,
+                    status_text: "OK",
+                    content_type: "application/gzip".into(),
+                    headers: vec![
+                        (
+                            "Content-Disposition".to_string(),
+                            format!("attachment; filename=\"{name}-backup.tar.gz\""),
+                        ),
+                        ("X-Backup-Collections".to_string(), info.collections.to_string()),
+                    ],
+                    body: bytes,
+                    content_length_override: None,
+                },
+                Err(e) => json_response(500, "Internal Server Error", json!({"error": e.to_string()})),
+            },
+            Err(e) => json_response(500, "Internal Server Error", json!({"error": e.to_string()})),
+        };
+        let _ = std::fs::remove_file(&tmp);
+        return with_rest_cors(resp);
+    }
+
     // ── Per-project file storage (`/api/storage/…`) ───────────────────
     // Handled outside the generic match: downloads return raw bytes with the
     // stored Content-Type, which the JSON-only match below cannot express.
@@ -1218,7 +1256,8 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
     // Mutating administrative endpoints — admin only.
     let admin_only = matches!(
         (method, segments),
-        ("DELETE", ["api", "collections", _])
+        ("POST", ["api", "backup"])
+            | ("DELETE", ["api", "collections", _])
             | ("POST", ["api", "procedures"])
             | ("DELETE", ["api", "procedures", _])
             | ("POST", ["api", "rules", _])

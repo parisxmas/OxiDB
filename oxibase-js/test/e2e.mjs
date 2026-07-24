@@ -1,5 +1,5 @@
 // e2e for oxibase-js: provision a throwaway project on a running OxiBase control
-// plane, then drive the SDK exactly like you'd use supabase-js.
+// plane, then drive the SDK end to end.
 //
 //   OXIBASE_CP_URL   control plane (default http://127.0.0.1:4460)
 //   OXIBASE_DATA_URL data plane REST (default http://127.0.0.1:8087)
@@ -35,7 +35,7 @@ ok(pj.status === 201 && pj.data.ref, "control plane: create project");
 const ref = pj.data.ref;
 const key = pj.data.service_role_key;
 
-// ── Use it just like Supabase ───────────────────────────────────────────────
+// ── The query builder ───────────────────────────────────────────────────────
 const oxibase = createClient(DATA, key, { ref });
 
 // insert (returns representation by default in postgrest-js when you chain .select)

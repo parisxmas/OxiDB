@@ -1,8 +1,7 @@
-// oxibase-js — a Supabase-compatible JavaScript client for OxiBase.
+// oxibase-js — the OxiBase JavaScript client.
 //
-// OxiBase's data plane implements PostgREST (ADR-0019), so the data API IS the
-// real `@supabase/postgrest-js` query builder — `createClient(url, key).from(t)`
-// behaves exactly like `supabase.from(t)`. On top of that we add:
+// OxiBase's data plane implements PostgREST (ADR-0019), so `.from()` is a
+// full-featured PostgREST query builder. On top of that we add:
 //   • per-project targeting  — every request carries `?db=<ref>`
 //   • bearer auth            — the project's anon or service_role key
 //   • `.sql()`               — an OxiBase extension for the standalone SQL engine
@@ -55,7 +54,7 @@ export interface AuthResult {
   error: string | null;
 }
 
-/** End-user auth for an OxiBase project — the Supabase `supabase.auth` analog. */
+/** End-user auth for an OxiBase project (sign-up / sign-in / sessions). */
 export interface OxibaseAuth {
   /** Register an end-user of this project and start their session. */
   signUp(credentials: { email: string; password: string }): Promise<AuthResult>;
@@ -118,7 +117,7 @@ export interface StorageObject {
   created_at: string;
 }
 
-/** Operations on one storage bucket — the Supabase `storage.from()` analog. */
+/** Operations on one storage bucket. */
 export interface StorageBucket {
   /** Upload (or overwrite) an object. `data` may be a Blob/File, ArrayBuffer,
    *  typed array, or string. Requires the service_role key (writes are
@@ -157,7 +156,7 @@ export interface OxibaseStorage {
 
 export interface OxibaseClient {
   /**
-   * PostgREST query builder for a table/collection — the Supabase `.from()`.
+   * PostgREST query builder for a table/collection.
    *
    * Engine dispatch (server-side, ADR-0019): if `name` is a **SQL table** the
    * call is served by the SQL engine, otherwise by the **document engine** (a
@@ -171,7 +170,7 @@ export interface OxibaseClient {
    * **time-series engine** (sends `Accept-Profile: tsdb`). Requires `OXIDB_TSDB=1`.
    */
   schema: PostgrestClient["schema"];
-  /** PostgREST stored-procedure call — the Supabase `.rpc()` (if the server exposes it). */
+  /** PostgREST stored-procedure call (if the server exposes it). */
   rpc: PostgrestClient["rpc"];
   /** Run SQL against the project's SQL engine (requires `OXIDB_SQL=1`). */
   sql: (text: string, params?: unknown[]) => Promise<{ results: SqlResult[] | null; error: string | null }>;

@@ -1,6 +1,6 @@
 # Per-project end-user auth + owner-only rules
 
-The Supabase **auth + RLS** story, per OxiBase project: a project's own users
+**End-user auth + row-level security**, per OxiBase project: a project's own users
 sign up against it, get a token signed with the **project's key**, and security
 rules enforce per-user, per-row authorization.
 
@@ -32,7 +32,7 @@ Rules (installed once by the operator with the service_role key):
 | update | `auth.username == doc.owner` | may only edit their own (per row) |
 | delete | `auth.username == doc.owner` | may only delete their own (per row) |
 
-`service_role` bypasses rules entirely (Supabase semantic) — used here only for
+`service_role` bypasses rules entirely — used here only for
 the operator's rule install and cleanup, never in the browser.
 
 ## Run

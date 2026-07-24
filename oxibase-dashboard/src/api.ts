@@ -147,6 +147,19 @@ export function verifyProjectUser(ref: string, email: string): Promise<unknown> 
   );
 }
 
+/** Generated TypeScript definitions for the project (SQL exact, collections inferred). */
+export async function downloadTypes(ref: string): Promise<string> {
+  const t = localStorage.getItem("oxibase_token");
+  const res = await fetch(`${BASE}/platform/v1/projects/${encodeURIComponent(ref)}/types`, {
+    headers: { Authorization: `Bearer ${t}` },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error(data?.message ?? `HTTP ${res.status}`);
+  }
+  return res.text();
+}
+
 /** Complete an end-user password reset (public — token from the email link). */
 export async function completePasswordReset(
   ref: string,
@@ -175,6 +188,6 @@ export interface LogRow {
   ms?: number;
 }
 
-export function listProjectLogs(ref: string, limit = 100): Promise<LogRow[]> {
-  return req("GET", `/projects/${encodeURIComponent(ref)}/logs?limit=${limit}`);
+export function listProjectLogs(ref: string, limit = 50, offset = 0): Promise<LogRow[]> {
+  return req("GET", `/projects/${encodeURIComponent(ref)}/logs?limit=${limit}&offset=${offset}`);
 }

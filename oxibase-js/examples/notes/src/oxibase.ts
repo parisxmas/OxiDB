@@ -1,5 +1,4 @@
-// The whole "connect to OxiBase" story — identical in spirit to
-// `createClient(url, anonKey)` in a Supabase app. Three values come from the
+// The whole "connect to OxiBase" story in one call. Three values come from the
 // OxiBase dashboard (Open a project → API keys):
 //   VITE_OXIBASE_URL  the data-plane REST origin (the OxiDB server)
 //   VITE_OXIBASE_REF  the project ref

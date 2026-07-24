@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { type Project, getProject, updateProjectLimits } from "./api.ts";
-import { listCollections, runSql, countDocuments, listBuckets } from "./dataApi.ts";
+import { type Project, getProject, updateProjectLimits, downloadTypes } from "./api.ts";
+import { listCollections, runSql, countDocuments, listBuckets, downloadBackup } from "./dataApi.ts";
 import { FilesBrowser, fmtBytes } from "./FilesBrowser.tsx";
 import { UsersPanel } from "./UsersPanel.tsx";
 import { LogsPanel } from "./LogsPanel.tsx";
@@ -8,6 +8,18 @@ import { DataBrowser } from "./DataBrowser.tsx";
 import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
 import { RulesEditor } from "./RulesEditor.tsx";
+import {
+  IconBack,
+  IconBackup,
+  IconCollections,
+  IconFiles,
+  IconLogs,
+  IconRules,
+  IconSql,
+  IconTable,
+  IconTypes,
+  IconUsers,
+} from "./icons.tsx";
 
 type Tab = "collections" | "sqltables" | "sql" | "files" | "users" | "logs" | "rules";
 
@@ -15,6 +27,40 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("collections");
+  const [backingUp, setBackingUp] = useState(false);
+
+  async function genTypes() {
+    try {
+      const ts = await downloadTypes(projectRef);
+      const url = URL.createObjectURL(new Blob([ts], { type: "text/typescript" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${projectRef}-types.ts`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function backup() {
+    if (!project?.service_role_key) return;
+    setBackingUp(true);
+    setError(null);
+    try {
+      const blob = await downloadBackup(projectRef, project.service_role_key);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${projectRef}-${new Date().toISOString().slice(0, 10)}.tar.gz`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBackingUp(false);
+    }
+  }
 
   useEffect(() => {
     getProject(projectRef)
@@ -28,42 +74,50 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
 
   return (
     <section>
-      <div className="row between">
-        <div className="row" style={{ gap: 10 }}>
-          <button className="ghost" onClick={onBack}>
-            ← Projects
+      <div className="proj-head">
+        <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+          <button className="ghost iconbtn" onClick={onBack} title="Back to projects">
+            <IconBack /> Projects
           </button>
           <h1 style={{ margin: 0 }}>{project?.name || projectRef}</h1>
           <code className="ref">{projectRef}</code>
+          <span className="grow" />
+          <button
+            className="ghost iconbtn"
+            title="Generate TypeScript definitions for this project's tables and collections"
+            onClick={genTypes}
+          >
+            <IconTypes /> Types
+          </button>
+          <button
+            className="ghost iconbtn"
+            disabled={backingUp || !project?.service_role_key}
+            title="Download a consistent backup of the whole project database (tar.gz)"
+            onClick={backup}
+          >
+            <IconBackup /> {backingUp ? "Backing up…" : "Backup"}
+          </button>
         </div>
-        <div className="tabs">
-          <button
-            className={tab === "collections" ? "tab active" : "tab"}
-            onClick={() => setTab("collections")}
-          >
-            Collections
-          </button>
-          <button
-            className={tab === "sqltables" ? "tab active" : "tab"}
-            onClick={() => setTab("sqltables")}
-          >
-            SQL Tables
-          </button>
-          <button className={tab === "sql" ? "tab active" : "tab"} onClick={() => setTab("sql")}>
-            SQL
-          </button>
-          <button className={tab === "files" ? "tab active" : "tab"} onClick={() => setTab("files")}>
-            Files
-          </button>
-          <button className={tab === "users" ? "tab active" : "tab"} onClick={() => setTab("users")}>
-            Users
-          </button>
-          <button className={tab === "logs" ? "tab active" : "tab"} onClick={() => setTab("logs")}>
-            Logs
-          </button>
-          <button className={tab === "rules" ? "tab active" : "tab"} onClick={() => setTab("rules")}>
-            Rules
-          </button>
+        <div className="tabs tabbar">
+          {(
+            [
+              ["collections", "Collections", <IconCollections key="i" />],
+              ["sqltables", "SQL Tables", <IconTable key="i" />],
+              ["sql", "SQL", <IconSql key="i" />],
+              ["files", "Files", <IconFiles key="i" />],
+              ["users", "Users", <IconUsers key="i" />],
+              ["logs", "Logs", <IconLogs key="i" />],
+              ["rules", "Rules", <IconRules key="i" />],
+            ] as [Tab, string, React.ReactNode][]
+          ).map(([t, label, icon]) => (
+            <button
+              key={t}
+              className={tab === t ? "tab active" : "tab"}
+              onClick={() => setTab(t)}
+            >
+              {icon} {label}
+            </button>
+          ))}
         </div>
       </div>
 
