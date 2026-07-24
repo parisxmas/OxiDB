@@ -98,6 +98,11 @@ input {
   padding: 10px 12px; border-radius: 8px; font-size: 14px; outline: none;
 }
 input:focus { border-color: var(--accent); }
+select {
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  padding: 9px 10px; border-radius: 8px; font-size: 14px; outline: none;
+}
+select:focus { border-color: var(--accent); }
 button {
   border: 1px solid transparent; border-radius: 8px; padding: 9px 14px;
   font-size: 14px; font-weight: 600; cursor: pointer;

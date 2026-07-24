@@ -6574,7 +6574,8 @@ where
 }
 
 /// `CAST(v AS ty)` — NULL passes through; failed text parses are errors.
-fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
+/// Also the cast `ALTER COLUMN TYPE` applies to existing rows (`lib.rs`).
+pub(crate) fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
     use SqlType as T;
     let fail = |v: &Value| SqlError::Eval(format!("cannot cast {v:?} to {ty:?}"));
     Ok(match (v, ty) {

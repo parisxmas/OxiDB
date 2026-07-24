@@ -163,6 +163,40 @@ impl RowStore {
         self.projected = false;
     }
 
+    /// Rewrite one physical slot's cell in every stored row (`ALTER COLUMN
+    /// TYPE`). Rows too narrow to reach the slot are left as-is — their
+    /// logical value comes from the `fill` template, which the caller
+    /// regenerates from the column's (also-cast) default. In disk-first mode
+    /// the immutable mmap'd base materializes into the overlay; the caller
+    /// checkpoints right after, folding it into a fresh snapshot.
+    pub fn rewrite_slot(&mut self, slot: usize, f: &dyn Fn(&Value) -> Value) {
+        self.wgen = self.wgen.wrapping_add(1);
+        match &mut self.mode {
+            RowMode::Resident(m) => {
+                for cells in m.values_mut() {
+                    if let Some(c) = cells.get_mut(slot) {
+                        *c = f(c);
+                    }
+                }
+            }
+            RowMode::DiskFirst(d) => {
+                if let Some(base) = d.base.take() {
+                    for (id, cells) in base.entries() {
+                        d.overlay.entry(id).or_insert(Some(cells));
+                    }
+                }
+                // Deletes of base rows are meaningless once the base is gone.
+                d.overlay.retain(|_, change| change.is_some());
+                for cells in d.overlay.values_mut().flatten() {
+                    if let Some(c) = cells.get_mut(slot) {
+                        *c = f(c);
+                    }
+                }
+                d.live = d.overlay.len();
+            }
+        }
+    }
+
     /// True for the RAM-resident mode (the only mode a contiguous scan cache
     /// materializes for; disk-first stays lazy over its mmap).
     pub fn is_resident(&self) -> bool {

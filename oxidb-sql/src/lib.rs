@@ -592,7 +592,8 @@ impl SqlEngine {
                 // shifts an existing physical position, so constraint maps and
                 // secondary indexes stay valid and the stored rows need no
                 // rewrite — old rows read back padded (ADD) or projected (DROP).
-                // Both are O(1); only RENAME falls through to the rebuild below.
+                // Both are O(1); RENAME and ALTER TYPE fall through to the
+                // rebuild below (TYPE also rewrites the stored cells).
                 let metadata_only = matches!(op, AlterOp::AddColumn(_) | AlterOp::DropColumn(_));
                 match op {
                     AlterOp::AddColumn(col) => {
@@ -636,6 +637,37 @@ impl SqlEngine {
                         }
                         if let Some(state) = tables.get_mut(table) {
                             state.def = def.clone();
+                        }
+                    }
+                    AlterOp::AlterColumnType {
+                        column,
+                        ty,
+                        max_len,
+                    } => {
+                        let Some(pos) = def
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == column && !c.dropped)
+                        else {
+                            return;
+                        };
+                        // The cast was validated before the WAL append, so it
+                        // succeeds here (and on deterministic replay over the
+                        // same data). Keep the original on the impossible
+                        // failure rather than losing the cell.
+                        let cast =
+                            |v: &Value| executor::cast_value(v.clone(), *ty).unwrap_or_else(|_| v.clone());
+                        def.columns[pos].ty = *ty;
+                        def.columns[pos].max_len = *max_len;
+                        if let Some(dv) = def.columns[pos].default_value.take() {
+                            def.columns[pos].default_value = Some(cast(&dv));
+                        }
+                        if let Some(state) = tables.get_mut(table) {
+                            state.def = def.clone();
+                            // Narrow rows (pre-ADD-COLUMN) read from the fill
+                            // template, regenerated from the cast default by
+                            // sync_layout below.
+                            state.rows.rewrite_slot(pos, &cast);
                         }
                     }
                 }
@@ -1919,6 +1951,68 @@ impl SqlEngine {
                     return Err(SqlError::SchemaMismatch(format!(
                         "column {new:?} already exists in {table:?}"
                     )));
+                }
+            }
+            AlterOp::AlterColumnType {
+                column,
+                ty,
+                max_len,
+            } => {
+                let Some(pos) = def
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == column && !c.dropped)
+                else {
+                    return Err(SqlError::NoSuchColumn(column.clone()));
+                };
+                let col = &def.columns[pos];
+                // Keys keep their identity semantics: a cast can collide two
+                // previously-distinct values, silently breaking uniqueness.
+                if col.primary_key || col.auto_increment || col.unique {
+                    return Err(SqlError::Unsupported(
+                        "changing the type of a PRIMARY KEY / AUTO_INCREMENT / UNIQUE column"
+                            .into(),
+                    ));
+                }
+                // FK join columns must stay type-compatible on both sides.
+                let fk_bound = def.foreign_keys.iter().any(|fk| &fk.column == column)
+                    || inner.catalog.tables.values().any(|t| {
+                        t.foreign_keys
+                            .iter()
+                            .any(|fk| fk.parent_table == table && &fk.parent_column == column)
+                    });
+                if fk_bound {
+                    return Err(SqlError::Unsupported(
+                        "changing the type of a FOREIGN KEY column".into(),
+                    ));
+                }
+                // Dry-run: every stored value (and the default) must cast — and
+                // fit a shrunk VARCHAR(n) — before anything is written.
+                let check_len = |v: &Value| -> Result<()> {
+                    if let (Some(max), Value::Text(s)) = (max_len, v) {
+                        let got = s.chars().count();
+                        if got as u64 > u64::from(*max) {
+                            return Err(SqlError::ValueTooLong {
+                                column: column.clone(),
+                                max: *max,
+                                got,
+                            });
+                        }
+                    }
+                    Ok(())
+                };
+                if let Some(dv) = &col.default_value
+                    && !matches!(dv, Value::Null)
+                {
+                    check_len(&executor::cast_value(dv.clone(), *ty)?)?;
+                }
+                if let Some(state) = inner.tables.get(table) {
+                    for (_id, cells) in state.rows.iter_physical() {
+                        let v = &cells[pos];
+                        if !matches!(v, Value::Null) {
+                            check_len(&executor::cast_value(v.clone(), *ty)?)?;
+                        }
+                    }
                 }
             }
         }

@@ -127,6 +127,17 @@ export async function runSql(ref: string, key: string, sql: string): Promise<Sql
   return d.results ?? [];
 }
 
+/** Run SQL with bound `?` parameters (values never interpolated into the text). */
+export async function runSqlParams(
+  ref: string,
+  key: string,
+  sql: string,
+  params: unknown[],
+): Promise<SqlResult[]> {
+  const d = await call<{ results: SqlResult[] }>("POST", ref, "/api/sql", key, { sql, params });
+  return d.results ?? [];
+}
+
 /** The four rule expressions of a collection (OxiBase's RLS analog). */
 export interface Rules {
   read: string;
@@ -186,6 +197,133 @@ export function describeSqlTable(ref: string, key: string, table: string): Promi
 /** First `limit` rows of a SQL table. */
 export function selectSqlRows(ref: string, key: string, table: string, limit = 100): Promise<SqlResult> {
   return oneResult(ref, key, `SELECT * FROM ${quoteIdent(table)} LIMIT ${Math.max(1, limit | 0)}`);
+}
+
+// ── SQL table editing ───────────────────────────────────────────────────────
+// Values always travel as bound `?` params; only identifiers (quoted) and a
+// validated type keyword are spliced into the statement text.
+
+/** One column of a SQL table, parsed from a DESCRIBE result. */
+export interface SqlColumn {
+  name: string;
+  type: string; // e.g. "INT", "TEXT", "VARCHAR(80)"
+  nullable: boolean;
+  primaryKey: boolean;
+  autoIncrement: boolean;
+}
+
+/** Parse a DESCRIBE result (column/type/nullable/primary_key/auto_increment). */
+export function parseSchema(r: SqlResult | null): SqlColumn[] {
+  return (r?.rows ?? []).map((row) => ({
+    name: String(row[0]),
+    type: String(row[1]),
+    nullable: Boolean(row[2]),
+    primaryKey: Boolean(row[3]),
+    autoIncrement: Boolean(row[4]),
+  }));
+}
+
+/** Insert one row (only the listed columns; omitted ones take their default). */
+export function insertSqlRow(
+  ref: string,
+  key: string,
+  table: string,
+  cols: string[],
+  values: unknown[],
+): Promise<SqlResult[]> {
+  const list = cols.map(quoteIdent).join(", ");
+  const ph = cols.map(() => "?").join(", ");
+  return runSqlParams(ref, key, `INSERT INTO ${quoteIdent(table)} (${list}) VALUES (${ph})`, values);
+}
+
+/** Update one row, addressed by its primary-key value. */
+export function updateSqlRow(
+  ref: string,
+  key: string,
+  table: string,
+  cols: string[],
+  values: unknown[],
+  pkCol: string,
+  pkVal: unknown,
+): Promise<SqlResult[]> {
+  const sets = cols.map((c) => `${quoteIdent(c)} = ?`).join(", ");
+  return runSqlParams(
+    ref,
+    key,
+    `UPDATE ${quoteIdent(table)} SET ${sets} WHERE ${quoteIdent(pkCol)} = ?`,
+    [...values, pkVal],
+  );
+}
+
+/** Delete one row, addressed by its primary-key value. */
+export function deleteSqlRow(
+  ref: string,
+  key: string,
+  table: string,
+  pkCol: string,
+  pkVal: unknown,
+): Promise<SqlResult[]> {
+  return runSqlParams(ref, key, `DELETE FROM ${quoteIdent(table)} WHERE ${quoteIdent(pkCol)} = ?`, [
+    pkVal,
+  ]);
+}
+
+// A column type the Add-column UI may splice into DDL: a bare keyword with an
+// optional length, e.g. TEXT / VARCHAR(80). Anything else is rejected here.
+const TYPE_RE = /^[A-Za-z]+(\(\d+\))?$/;
+
+/** `ALTER TABLE … ADD COLUMN` — metadata-only (O(1)) in the engine. */
+export function addSqlColumn(
+  ref: string,
+  key: string,
+  table: string,
+  name: string,
+  type: string,
+): Promise<SqlResult[]> {
+  if (!TYPE_RE.test(type)) return Promise.reject(new Error(`invalid column type: ${type}`));
+  return runSql(ref, key, `ALTER TABLE ${quoteIdent(table)} ADD COLUMN ${quoteIdent(name)} ${type}`);
+}
+
+/** `ALTER TABLE … DROP COLUMN` — metadata-only (O(1)) in the engine. */
+export function dropSqlColumn(ref: string, key: string, table: string, name: string): Promise<SqlResult[]> {
+  return runSql(ref, key, `ALTER TABLE ${quoteIdent(table)} DROP COLUMN ${quoteIdent(name)}`);
+}
+
+/** `ALTER TABLE … ALTER COLUMN … TYPE` — existing values are cast eagerly;
+ *  the engine rejects the statement if any value cannot cast. */
+export function alterSqlColumnType(
+  ref: string,
+  key: string,
+  table: string,
+  column: string,
+  type: string,
+): Promise<SqlResult[]> {
+  if (!TYPE_RE.test(type)) return Promise.reject(new Error(`invalid column type: ${type}`));
+  return runSql(
+    ref,
+    key,
+    `ALTER TABLE ${quoteIdent(table)} ALTER COLUMN ${quoteIdent(column)} TYPE ${type}`,
+  );
+}
+
+/** `ALTER TABLE … RENAME COLUMN old TO new`. */
+export function renameSqlColumn(
+  ref: string,
+  key: string,
+  table: string,
+  oldName: string,
+  newName: string,
+): Promise<SqlResult[]> {
+  return runSql(
+    ref,
+    key,
+    `ALTER TABLE ${quoteIdent(table)} RENAME COLUMN ${quoteIdent(oldName)} TO ${quoteIdent(newName)}`,
+  );
+}
+
+/** Drop a SQL table (irreversible). */
+export function dropSqlTable(ref: string, key: string, table: string): Promise<SqlResult[]> {
+  return runSql(ref, key, `DROP TABLE ${quoteIdent(table)}`);
 }
 
 // Table names come from SHOW TABLES (engine-validated identifiers), but quote

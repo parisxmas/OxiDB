@@ -687,6 +687,32 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                     old: old_column_name.value.clone(),
                     new: new_column_name.value.clone(),
                 },
+                // PG: `ALTER COLUMN c [SET DATA] TYPE ty`.
+                sp::AlterTableOperation::AlterColumn {
+                    column_name,
+                    op:
+                        sp::AlterColumnOperation::SetDataType {
+                            data_type,
+                            using: None,
+                            ..
+                        },
+                } => AlterOp::AlterColumnType {
+                    column: column_name.value.clone(),
+                    ty: map_data_type(data_type)?,
+                    max_len: char_max_len(data_type),
+                },
+                // MySQL: `MODIFY [COLUMN] c ty` (bare type only — constraint
+                // changes stay unsupported).
+                sp::AlterTableOperation::ModifyColumn {
+                    col_name,
+                    data_type,
+                    options,
+                    ..
+                } if options.is_empty() => AlterOp::AlterColumnType {
+                    column: col_name.value.clone(),
+                    ty: map_data_type(data_type)?,
+                    max_len: char_max_len(data_type),
+                },
                 other => {
                     return Err(SqlError::Unsupported(format!(
                         "ALTER TABLE operation {other:?}"

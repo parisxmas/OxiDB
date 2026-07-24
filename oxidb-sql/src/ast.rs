@@ -114,6 +114,15 @@ pub enum AlterOp {
     AddColumn(crate::catalog::Column),
     DropColumn(String),
     RenameColumn { old: String, new: String },
+    /// `ALTER COLUMN <col> [SET DATA] TYPE <ty>` (PG) / `MODIFY COLUMN` (MySQL).
+    /// Existing values are cast eagerly; any value that cannot cast aborts the
+    /// statement before anything is written.
+    AlterColumnType {
+        column: String,
+        ty: crate::types::SqlType,
+        /// Declared `VARCHAR(n)` length of the new type (chars), when any.
+        max_len: Option<u32>,
+    },
 }
 
 /// What a [`Statement::Show`] statement enumerates.
