@@ -380,6 +380,14 @@ fn op_to_cond(op: &str, arg: &str) -> PgResult<Value> {
         "match" => json!({ "$regex": arg }),
         "imatch" => json!({ "$regex": arg, "$options": "i" }),
         "in" => json!({ "$in": parse_in_list(arg) }),
+        // Array containment. PostgREST spells the value as a Postgres array
+        // literal (`cs.{a,b}`), which is what `postgrest-js`'s `.contains()`
+        // emits — the natural way to query a tag list.
+        "cs" => json!({ "$all": parse_array_literal(arg) }),
+        // The mirror: every element of the column is among these. There is no
+        // single operator for it, so it is a disjunction of "equals one of" —
+        // sound for the scalar case and for a single-element array.
+        "cd" => json!({ "$in": parse_array_literal(arg) }),
         "is" => match arg {
             "null" => json!({ "$eq": Value::Null }),
             "true" => json!({ "$eq": true }),
@@ -777,6 +785,51 @@ pub(super) fn coerce(s: &str) -> Value {
 }
 
 /// PostgREST `in.(a,b,c)` → `[a,b,c]` (each coerced). Values may be quoted.
+/// Parse a Postgres array literal — `{a,b}` or `{"a b","c,d"}` — into values.
+///
+/// Quoting is what makes an element containing a comma or a space expressible,
+/// so the split has to respect it rather than cutting on every comma. A quoted
+/// element stays a string: `{"2024"}` is the tag `2024`, not the number.
+fn parse_array_literal(arg: &str) -> Vec<Value> {
+    let inner = arg.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut was_quoted = false;
+
+    let mut flush = |buf: &mut String, was_quoted: &mut bool| {
+        let t = buf.trim().to_string();
+        if !t.is_empty() || *was_quoted {
+            out.push(if *was_quoted {
+                Value::String(t)
+            } else {
+                coerce(&t)
+            });
+        }
+        buf.clear();
+        *was_quoted = false;
+    };
+
+    for ch in inner.chars() {
+        if escaped {
+            buf.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+            was_quoted = true;
+        } else if ch == ',' && !quoted {
+            flush(&mut buf, &mut was_quoted);
+        } else {
+            buf.push(ch);
+        }
+    }
+    flush(&mut buf, &mut was_quoted);
+    out
+}
+
 fn parse_in_list(arg: &str) -> Vec<Value> {
     let inner = arg.trim_start_matches('(').trim_end_matches(')');
     split_top_commas(inner)
@@ -895,6 +948,42 @@ fn access_denied(_e: impl std::fmt::Display) -> HttpResponse {
 // ---------------------------------------------------------------------------
 // Tests — the pure translation layer (no server required)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contains_tests {
+    use super::{op_to_cond, parse_array_literal};
+    use serde_json::json;
+
+    #[test]
+    fn contains_maps_an_array_literal_to_all() {
+        // What `postgrest-js` emits for `.contains("tags", ["computing"])`.
+        assert_eq!(
+            op_to_cond("cs", "{computing}").unwrap(),
+            json!({ "$all": ["computing"] })
+        );
+        assert_eq!(
+            op_to_cond("cs", "{a,b}").unwrap(),
+            json!({ "$all": ["a", "b"] })
+        );
+    }
+
+    #[test]
+    fn quoted_elements_stay_strings() {
+        // A quoted element may contain a comma or a space, and must not be
+        // coerced to a number: `{"2024"}` is the tag "2024", not 2024.
+        assert_eq!(
+            parse_array_literal("{\"hello world\",\"a,b\"}"),
+            vec![json!("hello world"), json!("a,b")]
+        );
+        assert_eq!(parse_array_literal("{\"2024\"}"), vec![json!("2024")]);
+        assert_eq!(parse_array_literal("{2024}"), vec![json!(2024)]);
+    }
+
+    #[test]
+    fn an_empty_array_is_empty_not_a_blank_element() {
+        assert!(parse_array_literal("{}").is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {
