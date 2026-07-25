@@ -125,6 +125,18 @@ impl Rate {
         Ok(Rate { limit, window_secs })
     }
 
+    /// The spelling a rule is written in — so a stored limit can be shown back
+    /// to whoever set it, and round-trips through `parse`.
+    pub fn spec(&self) -> String {
+        let unit = match self.window_secs {
+            1 => "sec",
+            60 => "min",
+            3_600 => "hour",
+            _ => "day",
+        };
+        format!("{}/{unit}", self.limit)
+    }
+
     fn describe(&self) -> String {
         let unit = match self.window_secs {
             1 => "second",
@@ -816,6 +828,27 @@ mod rate_limit_tests {
         assert!(Rate::parse("10/fortnight").is_err());
         assert!(Rate::parse("lots/min").is_err());
         assert!(Rate::parse("10").is_err());
+    }
+
+    #[test]
+    fn a_stored_rate_can_be_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        set_rules(
+            &db,
+            "posts",
+            &json!({ "read": "true", "create": "true", "update": "true", "delete": "true",
+                     "rate": { "create": "5/hour", "delete": "20/min" } }),
+        )
+        .unwrap();
+        let stored = get_rules(&db, "posts").unwrap();
+        assert_eq!(stored.rate.get("create").unwrap().spec(), "5/hour");
+        assert_eq!(stored.rate.get("delete").unwrap().spec(), "20/min");
+        // And the spelling round-trips, so what is shown can be saved again.
+        assert_eq!(
+            Rate::parse("5/hour").unwrap(),
+            *stored.rate.get("create").unwrap()
+        );
     }
 
     #[test]

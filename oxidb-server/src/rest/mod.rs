@@ -1314,6 +1314,10 @@ fn handle_get_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'stati
             "create": r.create,
             "update": r.update,
             "delete": r.delete,
+            // Rates are part of the policy: leaving them out of the read makes
+            // a limit invisible to whoever set it.
+            "rate": r.rate.iter().map(|(op, rate)| (op.clone(), rate.spec()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
         })),
         None => Err((404, "no rules defined for this collection")),
     }
