@@ -941,8 +941,21 @@ fn err(status: u16, message: &str) -> HttpResponse {
     super::json_response(status, text, json!({ "message": message }))
 }
 
-fn access_denied(_e: impl std::fmt::Display) -> HttpResponse {
-    super::json_response(403, "Forbidden", json!({ "message": "access denied" }))
+/// A rule saying "no" is a 403; a rule saying "not yet" is a 429 with the wait,
+/// so a client can back off instead of guessing.
+fn access_denied(e: impl Into<crate::rules::Denied>) -> HttpResponse {
+    let denied = e.into();
+    match denied.retry_after {
+        Some(retry) => super::json_response(
+            429,
+            "Too Many Requests",
+            json!({ "message": denied.message, "retry_after": retry }),
+        )
+        .with_header("Retry-After", &retry.to_string()),
+        // The reason a write was refused is not the caller's business beyond
+        // "denied" — it would otherwise describe the rule to a stranger.
+        None => super::json_response(403, "Forbidden", json!({ "message": "access denied" })),
+    }
 }
 
 // ---------------------------------------------------------------------------

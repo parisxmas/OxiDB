@@ -855,6 +855,17 @@ fn handle_count(
     Ok(json!({"count": n}))
 }
 
+/// A refusal from the rules layer, as a status for the native `/api` surface.
+/// The PostgREST surface carries `Retry-After`; here the shape is a fixed
+/// message, so the status has to do the talking.
+fn denied_status(e: rules::Denied) -> (u16, &'static str) {
+    if e.retry_after.is_some() {
+        (429, "rate limit exceeded")
+    } else {
+        (403, "access denied")
+    }
+}
+
 /// May this caller read the named object?
 ///
 /// The rules store is keyed by name across every engine — a collection, a SQL
@@ -1185,14 +1196,14 @@ fn handle_insert_with_rules(
     let body = parse_json_body(req)?;
     if let Some(doc) = body.get("doc") {
         rules::check_access(&state.db, col, Operation::Create, auth, None, Some(doc))
-            .map_err(|_| (403, "access denied"))?;
+            .map_err(denied_status)?;
         let id = state.db.insert(col, doc.clone()).map_err(db_err)?;
         Ok(json!({"id": id}))
     } else if let Some(docs) = body.get("docs").and_then(|v| v.as_array()) {
         // Check rules on first doc as representative (batch check)
         if let Some(first) = docs.first() {
             rules::check_access(&state.db, col, Operation::Create, auth, None, Some(first))
-                .map_err(|_| (403, "access denied"))?;
+                .map_err(denied_status)?;
         }
         let ids = state.db.insert_many(col, docs.clone()).map_err(db_err)?;
         Ok(json!({"ids": ids}))
@@ -1235,7 +1246,7 @@ fn handle_update_with_rules(
     let docs = state.db.find(col, query).map_err(db_err)?;
     for doc in &docs {
         rules::check_access(&state.db, col, Operation::Update, auth, Some(doc), None)
-            .map_err(|_| (403, "access denied"))?;
+            .map_err(denied_status)?;
     }
 
     let one = body.get("one").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1266,7 +1277,7 @@ fn handle_delete_with_rules(
     let docs = state.db.find(col, query).map_err(db_err)?;
     for doc in &docs {
         rules::check_access(&state.db, col, Operation::Delete, auth, Some(doc), None)
-            .map_err(|_| (403, "access denied"))?;
+            .map_err(denied_status)?;
     }
 
     let n = state.db.delete(col, query).map_err(db_err)?;

@@ -24,6 +24,9 @@
 //! {"cmd": "delete_rules", "collection": "posts"}
 //! ```
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use oxidb::OxiDb;
 use serde_json::{Value, json};
 
@@ -83,6 +86,85 @@ pub struct RuleSet {
     pub create: String,
     pub update: String,
     pub delete: String,
+    /// Optional per-operation rate limits, keyed by operation name.
+    pub rate: HashMap<String, Rate>,
+}
+
+/// "at most `limit` of this operation per `window_secs`, per identity".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rate {
+    pub limit: u32,
+    pub window_secs: u64,
+}
+
+impl Rate {
+    /// Parse the compact spelling a rule is written in: `10/min`, `100/hour`,
+    /// `5/sec`, `2000/day`.
+    pub fn parse(spec: &str) -> Result<Rate, String> {
+        let (count, unit) = spec
+            .split_once('/')
+            .ok_or_else(|| format!("expected `<count>/<unit>`, got `{spec}`"))?;
+        let limit: u32 = count
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{count}` is not a count"))?;
+        if limit == 0 {
+            return Err("a limit of 0 would deny everything — remove the rule instead".into());
+        }
+        let window_secs = match unit.trim().to_ascii_lowercase().as_str() {
+            "s" | "sec" | "second" => 1,
+            "m" | "min" | "minute" => 60,
+            "h" | "hr" | "hour" => 3_600,
+            "d" | "day" => 86_400,
+            other => {
+                return Err(format!(
+                    "unknown unit `{other}` — use sec, min, hour or day"
+                ));
+            }
+        };
+        Ok(Rate { limit, window_secs })
+    }
+
+    fn describe(&self) -> String {
+        let unit = match self.window_secs {
+            1 => "second",
+            60 => "minute",
+            3_600 => "hour",
+            _ => "day",
+        };
+        format!("{} per {unit}", self.limit)
+    }
+}
+
+/// Why a write was refused. A rule saying "no" and a rule saying "not yet" are
+/// different answers, and the HTTP layer owes the caller different statuses:
+/// 403 is permanent, 429 is an invitation to retry.
+#[derive(Debug, Clone)]
+pub struct Denied {
+    pub message: String,
+    /// Seconds until the operation would be allowed again, when it is a rate.
+    pub retry_after: Option<u64>,
+}
+
+impl Denied {
+    fn access(message: impl Into<String>) -> Denied {
+        Denied {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for Denied {
+    fn from(message: String) -> Denied {
+        Denied::access(message)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,12 +188,34 @@ pub fn set_rules(db: &OxiDb, collection: &str, rules: &Value) -> Result<(), Stri
     ] {
         validate_rule_expr(expr).map_err(|e| format!("invalid `{field}` rule: {e}"))?;
     }
+
+    // Optional rates: `{"rate": {"create": "10/min", "delete": "30/hour"}}`.
+    // Validated here too, so an unparseable spec is a clear error at save time
+    // rather than a limit that silently never applies.
+    let mut rate = serde_json::Map::new();
+    if let Some(spec) = rules.get("rate") {
+        let obj = spec
+            .as_object()
+            .ok_or_else(|| "`rate` must be an object of operation → limit".to_string())?;
+        for (op, value) in obj {
+            if !matches!(op.as_str(), "read" | "create" | "update" | "delete") {
+                return Err(format!("unknown operation `{op}` in `rate`"));
+            }
+            let text = value
+                .as_str()
+                .ok_or_else(|| format!("`rate.{op}` must be a string like \"10/min\""))?;
+            Rate::parse(text).map_err(|e| format!("invalid `rate.{op}`: {e}"))?;
+            rate.insert(op.clone(), json!(text));
+        }
+    }
+
     let rule_doc = json!({
         "collection": collection,
         "read": read,
         "create": create,
         "update": update,
         "delete": delete,
+        "rate": Value::Object(rate),
     });
     // Upsert: drop any existing rule(s) for this collection, then insert.
     remove_rules(db, collection);
@@ -216,11 +320,20 @@ pub fn get_rules(db: &OxiDb, collection: &str) -> Option<RuleSet> {
         .into_iter()
         .rev()
         .find(|d| d.get("collection").and_then(|v| v.as_str()) == Some(collection))?;
+    let mut rate = HashMap::new();
+    if let Some(obj) = doc.get("rate").and_then(|v| v.as_object()) {
+        for (op, value) in obj {
+            if let Some(parsed) = value.as_str().and_then(|t| Rate::parse(t).ok()) {
+                rate.insert(op.clone(), parsed);
+            }
+        }
+    }
     Some(RuleSet {
         read: doc["read"].as_str().unwrap_or("true").to_string(),
         create: doc["create"].as_str().unwrap_or("true").to_string(),
         update: doc["update"].as_str().unwrap_or("true").to_string(),
         delete: doc["delete"].as_str().unwrap_or("true").to_string(),
+        rate,
     })
 }
 
@@ -275,16 +388,16 @@ pub fn check_access(
     auth: &AuthContext,
     doc: Option<&Value>,
     new_doc: Option<&Value>,
-) -> Result<(), String> {
+) -> Result<(), Denied> {
     // System collections carry no rules — which is precisely why an untrusted
     // key must not reach them. Skipping the rules was meant for the server's
     // own bookkeeping, not for a browser: it let any anon key read the request
     // log and create unlimited `_`-named collections outside the quota.
     if collection.starts_with('_') {
         return if untrusted(auth) {
-            Err(format!(
+            Err(Denied::access(format!(
                 "access denied: '{collection}' is a system collection"
-            ))
+            )))
         } else {
             Ok(())
         };
@@ -314,11 +427,11 @@ pub fn check_access(
                     Some(crate::auth::Role::Read) | Some(crate::auth::Role::Authenticated)
                 );
             return if unprivileged_write {
-                Err(format!(
+                Err(Denied::access(format!(
                     "access denied: {} on '{}' requires a security rule",
                     op.as_str(),
                     collection
-                ))
+                )))
             } else {
                 Ok(())
             };
@@ -342,15 +455,76 @@ pub fn check_access(
         _ => doc,
     };
 
-    if eval_rule_expr(expr, auth, doc, new_doc) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !eval_rule_expr(expr, auth, doc, new_doc) {
+        return Err(Denied::access(format!(
             "access denied: {} on '{}' not allowed",
             op.as_str(),
             collection
-        ))
+        )));
     }
+
+    // The rule permits it — but perhaps not this often. A rate is checked last,
+    // so a refused write never consumes budget, and it is counted per identity:
+    // one account flooding a collection cannot throttle everybody else.
+    if let Some(rate) = rules.rate.get(op.as_str()) {
+        let identity = auth.username.as_deref().unwrap_or("anonymous");
+        if let Some(retry_after) = rate_limited(collection, op.as_str(), identity, *rate) {
+            return Err(Denied {
+                message: format!(
+                    "rate limit exceeded: {} on '{}' is limited to {}",
+                    op.as_str(),
+                    collection,
+                    rate.describe()
+                ),
+                retry_after: Some(retry_after),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+//
+// A fixed window per (collection, operation, identity). In-process, like every
+// other counter here: two data-plane nodes would each allow the limit, which is
+// the usual trade for not putting a write on the hot path of every request.
+// ---------------------------------------------------------------------------
+
+/// Above this many tracked keys, expired windows are swept, so a busy project
+/// cannot grow the map without bound.
+const RATE_SWEEP_ABOVE: usize = 8_192;
+
+fn rate_counters() -> &'static Mutex<HashMap<String, (u32, u64)>> {
+    static C: OnceLock<Mutex<HashMap<String, (u32, u64)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `Some(retry_after_secs)` when this operation is over its limit — and it is
+/// then *not* counted, so hammering a closed window cannot extend it.
+fn rate_limited(collection: &str, op: &str, identity: &str, rate: Rate) -> Option<u64> {
+    let mut map = rate_counters().lock().ok()?;
+    let now = now_secs();
+    if map.len() > RATE_SWEEP_ABOVE {
+        map.retain(|_, (_, start)| now.saturating_sub(*start) < 86_400);
+    }
+    let key = format!("{collection}\u{1}{op}\u{1}{identity}");
+    let entry = map.entry(key).or_insert((0, now));
+    if now.saturating_sub(entry.1) >= rate.window_secs {
+        *entry = (0, now);
+    }
+    if entry.0 >= rate.limit {
+        return Some((rate.window_secs - now.saturating_sub(entry.1)).max(1));
+    }
+    entry.0 += 1;
+    None
 }
 
 /// The outcome of a read check that supports **row-level** filtering.
@@ -596,6 +770,180 @@ fn is_truthy(val: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user(email: &str) -> AuthContext {
+        AuthContext::from_claims(email, "authenticated")
+    }
+
+    #[test]
+    fn rate_specs_parse_the_way_they_are_written() {
+        assert_eq!(
+            Rate::parse("10/min").unwrap(),
+            Rate {
+                limit: 10,
+                window_secs: 60
+            }
+        );
+        assert_eq!(
+            Rate::parse("5/sec").unwrap(),
+            Rate {
+                limit: 5,
+                window_secs: 1
+            }
+        );
+        assert_eq!(
+            Rate::parse("100/hour").unwrap(),
+            Rate {
+                limit: 100,
+                window_secs: 3600
+            }
+        );
+        assert_eq!(
+            Rate::parse("2000/day").unwrap(),
+            Rate {
+                limit: 2000,
+                window_secs: 86400
+            }
+        );
+        // A limit of zero is a denial dressed as a rate; say so rather than
+        // silently blocking every write.
+        assert!(Rate::parse("0/min").is_err());
+        assert!(Rate::parse("10/fortnight").is_err());
+        assert!(Rate::parse("lots/min").is_err());
+        assert!(Rate::parse("10").is_err());
+    }
+
+    #[test]
+    fn a_rate_is_per_identity_and_per_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        set_rules(
+            &db,
+            "posts",
+            &json!({
+                "read": "true",
+                "create": "auth != null",
+                "update": "auth != null",
+                "delete": "auth != null",
+                "rate": { "create": "3/min" }
+            }),
+        )
+        .unwrap();
+
+        let ada = user("ada@example.com");
+        let kai = user("kai@example.com");
+        let doc = json!({ "body": "hi" });
+
+        for i in 0..3 {
+            assert!(
+                check_access(&db, "posts", Operation::Create, &ada, None, Some(&doc)).is_ok(),
+                "create {i} should pass"
+            );
+        }
+        // The fourth is refused, and says when to come back.
+        let denied = check_access(&db, "posts", Operation::Create, &ada, None, Some(&doc))
+            .expect_err("fourth create is over the limit");
+        assert!(
+            denied.retry_after.is_some(),
+            "a rate must say how long to wait"
+        );
+        assert!(denied.message.contains("rate limit"));
+
+        // Another account is unaffected — one user flooding must not throttle
+        // everyone else, which a per-collection counter would do.
+        assert!(check_access(&db, "posts", Operation::Create, &kai, None, Some(&doc)).is_ok());
+
+        // And a different operation has its own budget.
+        assert!(check_access(&db, "posts", Operation::Update, &ada, Some(&doc), None).is_ok());
+    }
+
+    #[test]
+    fn a_refused_write_does_not_consume_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        // The rule denies everything, and a rate is also set.
+        set_rules(
+            &db,
+            "locked",
+            &json!({ "read": "true", "create": "false", "update": "false", "delete": "false",
+                     "rate": { "create": "2/min" } }),
+        )
+        .unwrap();
+        let ada = user("ada@example.com");
+        for _ in 0..5 {
+            let e = check_access(
+                &db,
+                "locked",
+                Operation::Create,
+                &ada,
+                None,
+                Some(&json!({})),
+            )
+            .expect_err("denied by the rule");
+            // Always the rule's answer, never "you are over your limit" — the
+            // rate is checked after the rule, so refused writes cost nothing.
+            assert!(
+                e.retry_after.is_none(),
+                "a denied write must not consume the rate budget"
+            );
+        }
+    }
+
+    #[test]
+    fn service_role_is_not_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        set_rules(
+            &db,
+            "posts",
+            &json!({ "read": "true", "create": "auth != null", "update": "true", "delete": "true",
+                     "rate": { "create": "1/day" } }),
+        )
+        .unwrap();
+        let service = AuthContext::from_claims("service", "admin");
+        for _ in 0..5 {
+            assert!(
+                check_access(
+                    &db,
+                    "posts",
+                    Operation::Create,
+                    &service,
+                    None,
+                    Some(&json!({}))
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_rate_is_refused_at_save_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        let bad = set_rules(
+            &db,
+            "posts",
+            &json!({ "read": "true", "create": "true", "update": "true", "delete": "true",
+                     "rate": { "create": "ten a minute" } }),
+        );
+        assert!(
+            bad.is_err(),
+            "a limit that cannot be parsed would never apply"
+        );
+        let unknown_op = set_rules(
+            &db,
+            "posts",
+            &json!({ "read": "true", "create": "true", "update": "true", "delete": "true",
+                     "rate": { "publish": "10/min" } }),
+        );
+        assert!(unknown_op.is_err());
+    }
+}
 
 #[cfg(test)]
 mod system_collection_tests {

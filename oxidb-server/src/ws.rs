@@ -362,8 +362,8 @@ fn try_auth(cmd: &Value, state: &WsState) -> Result<ConnState, String> {
         if !crate::tenant_auth::enabled() {
             return Err("project authentication is not available".to_string());
         }
-        let db_ref = crate::tenant_auth::resolve_tenant(mgr, db_name)
-            .unwrap_or_else(|| db_name.to_string());
+        let db_ref =
+            crate::tenant_auth::resolve_tenant(mgr, db_name).unwrap_or_else(|| db_name.to_string());
         let pubkey = crate::tenant_auth::project_pubkey(mgr, &db_ref)
             .ok_or_else(|| format!("unknown project: {db_name}"))?;
         let claims = jwt::verify_es256(token, &pubkey).map_err(|e| e.to_string())?;
@@ -698,22 +698,17 @@ fn handle_command(
                 if let Err(e) =
                     rules::check_access(&db, col, Operation::Create, auth_ctx, None, Some(doc))
                 {
-                    return json!({"ok": false, "error": e});
+                    return json!({"ok": false, "error": e.message});
                 }
                 match db.insert(col, doc.clone()) {
                     Ok(id) => json!({"ok": true, "data": {"id": id}}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 }
             } else if let Some(docs) = cmd.get("docs").and_then(|v| v.as_array()) {
-                if let Err(e) = rules::check_access(
-                    &db,
-                    col,
-                    Operation::Create,
-                    auth_ctx,
-                    None,
-                    docs.first(),
-                ) {
-                    return json!({"ok": false, "error": e});
+                if let Err(e) =
+                    rules::check_access(&db, col, Operation::Create, auth_ctx, None, docs.first())
+                {
+                    return json!({"ok": false, "error": e.message});
                 }
                 match db.insert_many(col, docs.clone()) {
                     Ok(ids) => json!({"ok": true, "data": {"ids": ids}}),
@@ -763,8 +758,7 @@ fn handle_command(
                         json!({"ok": false, "error": format!("access denied: read on '{col}'")})
                     }
                     ReadAccess::Filter(expr) => {
-                        let visible =
-                            doc.filter(|d| rules::row_visible(&expr, auth_ctx, d));
+                        let visible = doc.filter(|d| rules::row_visible(&expr, auth_ctx, d));
                         json!({"ok": true, "data": visible})
                     }
                 },
@@ -861,7 +855,7 @@ fn check_write_rules(
     let docs = db.find(col, query).map_err(|e| e.to_string())?;
     // Zero matches = zero writes; nothing to authorize (REST parity).
     for doc in &docs {
-        rules::check_access(db, col, op, auth_ctx, Some(doc), None)?;
+        rules::check_access(db, col, op, auth_ctx, Some(doc), None).map_err(|e| e.message)?;
     }
     Ok(())
 }
