@@ -243,6 +243,34 @@ export interface OxibaseClient {
   /** Run SQL against the project's SQL engine (requires `OXIDB_SQL=1`). */
   sql: (text: string, params?: unknown[]) => Promise<{ results: SqlResult[] | null; error: string | null }>;
   /**
+   * Ranked full-text search over a collection (BM25), rather than the substring
+   * match `.ilike()` gives you: results come back best-first, and a term used
+   * twice in a document outranks one used once.
+   *
+   * Needs an index over the fields to search — `createTextIndex` below, once,
+   * with a service_role key. Read rules still apply: a collection closed to this
+   * key is refused, and a row-level rule filters the matches (so a filtered
+   * search can return fewer than `limit`).
+   */
+  textSearch: (
+    collection: string,
+    query: string,
+    opts?: {
+      limit?: number;
+      /** Ask the server for matched snippets — costs more than scoring alone. */
+      highlight?: boolean | { snippetChars?: number; maxSnippets?: number };
+    },
+  ) => Promise<{ data: Record<string, unknown>[] | null; error: string | null }>;
+  /**
+   * Build the BM25 index `textSearch` needs, over the given fields. Schema work:
+   * needs a service_role key, and is meant to be run once at setup rather than
+   * per request.
+   */
+  createTextIndex: (
+    collection: string,
+    fields: string[],
+  ) => Promise<{ error: string | null }>;
+  /**
    * Subscribe to live changes of a collection (requires `OXIDB_WS_PORT` on the
    * server). Events are pushed over one shared WebSocket; per-row read rules
    * are enforced server-side (a caller only receives rows it may read).
@@ -394,6 +422,58 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     const body = (await r.json().catch(() => null)) as { results?: SqlResult[]; error?: string } | null;
     if (!r.ok) return { results: null, error: body?.error ?? `HTTP ${r.status}` };
     return { results: body?.results ?? [], error: null };
+  }
+
+  // Both full-text calls go to the native `/api` surface: PostgREST has no
+  // vocabulary for a ranked search, so there is nothing to express them in on
+  // `/rest/v1`.
+  function apiUrl(path: string): string {
+    const u = new URL(`${base}${pathTenant}${path}`);
+    if (ref && !opts.tenantInPath) u.searchParams.set("db", ref);
+    return u.toString();
+  }
+
+  async function textSearch(
+    collection: string,
+    query: string,
+    o: { limit?: number; highlight?: boolean | { snippetChars?: number; maxSnippets?: number } } = {},
+  ) {
+    const highlight =
+      typeof o.highlight === "object"
+        ? { snippet_chars: o.highlight.snippetChars, max_snippets: o.highlight.maxSnippets }
+        : o.highlight;
+    let r: Response;
+    try {
+      r = await sendAuthed(apiUrl(`/api/${encodeURIComponent(collection)}/text_search`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...extra },
+        body: JSON.stringify({ query, limit: o.limit, highlight }),
+      });
+    } catch (e) {
+      return { data: null, error: e instanceof Error ? e.message : String(e) };
+    }
+    const body = await r.json().catch(() => null);
+    if (!r.ok) {
+      const msg = (body as { error?: string } | null)?.error;
+      return { data: null, error: msg ?? `HTTP ${r.status}` };
+    }
+    return { data: (body ?? []) as Record<string, unknown>[], error: null };
+  }
+
+  async function createTextIndex(collection: string, fields: string[]) {
+    let r: Response;
+    try {
+      r = await sendAuthed(apiUrl(`/api/${encodeURIComponent(collection)}/text_index`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...extra },
+        body: JSON.stringify({ fields }),
+      });
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+    if (r.ok) return { error: null };
+    const body = (await r.json().catch(() => null)) as { error?: string } | null;
+    return { error: body?.error ?? `HTTP ${r.status}` };
   }
 
   async function authCall(action: "signup" | "login", email: string, password: string): Promise<AuthResult> {
@@ -882,6 +962,8 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     schema: rest.schema.bind(rest),
     rpc: rest.rpc.bind(rest),
     sql,
+    textSearch,
+    createTextIndex,
     subscribe,
     storage,
     auth,

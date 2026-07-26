@@ -715,6 +715,12 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         // Aggregation
         ("POST", ["api", col, "aggregate"]) => handle_aggregate(col, req, state, &auth_ctx),
 
+        // Full-text search over a collection (BM25). The engine has had this all
+        // along; it was reachable only over the wire, so no OxiBase project
+        // could use it.
+        ("POST", ["api", col, "text_search"]) => handle_text_search(col, req, state, &auth_ctx),
+        ("POST", ["api", col, "text_index"]) => handle_create_text_index(col, req, state),
+
         // Indexes
         ("GET", ["api", col, "indexes"]) => handle_list_indexes(col, state),
         ("POST", ["api", col, "indexes"]) => handle_create_index(col, req, state),
@@ -919,6 +925,97 @@ fn handle_aggregate(
     let pipeline = body.get("pipeline").ok_or((400, "missing 'pipeline'"))?;
     let results = state.db.aggregate(col, pipeline).map_err(db_err)?;
     Ok(json!(results))
+}
+
+/// `POST /api/{col}/text_search` — ranked full-text search (BM25).
+///
+/// Body: `{ "query": "...", "limit": 20, "highlight": true | {snippet_chars, max_snippets} }`.
+///
+/// Unlike `aggregate`, this returns whole documents, so a row-level read rule
+/// *can* be honoured: the matches are filtered the way `find` filters them,
+/// rather than the request being refused. A filtered search can therefore return
+/// fewer than `limit` rows — the alternative would be telling the caller how many
+/// matches it is not allowed to see.
+fn handle_text_search(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
+    let access = rules::read_access(&state.db, col, auth);
+    if matches!(access, rules::ReadAccess::None) {
+        return Err((403, "access denied: read on this collection is not allowed"));
+    }
+
+    let body = parse_json_body(req)?;
+    let query = body
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or((400, "missing 'query'"))?;
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(500) as usize;
+
+    // Highlighting trims and marks up the matched text, which costs more than
+    // scoring it — so it happens only when asked for.
+    let highlight = body.get("highlight").and_then(|h| {
+        if h.as_bool() == Some(true) {
+            Some((80usize, 3usize))
+        } else if let Some(o) = h.as_object() {
+            Some((
+                o.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize,
+                o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
+            ))
+        } else {
+            None
+        }
+    });
+
+    let hits = match highlight {
+        Some((chars, max)) => state
+            .db
+            .text_search_highlighted(col, query, limit, chars, max)
+            .map_err(db_err)?,
+        None => state.db.text_search(col, query, limit).map_err(db_err)?,
+    };
+
+    let mut out = json!(hits);
+    if let rules::ReadAccess::Filter(expr) = access {
+        if let Value::Array(arr) = &mut out {
+            arr.retain(|d| rules::row_visible(&expr, auth, d));
+        }
+    }
+    Ok(out)
+}
+
+/// `POST /api/{col}/text_index` — build the BM25 index over the given fields.
+///
+/// Body: `{ "fields": ["title", "body"] }`. Indexing is schema work, so
+/// `rest_permitted` keeps this to a ReadWrite/service_role key — otherwise a
+/// published browser key could index whatever it liked.
+fn handle_create_text_index(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let fields: Vec<String> = body
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or((400, "missing 'fields' array"))?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if fields.is_empty() {
+        return Err((400, "'fields' must list at least one field"));
+    }
+    state
+        .db
+        .create_text_index(col, fields.clone())
+        .map_err(db_err)?;
+    Ok(json!({ "created": fields, "type": "text" }))
 }
 
 fn handle_list_indexes(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
@@ -1499,6 +1596,10 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_eng
                 ("GET", _)
                     | ("HEAD", ["api", "storage", ..])
                     | ("POST", ["api", _, "aggregate"])
+                    // A text search reads rows and hands them back, so the read
+                    // rules can filter it and a browser key may search. Building
+                    // the index is not a read, and is deliberately not here.
+                    | ("POST", ["api", _, "text_search"])
                     | ("POST", ["api", "sql"])
                     | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
             )

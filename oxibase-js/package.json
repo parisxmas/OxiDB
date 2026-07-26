@@ -1,6 +1,6 @@
 {
   "name": "oxibase-js",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "JavaScript client for OxiBase — createClient(url, key).from('table')... over the PostgREST data plane, plus .sql(), .subscribe() realtime and .storage.",
   "type": "module",
   "main": "./dist/index.js",
