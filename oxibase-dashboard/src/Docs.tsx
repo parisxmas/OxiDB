@@ -120,10 +120,14 @@ export function Docs({ onOpenConsole }: { onOpenConsole: () => void }) {
           <h2 id="install">2 · Install &amp; connect</h2>
           <p>
             The client is <code>oxibase-js</code> — a thin client over OxiBase&apos;s
-            PostgREST-compatible API, with a full-featured query builder.
-            It is not on npm yet; install it straight from this site:
+            PostgREST-compatible API, with a full-featured query builder:
           </p>
-          <Code title="shell (Node / bundlers)">{`npm install https://oxibase.baltavista.com/oxibase-js.tgz`}</Code>
+          <Code title="shell (Node / bundlers)">{`npm install oxibase-js`}</Code>
+          <p>
+            The build hosted here is always the current one, if you would rather pin to this
+            deployment than to the registry:{" "}
+            <code>npm install https://oxibase.baltavista.com/oxibase-js.tgz</code>
+          </p>
           <p>
             Or skip npm entirely — a self-contained ES module (dependencies bundled, ~15&nbsp;kB) is
             hosted too, so a plain <code>&lt;script type="module"&gt;</code> works with no build
