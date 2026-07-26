@@ -973,13 +973,20 @@ fn handle_text_search(
         }
     });
 
-    let hits = match highlight {
-        Some((chars, max)) => state
-            .db
-            .text_search_highlighted(col, query, limit, chars, max)
-            .map_err(db_err)?,
-        None => state.db.text_search(col, query, limit).map_err(db_err)?,
+    // "No text index yet" is the caller's problem to fix, not a server fault:
+    // say so with a 400 and the remedy, instead of the generic 500 that
+    // `db_err` would give an InvalidQuery.
+    let searched = match highlight {
+        Some((chars, max)) => state.db.text_search_highlighted(col, query, limit, chars, max),
+        None => state.db.text_search(col, query, limit),
     };
+    let hits = searched.map_err(|e| match e {
+        oxidb::Error::InvalidQuery(ref m) if m.contains("no text index") => (
+            400,
+            "no text index on this collection — build one with POST /api/{collection}/text_index",
+        ),
+        other => db_err(other),
+    })?;
 
     let mut out = json!(hits);
     if let rules::ReadAccess::Filter(expr) = access {
