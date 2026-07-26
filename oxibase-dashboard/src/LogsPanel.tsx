@@ -4,6 +4,11 @@ import { LogsMap } from "./LogsMap.tsx";
 
 const PAGE_SIZE = 50;
 
+/** How far apart two requests from one address can be and still be one burst.
+ *  A page load's requests land within a second or two of each other; a window
+ *  much wider than that would start merging separate visits. */
+const BURST_SECONDS = 2;
+
 /** Refresh rates offered for Live. */
 const POLL_CHOICES = [
   { ms: 2000, label: "every 2s" },
@@ -55,6 +60,13 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
   // Rows accumulate across pages so the map builds a picture as you page back,
   // rather than redrawing from 50 rows each time.
   const [seen, setSeen] = useState<LogRow[]>([]);
+  // Places that appeared in the most recent fetch, and a counter so the map can
+  // restart the animation even when the same place arrives twice running.
+  const [arrivals, setArrivals] = useState<{ places: string[]; nonce: number }>({
+    places: [],
+    nonce: 0,
+  });
+  const seenKeys = useRef<Set<string>>(new Set());
   const timer = useRef<number | null>(null);
 
   async function load(p = page) {
@@ -63,14 +75,18 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
       setHasNext(r.length > PAGE_SIZE);
       const page = r.slice(0, PAGE_SIZE);
       setRows(page);
-      setSeen((prev) => {
-        const key = (r: LogRow) => `${r.ts}-${r.path}-${r.ip ?? ""}`;
-        const known = new Set(prev.map(key));
-        const fresh = page.filter((r) => !known.has(key(r)));
-        // Bounded: a session that pages a long way back should not grow without
-        // limit, and 2000 points is already more than a map can show.
-        return [...prev, ...fresh].slice(-2000);
-      });
+      // Which of these rows we had not seen before — the map pulses their
+      // locations, and `seen` grows only by them.
+      const key = (r: LogRow) => `${r.ts}-${r.path}-${r.ip ?? ""}`;
+      const fresh = page.filter((r) => !seenKeys.current.has(key(r)));
+      for (const r of fresh) seenKeys.current.add(key(r));
+      if (fresh.length > 0) {
+        setSeen((prev) => [...prev, ...fresh].slice(-2000));
+        const places = [...new Set(fresh.filter((r) => !isServerSide(r)).map(placeOf))].filter(
+          Boolean,
+        );
+        if (places.length > 0) setArrivals((a) => ({ places, nonce: a.nonce + 1 }));
+      }
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -84,6 +100,8 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
     setPage(0);
     setPlace("");
     setSeen([]);
+    seenKeys.current = new Set();
+    setArrivals({ places: [], nonce: 0 });
     load(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectRef]);
@@ -145,19 +163,69 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
     String(r.status ?? "").startsWith(filter);
   const visible = rows.filter((r) => matchesText(r) && (!place || placeOf(r) === place));
 
-  /** Requests from the same caller in the same second: one page load, usually. */
+  /** One visit: a page load and whatever it set off.
+   *
+   *  Grouped by address within a short window, deliberately **not** by identity.
+   *  A single page load speaks with three: the reader's own token, the project's
+   *  anon key for what needs no session, and CORS preflights carrying no auth at
+   *  all. Keying on the identity split every load into a dozen rows.
+   *
+   *  Requests from your backend are then folded into the visit that caused them.
+   *  They come from a different address — a datacentre, not the reader — so
+   *  grouping by address alone left a Frankfurt row beside every Kardzhali one,
+   *  which is two rows for one thing that happened. They keep their own marker
+   *  inside the group, because where they ran is still worth knowing.
+   */
   const groups = useMemo(() => {
-    const out: { key: string; rows: LogRow[] }[] = [];
+    type Group = { key: string; rows: LogRow[]; server: boolean };
+    const out: Group[] = [];
     for (const r of visible) {
-      const key = `${Math.floor(r.ts ?? 0)}|${r.user ?? ""}|${r.ip ?? ""}`;
+      const server = isServerSide(r);
+      const who = server ? "backend" : r.ip || r.user || "";
       const last = out[out.length - 1];
-      // Rows arrive newest-first and in order, so a run is contiguous — no need
-      // to hash the whole page.
-      if (last && last.key === key) last.rows.push(r);
-      else out.push({ key, rows: [r] });
+      const near =
+        last && Math.abs((last.rows[0].ts ?? 0) - (r.ts ?? 0)) <= BURST_SECONDS;
+      if (last && near && last.key === who) last.rows.push(r);
+      else out.push({ key: who, rows: [r], server });
     }
-    return out;
+
+    // Rows arrive newest-first, so a backend call sits just before the visit that
+    // triggered it as often as just after. Attach it to whichever neighbour is a
+    // real visit within the window; if neither is, it stands on its own — a cron
+    // job or a webhook is not part of anybody's visit.
+    const merged: Group[] = [];
+    for (const g of out) {
+      if (!g.server) {
+        merged.push(g);
+        continue;
+      }
+      const prev = merged[merged.length - 1];
+      const fits = (o: Group | undefined) =>
+        o &&
+        !o.server &&
+        Math.abs((o.rows[0].ts ?? 0) - (g.rows[0].ts ?? 0)) <= BURST_SECONDS + 2;
+      if (fits(prev)) {
+        prev.rows.push(...g.rows);
+      } else {
+        merged.push(g);
+      }
+    }
+    // A backend call whose visit comes *after* it, in newest-first order.
+    for (let i = merged.length - 1; i > 0; i--) {
+      const g = merged[i - 1];
+      const next = merged[i];
+      if (
+        g.server &&
+        !next.server &&
+        Math.abs((g.rows[0].ts ?? 0) - (next.rows[0].ts ?? 0)) <= BURST_SECONDS + 2
+      ) {
+        next.rows.unshift(...g.rows);
+        merged.splice(i - 1, 1);
+      }
+    }
+    return merged;
   }, [visible]);
+
 
 
   const statusColor = (s?: number) =>
@@ -246,7 +314,9 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
 
       {showMap && (
         <LogsMap
-          rows={seen}
+          rows={seen.filter((r) => !isServerSide(r))}
+          serverSide={seen.filter(isServerSide).length}
+          arrivals={arrivals}
           selected={place}
           onSelect={(label) => {
             // The dropdown's labels carry a flag and the map's do not, so match
@@ -286,7 +356,9 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
               <tbody>
                 {grouped
                   ? groups.map((g, i) => {
-                      const first = g.rows[0];
+                      // The visitor is what the row is about; a backend call
+                      // attached to the visit should not decide its identity.
+                      const first = g.rows.find((r) => !isServerSide(r)) ?? g.rows[0];
                       const worst = g.rows.reduce(
                         (acc, r) => Math.max(acc, r.status ?? 0),
                         0,
@@ -322,10 +394,37 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
                             className="muted"
                             style={{ maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                           >
-                            {shortUser(first) ?? "—"}
+                            {(() => {
+                              const who = [...new Set(g.rows.map((r) => shortUser(r) ?? "—"))];
+                              // The signed-in address is the useful one to show;
+                              // keys and preflights are what any load also does.
+                              const named = who.find((w) => w.includes("@")) ?? who[0];
+                              return who.length === 1 ? named : `${named} +${who.length - 1}`;
+                            })()}
                           </td>
                           <td className="muted" style={{ whiteSpace: "nowrap" }}>
-                            {placeOf(first) || first.ip || "—"}
+                            {(() => {
+                              const visitor = g.rows.find((r) => !isServerSide(r));
+                              const backend = g.rows.filter(isServerSide).length;
+                              const shown = visitor ?? first;
+                              return (
+                                <>
+                                  {!visitor && (
+                                    <span title="Your app's backend, with no visit attached">🖥 </span>
+                                  )}
+                                  {placeOf(shown) || shown.ip || "—"}
+                                  {visitor && backend > 0 && (
+                                    <span
+                                      className="muted"
+                                      title={`${backend} request${backend === 1 ? "" : "s"} your backend made for this visit`}
+                                    >
+                                      {" "}
+                                      + 🖥{backend}
+                                    </span>
+                                  )}
+                                </>
+                              );
+                            })()}
                           </td>
                           <td style={{ color: statusColor(worst), fontWeight: 600 }}>
                             {worst}
@@ -341,7 +440,10 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
                               {g.rows.length > 1 && (
                                 <div style={{ padding: "8px 4px 2px" }}>
                                   <div className="muted small" style={{ marginBottom: 6 }}>
-                                    {g.rows.length} requests in this second
+                                    {g.rows.length} requests from this caller ·{" "}
+                                    {[...new Set(g.rows.map((r) => shortUser(r) ?? "no auth"))].join(
+                                      ", ",
+                                    )}
                                   </div>
                                   {g.rows.map((r, j) => (
                                     <div key={j} className="row" style={{ gap: 10 }}>
@@ -391,6 +493,11 @@ export function LogsPanel({ projectRef }: { projectRef: string }) {
                       {shortUser(r) ?? "—"}
                     </td>
                     <td className="muted" style={{ whiteSpace: "nowrap" }}>
+                      {isServerSide(r) && (
+                        <span title="Your app's backend, not a visitor — the service key never runs in a browser">
+                          🖥{" "}
+                        </span>
+                      )}
                       {placeOf(r) || r.ip || "—"}
                     </td>
                     <td style={{ color: statusColor(r.status), fontWeight: 600 }}>{r.status}</td>
@@ -454,6 +561,22 @@ function commonPrefix(paths: string[]): string {
   return cut > 0 ? `${prefix.slice(0, cut)}/…` : prefix || "various";
 }
 
+/** Whether a request came from a machine rather than somebody's browser.
+ *
+ *  The point is the map: a serverless function's datacentre is not a place any
+ *  of your users live, and plotting it among them is misleading.
+ *
+ *  The key alone does not settle it. A service key usually means a backend — but
+ *  this dashboard holds one too, and browses your data with it from your
+ *  browser, so keying on the role hid the reader's own requests and left the map
+ *  empty. What separates them is the user agent: a browser announces itself, a
+ *  fetch from a server does not. */
+function isServerSide(r: LogRow): boolean {
+  const key = r.role === "admin" || (r.user ?? "").startsWith("admin@");
+  const browser = /mozilla|applewebkit|chrome|safari|firefox|edg\//i.test(r.user_agent ?? "");
+  return key && !browser;
+}
+
 /** The acting identity, shortened for the table.
  *
  *  A project key's subject is `read@<ref>` / `admin@<ref>` — the ref adds
@@ -489,6 +612,7 @@ function Detail({ row }: { row: LogRow }) {
   const place = [row.city, row.region, row.country, row.continent].filter(Boolean).join(", ");
   const items: [string, string | undefined][] = [
     ["User", row.user],
+    ["Origin", isServerSide(row) ? "your app's backend (service key)" : undefined],
     ["Role", row.role],
     ["IP", row.ip],
     ["Location", place || undefined],
