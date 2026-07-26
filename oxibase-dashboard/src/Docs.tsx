@@ -290,6 +290,25 @@ oxibase.auth.getSession();   // { token, refreshToken } | null
 oxibase.auth.signOut();      // back to the anon key
 // expired tokens refresh automatically on 401 (refresh tokens rotate)`}</Code>
           <p>
+            <strong>Persisting a session</strong> (localStorage, a cookie, a native store):
+            refresh tokens are <strong>single-use</strong> — the moment the access token is first
+            renewed, the token you got at sign-in is revoked. So re-store the session on{" "}
+            <em>every</em> change, not just at sign-in; saving only the sign-in copy leaves a spent
+            token behind and the next reload cannot resume it:
+          </p>
+          <Code title="persisting a session across reloads">{`// re-store on every change — signedIn, tokenRefreshed, signedOut
+oxibase.auth.onAuthStateChange((event, session) => {
+  if (session) localStorage.setItem("session", JSON.stringify(session));
+  else localStorage.removeItem("session");
+});
+
+// on load, resume as that user
+const stored = JSON.parse(localStorage.getItem("session") ?? "null");
+if (stored) oxibase.auth.setSession(stored);
+
+// setSession does not fire the callback — you supplied that session,
+// so a listener that persists cannot loop back into it.`}</Code>
+          <p>
             <strong>Email verification</strong>: on this deployment, new users must confirm their
             address before they can sign in — <code>signUp</code> returns{" "}
             <code>verificationRequired: true</code> (no session yet), the user clicks the emailed
