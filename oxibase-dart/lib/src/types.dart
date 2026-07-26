@@ -154,10 +154,21 @@ class StorageSearchHit {
 /// The status matters here rather than being noise: OxiBase distinguishes them
 /// deliberately, and an app should too.
 class OxibaseException implements Exception {
-  const OxibaseException(this.message, {this.statusCode, this.retryAfter});
+  const OxibaseException(
+    this.message, {
+    this.statusCode,
+    this.retryAfter,
+    this.verificationRequired = false,
+  });
 
   final String message;
   final int? statusCode;
+
+  /// The account exists and an email is on its way — sign-in waits for the link
+  /// to be clicked. Carried as an exception because there is no session to
+  /// return, but it is not a failure, and a UI that paints it like one tells the
+  /// reader their signup went wrong when it went right.
+  final bool verificationRequired;
 
   /// Seconds to wait, from `Retry-After`, when [isRateLimited].
   final int? retryAfter;

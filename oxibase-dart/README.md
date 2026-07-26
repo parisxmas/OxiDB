@@ -3,6 +3,10 @@
 One backend behind one URL: documents governed by row-level security rules, SQL
 tables, time-series, file storage, realtime over a WebSocket, and end-user auth.
 
+**Targets Android and iOS.** It is plain Dart over `http` and
+`web_socket_channel`, so it runs anywhere those do, but mobile is what it is
+built and tested for — Flutter web is deliberately out of scope.
+
 ```dart
 final client = OxibaseClient(
   url: 'https://oxibase.example.com',

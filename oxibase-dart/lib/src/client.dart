@@ -100,6 +100,12 @@ class OxibaseClient {
 
   /// Run SQL against the project's SQL engine. Values must be bound (`?`), never
   /// interpolated.
+  /// The control-plane base auth talks to, or null when the client was built
+  /// without one. Worth asserting in an app's own tests: reads work fine without
+  /// it and only sign-in fails, so a missing `authUrl` stays invisible until a
+  /// user tries to log in.
+  String? get authUrl => _transport.authBaseUrl;
+
   Future<List<SqlResult>> sql(String statement, [List<Object?>? params]) async {
     final res = await _transport.send(
       'POST',

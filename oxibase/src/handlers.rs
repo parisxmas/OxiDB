@@ -378,6 +378,64 @@ pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
 // ---------------------------------------------------------------------------
 
 /// `POST /platform/v1/projects/{ref}/auth/signup` — create an end-user.
+
+/// Find one of a project's users by address, case-insensitively.
+///
+/// An email address is case-insensitive to every mail server on earth, but a
+/// document `find` matches the string it was given. Signup stored whatever the
+/// browser sent and login looked up whatever was typed, so an account created
+/// with autofill could not be signed into from a phone keyboard that
+/// capitalises the first letter — the row simply was not found, and the answer
+/// was "invalid credentials" no matter how many times the password was reset.
+///
+/// New rows are stored lowercased (see [`normalize_email`]); the exact match is
+/// tried first because it is the common case and index-friendly, and the
+/// case-insensitive scan exists for rows written before that was true.
+fn find_user_by_email(
+    state: &State,
+    project_ref: &str,
+    email: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+    ) {
+        Ok(mut u) if !u.is_empty() => return Ok(u.pop()),
+        Ok(_) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let pattern = format!("^{}$", regex_escape(email));
+    state
+        .upstream
+        .find(
+            "users",
+            &json!({
+                "project_ref": project_ref,
+                "email": { "$regex": pattern, "$options": "i" }
+            }),
+        )
+        .map(|mut u| u.pop())
+        .map_err(|e| e.to_string())
+}
+
+/// One address, one spelling. Applied wherever an address enters the system.
+fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Escape the characters a regex would otherwise read as syntax — an address
+/// contains dots, and may contain `+`.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
     // Per-project + per-actor rate limit — one project's abuse can't throttle
     // another's, and a single client can't flood the user table.
@@ -393,6 +451,7 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
     else {
         return resp(400, json!({ "message": "email and password required" }));
     };
+    let email = normalize_email(&email);
     if password.len() < MIN_PASSWORD_LEN {
         return resp(
             400,
@@ -423,10 +482,7 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
             json!({ "message": "user limit reached for this project" }),
         );
     }
-    match state.upstream.find(
-        "users",
-        &json!({ "project_ref": project_ref, "email": email }),
-    ) {
+    match find_user_by_email(state, project_ref, &email).map(|u| u.into_iter().collect::<Vec<_>>()) {
         Ok(u) if !u.is_empty() => {
             return resp(409, json!({ "message": "email already registered" }));
         }
@@ -486,6 +542,7 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
     else {
         return resp(400, json!({ "message": "email and password required" }));
     };
+    let email = normalize_email(&email);
     // Brute-force lockout, scoped per (project, email) so an attacker guessing
     // one project's user can't lock out the same email in another project.
     let lock_key = format!("{project_ref}:{email}");
@@ -504,11 +561,8 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         .get("ref")
         .and_then(|v| v.as_str())
         .unwrap_or(project_ref);
-    let user = match state.upstream.find(
-        "users",
-        &json!({ "project_ref": project_ref, "email": email }),
-    ) {
-        Ok(mut u) => u.pop(),
+    let user = match find_user_by_email(state, project_ref, &email) {
+        Ok(u) => u,
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let ok = user
@@ -1127,7 +1181,27 @@ fn login_clear(email: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{normalize_email, regex_escape, slugify};
+
+    #[test]
+    fn email_is_one_address_however_it_is_typed() {
+        // The bug this guards: a phone keyboard capitalises the first letter, an
+        // account signed up from a browser stored it lowercase, and the login
+        // lookup matched the string exactly — so the row was never found and the
+        // answer was "invalid credentials" through any number of password resets.
+        assert_eq!(normalize_email("Kaan@Example.COM"), "kaan@example.com");
+        assert_eq!(normalize_email("  spaced@example.com "), "spaced@example.com");
+        assert_eq!(normalize_email("already@lower.com"), "already@lower.com");
+    }
+
+    #[test]
+    fn address_metacharacters_do_not_become_regex_syntax() {
+        // The fallback lookup builds `^…$` out of the address, so a dot must
+        // match a dot and `a+b@x.com` must not match `ab@x.com`.
+        assert_eq!(regex_escape("a.b@x.com"), r"a\.b@x\.com");
+        assert_eq!(regex_escape("a+b@x.com"), r"a\+b@x\.com");
+        assert_eq!(regex_escape("plain@x"), "plain@x");
+    }
 
     #[test]
     fn slugify_basics() {
@@ -1273,14 +1347,9 @@ pub fn end_user_resend(req: &HttpRequest, state: &State, project_ref: &str) -> H
         .get("ref")
         .and_then(|v| v.as_str())
         .unwrap_or(project_ref);
-    let user = state
-        .upstream
-        .find(
-            "users",
-            &json!({ "project_ref": project_ref, "email": email }),
-        )
+    let user = find_user_by_email(state, project_ref, &normalize_email(&email))
         .ok()
-        .and_then(|mut v| v.pop());
+        .flatten();
     if let Some(user) = user
         && user.get("verified").and_then(|v| v.as_bool()) == Some(false)
     {
@@ -1324,14 +1393,9 @@ pub fn end_user_recover(req: &HttpRequest, state: &State, project_ref: &str) -> 
         .get("ref")
         .and_then(|v| v.as_str())
         .unwrap_or(project_ref);
-    let exists = state
-        .upstream
-        .find(
-            "users",
-            &json!({ "project_ref": project_ref, "email": email }),
-        )
+    let exists = find_user_by_email(state, project_ref, &normalize_email(&email))
         .ok()
-        .map(|v| !v.is_empty())
+        .map(|v| v.is_some())
         .unwrap_or(false);
     if exists {
         let (plain, hash, exp) = one_time_token(3600);

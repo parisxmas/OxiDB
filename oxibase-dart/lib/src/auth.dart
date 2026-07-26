@@ -63,6 +63,7 @@ class OxibaseAuth {
       throw const OxibaseException(
         'check your inbox: this project requires the emailed link before sign-in',
         statusCode: 403,
+        verificationRequired: true,
       );
     }
     final session =

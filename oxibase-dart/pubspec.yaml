@@ -1,5 +1,5 @@
 name: oxibase
-description: Dart and Flutter client for OxiBase — documents with row-level rules, SQL, time-series, file storage, realtime and auth, behind one URL.
+description: Dart and Flutter client for OxiBase — documents with row-level rules, SQL, time-series, file storage, realtime and auth, behind one URL. Targets Android and iOS.
 version: 0.1.0
 repository: https://github.com/parisxmas/OxiDB
 issue_tracker: https://github.com/parisxmas/OxiDB/issues

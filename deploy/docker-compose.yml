@@ -50,6 +50,13 @@ services:
       dockerfile: deploy/Dockerfile.oxibase
     image: oxibase:local
     environment:
+      # glibc hands every thread its own malloc arena and never returns what it
+      # once used, so a long-lived process settles at (threads x arena) rather
+      # than at what it holds — this one was observed at 158 MiB of anonymous
+      # memory across ten 64 MB-aligned arenas while its live data was a handful
+      # of account and project rows. Two arenas is plenty for a control plane
+      # that is not allocation-bound.
+      MALLOC_ARENA_MAX: "2"
       OXIBASE_ADDR: "0.0.0.0:4460"
       OXIBASE_UPSTREAM: "data-plane:4444"
       OXIDB_SEAL_KEY: "${OXIDB_SEAL_KEY}"
