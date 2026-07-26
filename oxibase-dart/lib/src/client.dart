@@ -68,6 +68,12 @@ class OxibaseClient {
   late final Realtime _realtime;
   late final StreamSubscription<(AuthChangeEvent, Session?)> _authWatch;
 
+  /// The data-plane base this client talks to.
+  String get url => _transport.baseUrl;
+
+  /// The project this client is bound to, if it was given one.
+  String? get ref => _transport.ref;
+
   /// End-user sign-in for this project.
   late final OxibaseAuth auth;
 

@@ -146,6 +146,39 @@ class OxibaseQuery {
   /// client does. Being explicit is the better trade than a fake Future.
   Future<List<Map<String, dynamic>>> get() => _run();
 
+  /// How many rows match, without fetching them.
+  ///
+  /// Uses the native `/api/{collection}/count`, not a PostgREST count: this
+  /// server's `Content-Range` reports the page but leaves the total as `*`, so
+  /// there is nothing to read a total from. Only equality filters translate,
+  /// which is what that endpoint takes.
+  Future<int> count() async {
+    final equalities = <String, Object?>{};
+    for (final (column, expr) in _filters) {
+      if (!expr.startsWith('eq.')) {
+        throw OxibaseException(
+          'count() takes equality filters only; `$column=$expr` cannot be expressed',
+        );
+      }
+      final raw = expr.substring(3);
+      equalities[column] = raw.startsWith('"') && raw.endsWith('"')
+          ? raw.substring(1, raw.length - 1)
+          : (num.tryParse(raw) ??
+              (raw == 'true'
+                  ? true
+                  : raw == 'false'
+                      ? false
+                      : raw));
+    }
+    final uri = _transport.url(
+      '/api/${Uri.encodeComponent(_table)}/count',
+      equalities.isEmpty ? null : {'q': jsonEncode(equalities)},
+    );
+    final res = await _transport.send('GET', uri, headers: _profileHeaders);
+    final body = _transport.decodeOrThrow(res);
+    return (body['count'] as num?)?.toInt() ?? 0;
+  }
+
   /// Run and return the first row, or null.
   Future<Map<String, dynamic>?> maybeSingle() async {
     final rows = await single()._run();

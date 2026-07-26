@@ -24,6 +24,16 @@ class Realtime {
   WebSocketChannel? _socket;
   bool _ready = false;
   int _nextId = 1;
+  bool _disposed = false;
+
+  /// Backoff for re-dialling, from half a second to fifteen — the same shape the
+  /// JavaScript client uses. On a phone the socket dies routinely: backgrounding,
+  /// a lost signal, Wi-Fi to cellular. Without this the subscriptions simply
+  /// stopped and nothing said so.
+  static const _retryFloor = Duration(milliseconds: 500);
+  static const _retryCeiling = Duration(seconds: 15);
+  Duration _retry = _retryFloor;
+  Timer? _retryTimer;
 
   /// Commands are answered in order on a connection, so a plain FIFO matches an
   /// ack to the command that caused it.
@@ -69,6 +79,9 @@ class Realtime {
     final socket = _socket;
     _socket = null;
     _ready = false;
+    _retry = _retryFloor;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _acks.clear();
     socket?.sink.close();
     for (final sub in _subs.values) {
@@ -87,17 +100,23 @@ class Realtime {
         if (_socket != socket) return; // superseded by a reset
         _socket = null;
         _ready = false;
+        _scheduleReconnect();
       },
       onError: (Object e) {
+        if (_socket != socket) return;
         for (final sub in _subs.values) {
           sub.onError?.call('realtime connection failed: $e');
         }
         _socket = null;
         _ready = false;
+        _scheduleReconnect();
       },
       cancelOnError: true,
     );
     await socket.ready;
+    // Connected: the next drop starts from the floor again, so a long-lived
+    // connection does not inherit the backoff of an outage hours ago.
+    _retry = _retryFloor;
 
     // Authenticate first: the frame carries the project, which pins the
     // connection to it — a socket cannot then be pointed at another database.
@@ -127,6 +146,23 @@ class Realtime {
         if (_transport.ref != null) 'db': _transport.ref,
       }, null);
     }
+  }
+
+  /// Re-dial after a drop, but only while something is subscribed — an idle
+  /// client should not hold a socket open, or keep waking the radio to reopen one.
+  void _scheduleReconnect() {
+    if (_disposed || _subs.isEmpty || _retryTimer != null) return;
+    final delay = _retry;
+    _retry = Duration(
+      milliseconds: (_retry.inMilliseconds * 2).clamp(0, _retryCeiling.inMilliseconds),
+    );
+    _retryTimer = Timer(delay, () {
+      _retryTimer = null;
+      if (_disposed || _socket != null || _subs.isEmpty) return;
+      unawaited(_ensureSocket().catchError((Object _) {
+        // Still down: the onError/onDone above schedules the next attempt.
+      }));
+    });
   }
 
   void _send(Map<String, dynamic> frame, void Function(bool, String?)? ack) {
@@ -164,6 +200,9 @@ class Realtime {
   }
 
   void dispose() {
+    _disposed = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _subs.clear();
     _socket?.sink.close();
     _socket = null;

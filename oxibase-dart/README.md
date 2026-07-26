@@ -120,6 +120,22 @@ Image.network(
 );
 ```
 
+## Counting
+
+```dart
+final open = await client.from('todos').eq('done', false).count();
+```
+
+Uses the native count endpoint rather than a PostgREST count: this server's
+`Content-Range` reports the page but leaves the total as `*`, so there is nothing
+to read a total from. Equality filters only — that is what the endpoint takes.
+
+## Not here, on purpose
+
+`rpc()` — the JavaScript client exposes it because it wraps `postgrest-js`, but
+OxiBase does not serve `/rest/v1/rpc`; calling it returns 404. Stored procedures
+are reached through `.sql('CALL …')`.
+
 ## Tests
 
 `dart test` runs hermetically against a mock server. To also run the integration
