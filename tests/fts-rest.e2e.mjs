@@ -125,6 +125,29 @@ ok(userRows[0]?.owner === "ada@test", "and it is the caller's row");
 const asAdmin = await call("POST", `/api/${RULED}/text_search`, { body: { query: "storage" } });
 ok((asAdmin.data ?? []).length === 2, "the service key sees both, as it bypasses rules");
 
+// ── the index must survive a restart ────────────────────────────────────────
+// Only the definition is persisted; the postings are rebuilt from the documents
+// at open. Without that, a text index quietly disappeared on every deploy and
+// every search answered "no text index" — invisible until something restarted.
+if (process.env.OXIDB_RESTART_CMD) {
+  const { execSync } = await import("node:child_process");
+  execSync(process.env.OXIDB_RESTART_CMD, { stdio: "ignore" });
+  for (let i = 0; i < 40; i++) {
+    try {
+      const r = await fetch(`${BASE}/api/ping`);
+      if (r.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  const after = await call("POST", `/api/${COL}/text_search`, { body: { query: "storage", limit: 10 } });
+  const rows2 = Array.isArray(after.data) ? after.data : [];
+  ok(after.status === 200, `search still works after a restart (${after.status})`);
+  ok(rows2.length === 2, `the index was rebuilt (${rows2.length} hits)`);
+  ok(rows2[0]?.id === 1, "and it still ranks correctly");
+} else {
+  console.log("  … set OXIDB_RESTART_CMD to also cover surviving a restart");
+}
+
 // ── cleanup ─────────────────────────────────────────────────────────────────
 for (const c of [COL, RULED, CLOSED]) {
   await call("DELETE", `/api/rules/${c}`);

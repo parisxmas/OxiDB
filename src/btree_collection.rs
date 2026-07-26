@@ -406,6 +406,28 @@ impl BTreeCollection {
             Vec::new()
         };
 
+        // Rebuild a text index the collection had before. Only the *definition*
+        // is persisted (which fields), so the postings are rebuilt by reading the
+        // documents once — a text index has to see every document's text either
+        // way. Disk-first otherwise avoids loading all documents, so this cost is
+        // paid only by collections that asked for full-text search.
+        let restored_text = persisted_indexes
+            .iter()
+            .find(|info| info.index_type == "text")
+            .map(|info| -> Result<CollectionTextIndex> {
+                let mut idx = CollectionTextIndex::new(info.fields.clone());
+                storage.scan_all_while(|_id, bytes| {
+                    if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                        if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                            idx.index_doc(id, &Arc::new(doc));
+                        }
+                    }
+                    Ok(true)
+                })?;
+                Ok(idx)
+            })
+            .transpose()?;
+
         // Restore TTL index configs from persisted metadata
         let ttl_configs: Vec<TtlIndexConfig> = persisted_indexes
             .iter()
@@ -430,7 +452,7 @@ impl BTreeCollection {
             storage,
             field_indexes: RwLock::new(field_indexes),
             composite_indexes: RwLock::new(composite_indexes),
-            text_index: RwLock::new(None),
+            text_index: RwLock::new(restored_text),
             vector_indexes: RwLock::new(HashMap::new()),
             doc_cache: DocCache::new(crate::doc_cache::default_capacity()),
             bytes_cache: DocBytesCache::new(crate::doc_bytes_cache::default_capacity()),
@@ -3486,8 +3508,16 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
-        let mut ti = self.text_index.write();
-        *ti = Some(idx);
+        {
+            let mut ti = self.text_index.write();
+            *ti = Some(idx);
+        }
+        // Persist the definition, or the index is gone at the next restart and a
+        // search answers "no text index" — which is exactly what happened the
+        // first time this was reachable from outside the wire. `list_indexes`
+        // already reports it, so this is all that was missing here; the in-RAM
+        // collection has always done it.
+        let _ = self.save_index_metadata();
         Ok(())
     }
 
