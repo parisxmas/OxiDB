@@ -206,6 +206,33 @@ export interface StorageBucket {
   remove(key: string): Promise<{ error: string | null }>;
   /** The object's URL (requests to it still need the Authorization header). */
   getUrl(key: string): string;
+  /**
+   * Ranked full-text search over the *contents* of this bucket's files (BM25) —
+   * HTML, XML, JSON, PDF, DOCX, XLSX, and images when the server is built with
+   * OCR. Text is extracted and indexed on upload, so nothing has to be built
+   * first, unlike a collection's text index.
+   *
+   * Per bucket by design: a bucket's read rule is what decides who may read its
+   * files, so a search that spanned buckets could report keys out of one this key
+   * cannot read.
+   */
+  search(
+    query: string,
+    opts?: {
+      limit?: number;
+      /** Ask for matched snippets — re-extracts each hit's text, so it costs. */
+      highlight?: boolean | { snippetChars?: number; maxSnippets?: number };
+    },
+  ): Promise<{ data: StorageSearchHit[] | null; error: string | null }>;
+}
+
+/** One hit from {@link StorageBucket.search}: a file, not a document. */
+export interface StorageSearchHit {
+  bucket: string;
+  key: string;
+  score: number;
+  /** Present only when `highlight` was asked for; snippets carry `<mark>`. */
+  highlights?: string[];
 }
 
 export interface OxibaseStorage {
@@ -916,6 +943,22 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
         },
         getUrl(key) {
           return storageUrl(keyPath(key));
+        },
+        async search(query, searchOpts = {}) {
+          const highlight =
+            typeof searchOpts.highlight === "object"
+              ? {
+                  snippet_chars: searchOpts.highlight.snippetChars,
+                  max_snippets: searchOpts.highlight.maxSnippets,
+                }
+              : searchOpts.highlight;
+          const { data, error } = await storageJson<StorageSearchHit[]>(
+            "POST",
+            "/_search",
+            JSON.stringify({ bucket, query, limit: searchOpts.limit, highlight }),
+            { "Content-Type": "application/json" },
+          );
+          return { data, error };
         },
       };
     },

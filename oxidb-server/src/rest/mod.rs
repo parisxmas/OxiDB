@@ -584,6 +584,29 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Handled outside the generic match: downloads return raw bytes with the
     // stored Content-Type, which the JSON-only match below cannot express.
     if segments.len() >= 2 && segments[0] == "api" && segments[1] == "storage" {
+        // Full-text search over stored *file contents* (the blob FTS index:
+        // HTML, XML, JSON, PDF, DOCX, XLSX, and OCR'd images when built with
+        // that feature). Matched here rather than in `storage::handle` because
+        // the rule check needs the caller, and ahead of the delegate because
+        // `POST /api/storage/{x}` already means "create bucket x" — `_search`
+        // is therefore not a usable bucket name on this surface, which matches
+        // the `_`-prefix convention everywhere else.
+        if req.method == "POST" && segments.len() == 3 && segments[2] == "_search" {
+            let result = handle_storage_search(req, state, &auth_ctx);
+            return with_rest_cors(match result {
+                Ok(v) => json_response(200, "OK", v),
+                Err((status, msg)) => {
+                    let text = match status {
+                        400 => "Bad Request",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        _ => "Internal Server Error",
+                    };
+                    json_response(status, text, json!({ "error": msg }))
+                }
+            });
+        }
+
         // A bucket is a named object like any other, so a rule on its name
         // decides who may read it — the only way to keep stored files private
         // from a key that ships in a browser.
@@ -995,6 +1018,65 @@ fn handle_text_search(
         }
     }
     Ok(out)
+}
+
+/// `POST /api/storage/_search` — full-text search over stored file contents.
+///
+/// Body: `{ "bucket": "docs", "query": "...", "limit": 20, "highlight": true }`.
+/// Hits are `{bucket, key, score}` (plus `highlights` when asked), not documents:
+/// the index holds text extracted from the files themselves.
+///
+/// **The bucket is required.** A bucket's read rule is per bucket, so a search
+/// across all of them could report keys and snippets out of a bucket this key may
+/// not read. Searching one bucket at a time makes the check exactly the one the
+/// download path already performs.
+fn handle_storage_search(
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let bucket = body
+        .get("bucket")
+        .and_then(|v| v.as_str())
+        .ok_or((400, "missing 'bucket' (search is per bucket, so its read rule applies)"))?;
+    let query = body
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or((400, "missing 'query'"))?;
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(200) as usize;
+
+    // The same gate a download goes through — including refusing a row-level
+    // rule, which cannot mean anything for a file.
+    read_allowed(state, bucket, auth)?;
+
+    // Highlighting re-extracts the text of every hit (a PDF is not cheap), so it
+    // happens only when asked for.
+    let highlight = body.get("highlight").and_then(|h| {
+        if h.as_bool() == Some(true) {
+            Some((80usize, 3usize))
+        } else if let Some(o) = h.as_object() {
+            Some((
+                o.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize,
+                o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
+            ))
+        } else {
+            None
+        }
+    });
+
+    let hits = match highlight {
+        Some((chars, max)) => state
+            .db
+            .search_highlighted(Some(bucket), query, limit, chars, max)
+            .map_err(db_err)?,
+        None => state.db.search(Some(bucket), query, limit).map_err(db_err)?,
+    };
+    Ok(json!(hits))
 }
 
 /// `POST /api/{col}/text_index` — build the BM25 index over the given fields.
@@ -1607,6 +1689,10 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_eng
                     // rules can filter it and a browser key may search. Building
                     // the index is not a read, and is deliberately not here.
                     | ("POST", ["api", _, "text_search"])
+                    // Searching a bucket's file text is a read of those files,
+                    // which this key may already download; the per-bucket rule is
+                    // checked in the handler.
+                    | ("POST", ["api", "storage", "_search"])
                     | ("POST", ["api", "sql"])
                     | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
             )
