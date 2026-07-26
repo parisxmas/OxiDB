@@ -1984,6 +1984,10 @@ fn db_err(e: oxidb::Error) -> (u16, &'static str) {
             (403, "collection limit reached for this project")
         }
         oxidb::Error::DocumentLimitExceeded(_) => (403, "document limit reached for this project"),
+        // A duplicate on a unique index is a conflict the caller can act on, not a
+        // server fault. Deduplicating by key is the whole use of a unique index,
+        // and a 500 makes it indistinguishable from a broken server.
+        oxidb::Error::UniqueViolation { .. } => (409, "duplicate value for a unique field"),
         _ => (500, "database error"),
     }
 }

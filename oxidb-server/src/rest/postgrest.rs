@@ -198,6 +198,12 @@ pub(super) fn handle_post(
         Err(oxidb::Error::DocumentLimitExceeded(_)) => {
             return err(403, "document limit reached for this project");
         }
+        // A unique index refusing a duplicate is the caller's conflict, not a
+        // server fault — and clients act on it (an app deduplicating by key needs
+        // to tell "already there" from "something broke"). 409 is that answer.
+        Err(oxidb::Error::UniqueViolation { field }) => {
+            return err(409, &format!("duplicate value for unique field '{field}'"));
+        }
         Err(_) => return err(500, "database error"),
     };
 
