@@ -18,6 +18,12 @@ const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
 const SESSION_EXPIRY_SECS: u64 = 86_400;
 /// End-user **refresh** token lifetime.
 const REFRESH_EXPIRY_SECS: u64 = 30 * 86_400;
+/// How long a *just-consumed* refresh token keeps working. Rotation is
+/// single-use, so two requests presenting the same token — two tabs, a retried
+/// POST, a client without single-flight — would leave one winner and one dead
+/// session. Honouring the loser for a few seconds turns that race into a
+/// non-event, while a token replayed later is still refused.
+const REFRESH_GRACE_SECS: u64 = 10;
 
 /// End-user **access** token lifetime — short-lived; the client refreshes it
 /// with the long-lived refresh token. Configurable via `OXIDB_PLATFORM_ACCESS_TTL`
@@ -562,11 +568,29 @@ pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> 
     let Some(row) = row else {
         return resp(401, json!({ "message": "invalid refresh token" }));
     };
-    // Consume the presented token regardless (rotation / expiry cleanup).
-    let _ = state
-        .upstream
-        .delete("refresh_tokens", &json!({ "token_hash": hash }));
-    if now_secs() > row.get("exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+    let now = now_secs();
+    // Already rotated once. Inside the grace window this is a race, not a
+    // replay — serve it; past the window the token is spent for good.
+    if let Some(used_at) = row.get("used_at").and_then(|v| v.as_u64()) {
+        if now > used_at + REFRESH_GRACE_SECS {
+            let _ = state
+                .upstream
+                .delete("refresh_tokens", &json!({ "token_hash": hash }));
+            return resp(401, json!({ "message": "invalid refresh token" }));
+        }
+    } else {
+        // Consume it: the row lingers only so a concurrent presentation of the
+        // same token can be told apart from an unknown one.
+        let _ = state.upstream.update(
+            "refresh_tokens",
+            &json!({ "token_hash": hash }),
+            &json!({ "$set": { "used_at": now } }),
+        );
+    }
+    if now > row.get("exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+        let _ = state
+            .upstream
+            .delete("refresh_tokens", &json!({ "token_hash": hash }));
         return resp(401, json!({ "message": "refresh token expired" }));
     }
     let Some(email) = row.get("email").and_then(|v| v.as_str()) else {
@@ -677,11 +701,26 @@ fn issue_session(
 ) -> Option<(String, String)> {
     let access = mint_user_token(state, project_doc, email)?;
     let refresh = gen_token();
+    let now = now_secs();
+    // Sweep this user's dead rows — consumed ones past the grace window, and
+    // anything expired. Scoped to their own sessions and done in one pass, so
+    // rotation cannot pile up a row per hour for a month.
+    let _ = state.upstream.delete(
+        "refresh_tokens",
+        &json!({
+            "project_ref": project_ref,
+            "email": email,
+            "$or": [
+                { "used_at": { "$lt": now.saturating_sub(REFRESH_GRACE_SECS) } },
+                { "exp": { "$lt": now } },
+            ],
+        }),
+    );
     let row = json!({
         "project_ref": project_ref,
         "email": email,
         "token_hash": crypto::sha256_hex(refresh.as_bytes()),
-        "exp": now_secs() + REFRESH_EXPIRY_SECS,
+        "exp": now + REFRESH_EXPIRY_SECS,
     });
     state.upstream.insert("refresh_tokens", &row).ok()?;
     Some((access, refresh))

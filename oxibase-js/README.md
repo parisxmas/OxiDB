@@ -117,6 +117,28 @@ oxibase.auth.signOut();      // back to the client's original key
 Every `.from()` / `.sql()` call then runs as that user, so security rules see
 their identity. Access tokens refresh automatically on a 401.
 
+### Persisting a session
+
+Refresh tokens are **rotated single-use**: the moment the access token is first
+renewed, the refresh token you got at sign-in is dead. So if you store the
+session, re-store it on every change — `onAuthStateChange` is the signal:
+
+```js
+oxibase.auth.onAuthStateChange((event, session) => {
+  // "signedIn" | "tokenRefreshed" | "signedOut"
+  if (session) localStorage.setItem("session", JSON.stringify(session));
+  else localStorage.removeItem("session");
+});
+
+// on load, resume as that user
+const stored = JSON.parse(localStorage.getItem("session") ?? "null");
+if (stored) oxibase.auth.setSession(stored);
+```
+
+Saving only at sign-in leaves a spent token in storage, and the next reload
+gets a 401 it cannot recover from. `setSession` deliberately does not fire the
+callback — you are the one who supplied that session.
+
 ## Example app
 
 [`examples/notes`](examples/notes) — a tiny React app that does full CRUD against

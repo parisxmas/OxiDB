@@ -1,6 +1,6 @@
 {
   "name": "oxibase-js",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "JavaScript client for OxiBase — createClient(url, key).from('table')... over the PostgREST data plane, plus .sql(), .subscribe() realtime and .storage.",
   "type": "module",
   "main": "./dist/index.js",
@@ -15,7 +15,8 @@
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node test/e2e.mjs"
+    "test": "npm run build && node test/refresh.mjs && node test/e2e.mjs",
+    "test:offline": "npm run build && node test/refresh.mjs"
   },
   "keywords": ["oxibase", "oxidb", "postgrest", "database", "client"],
   "license": "MIT",

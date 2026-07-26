@@ -78,6 +78,18 @@ export interface OxibaseAuth {
    * as-is; if it has expired, the first call refreshes it automatically.
    */
   setSession(session: { token: string; refreshToken?: string }): void;
+  /**
+   * Observe session changes. The callback fires on sign-in, sign-out, and — the
+   * reason this exists — **every token refresh**, because the refresh token is
+   * rotated single-use: the one you stored at sign-in stops working the moment
+   * the access token is first renewed. An app that persists the session must
+   * re-save it here, or the next reload resumes with a spent token.
+   *
+   * Fires with `null` on sign-out. Returns an unsubscribe function.
+   */
+  onAuthStateChange(
+    cb: (event: AuthChangeEvent, session: { token: string; refreshToken: string } | null) => void,
+  ): () => void;
   /** Email a password-reset link (always resolves — no user enumeration). */
   resetPasswordForEmail(email: string): Promise<{ error: string | null }>;
   /** Re-send the signup verification email. */
@@ -129,6 +141,9 @@ export interface OxibaseAuth {
 
 /** Social identity providers OxiBase can sign end-users in with. */
 export type OAuthProvider = "google" | "github";
+
+/** What moved the session, as reported to {@link OxibaseAuth.onAuthStateChange}. */
+export type AuthChangeEvent = "signedIn" | "signedOut" | "tokenRefreshed";
 
 export interface SqlResult {
   columns?: string[];
@@ -261,13 +276,40 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   // `.auth` swaps in an end-user access token + refresh token.
   let token = key;
   let refreshToken = "";
+  // Bumped every time `token` changes. A request that 401s against a token
+  // that has since been replaced needs a retry, not another refresh.
+  let tokenGen = 0;
   const extra = opts.headers ?? {};
   const authBase = opts.authUrl?.replace(/\/+$/, "");
   const authEndpoint = (action: string) =>
     `${authBase}/platform/v1/projects/${encodeURIComponent(ref ?? "")}/auth/${action}`;
 
+  const authListeners = new Set<
+    (event: AuthChangeEvent, session: { token: string; refreshToken: string } | null) => void
+  >();
+  // Tell listeners the session moved. A refresh token is single-use, so an app
+  // that persists the session has to hear about every rotation or its stored
+  // copy goes stale — this is the only signal that it did.
+  function emitAuth(event: AuthChangeEvent) {
+    const session = refreshToken ? { token, refreshToken } : null;
+    for (const cb of [...authListeners]) {
+      try {
+        cb(event, session);
+      } catch {
+        // A listener's failure is not the auth call's failure.
+      }
+    }
+  }
+
+  // Adopt a new access token, noting the generation so concurrent 401s can tell
+  // "already refreshed" from "needs refreshing".
+  function setToken(next: string) {
+    token = next;
+    tokenGen++;
+  }
+
   // Renew the access token from the refresh token (rotated server-side).
-  async function tryRefresh(): Promise<boolean> {
+  async function doRefresh(): Promise<boolean> {
     if (!refreshToken || !authBase || !ref) return false;
     let r: Response;
     try {
@@ -281,9 +323,23 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     }
     const b = (await r.json().catch(() => null)) as { token?: string; refresh_token?: string } | null;
     if (!r.ok || !b?.token) return false;
-    token = b.token;
+    setToken(b.token);
     if (b.refresh_token) refreshToken = b.refresh_token;
+    emitAuth("tokenRefreshed");
     return true;
+  }
+
+  // Coalesce concurrent refreshes. The server rotates the refresh token and
+  // revokes the presented one, so N parallel requests each POSTing the same
+  // token would leave one winner and N-1 spurious 401s.
+  let refreshInFlight: Promise<boolean> | null = null;
+  function tryRefresh(): Promise<boolean> {
+    if (!refreshInFlight) {
+      refreshInFlight = doRefresh().finally(() => {
+        refreshInFlight = null;
+      });
+    }
+    return refreshInFlight;
   }
 
   // Stamp the current access token, and on a 401 refresh once and retry.
@@ -293,11 +349,13 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       headers.set("Authorization", `Bearer ${token}`);
       return baseFetch(input, { ...init, headers });
     };
-    let res = await attempt();
-    if (res.status === 401 && refreshToken && (await tryRefresh())) {
-      res = await attempt();
-    }
-    return res;
+    const sentGen = tokenGen;
+    const res = await attempt();
+    if (res.status !== 401 || !refreshToken) return res;
+    // Someone else already rotated while this was in flight — the 401 is about
+    // the old token, so just retry with the new one.
+    if (tokenGen !== sentGen) return attempt();
+    return (await tryRefresh()) ? attempt() : res;
   }
 
   // Two ways to address the project: put the ref/slug in the PATH
@@ -365,8 +423,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       return { user: body.user, verificationRequired: true, error: null };
     }
     if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
-    token = body.token; // subsequent .from()/.sql() run as this user
+    setToken(body.token); // subsequent .from()/.sql() run as this user
     refreshToken = body.refresh_token ?? "";
+    emitAuth("signedIn");
     return { user: body.user, token: body.token, refreshToken, error: null };
   }
 
@@ -403,8 +462,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     refreshSession: async () =>
       (await tryRefresh()) ? { token, refreshToken, error: null } : { error: "refresh failed" },
     signOut: () => {
-      token = key;
+      setToken(key);
       refreshToken = "";
+      emitAuth("signedOut");
       realtimeReset();
     },
     getSession: () => (refreshToken ? { token, refreshToken } : null),
@@ -412,9 +472,16 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       // Rehydrating the same session (a reload, a re-render) is not an
       // identity change and must not disturb a live connection.
       const unchanged = session.token === token;
-      token = session.token;
+      setToken(session.token);
       refreshToken = session.refreshToken ?? "";
+      // No `emitAuth` here: the caller handed us this session, so telling it
+      // back would just echo — and could loop a listener that persists on every
+      // event straight back into `setSession`.
       if (!unchanged) realtimeReset();
+    },
+    onAuthStateChange: (cb) => {
+      authListeners.add(cb);
+      return () => authListeners.delete(cb);
     },
     resetPasswordForEmail: (email) => authPost("recover", { email }),
     resendVerification: (email) => authPost("resend", { email }),
@@ -453,8 +520,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
         | { user?: { email: string }; token?: string; refresh_token?: string; message?: string }
         | null;
       if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
-      token = body.token;
+      setToken(body.token);
       refreshToken = body.refresh_token ?? "";
+      emitAuth("signedIn");
       realtimeReset();
       return { user: body.user, token, refreshToken, error: null };
     },
@@ -468,8 +536,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       if (err) return { error: err };
       const access = params.get("access_token");
       if (!access) return null;
-      token = access;
+      setToken(access);
       refreshToken = params.get("refresh_token") ?? "";
+      emitAuth("signedIn");
       realtimeReset();
       // Drop the fragment: a session in the address bar ends up in history,
       // bookmarks and anything the user pastes.

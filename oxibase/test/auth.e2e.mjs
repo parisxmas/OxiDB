@@ -370,6 +370,44 @@ if (SINK) {
   ok(!users.data.some((u) => u.email === email), "admin routes: the user is gone");
 }
 
+// ── refresh-token rotation ──────────────────────────────────────────────────
+{
+  const email = `rotate-${process.pid}@example.com`;
+  await api("POST", `/projects/${ref}/auth/signup`, {
+    auth: false,
+    body: { email, password: "hunter2hunter2" },
+  });
+  await api("POST", `/projects/${ref}/users/${encodeURIComponent(email)}/verify`);
+  const login = await api("POST", `/projects/${ref}/auth/login`, {
+    auth: false,
+    body: { email, password: "hunter2hunter2" },
+  });
+  ok(login.status === 200, "rotation: signed in");
+  const r0 = login.data.refresh_token;
+
+  const refresh = (t) =>
+    api("POST", `/projects/${ref}/auth/refresh`, { auth: false, body: { refresh_token: t } });
+
+  const first = await refresh(r0);
+  ok(first.status === 200 && first.data.token, "rotation: the token refreshes");
+  ok(first.data.refresh_token && first.data.refresh_token !== r0, "rotation: a new token comes back");
+
+  // Inside the grace window the *same* token still works — a client with two
+  // requests in flight rotates once and must not lose the loser's session.
+  const raced = await refresh(r0);
+  ok(raced.status === 200, `rotation: a re-presented token is honoured briefly (${raced.status})`);
+
+  // The rotated one is a full session in its own right.
+  const chained = await refresh(first.data.refresh_token);
+  ok(chained.status === 200, "rotation: the new token refreshes in turn");
+
+  // Nonsense is still refused.
+  const bogus = await refresh("not-a-token");
+  ok(bogus.status === 401, "rotation: an unknown token is rejected");
+
+  await api("DELETE", `/projects/${ref}/users/${encodeURIComponent(email)}`);
+}
+
 // ── cleanup ─────────────────────────────────────────────────────────────────
 {
   const r = await api("DELETE", `/projects/${ref}`);
