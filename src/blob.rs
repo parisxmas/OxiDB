@@ -869,6 +869,22 @@ impl BlobStore {
         prefix: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<ObjectMeta>> {
+        self.list_objects_from(bucket, prefix, None, limit)
+    }
+
+    /// Like [`list_objects`](Self::list_objects), but starting **after** a key.
+    ///
+    /// Keys sort, so paging by "everything greater than the last key I saw" is
+    /// stable in a way an offset is not: an upload or delete between two pages
+    /// cannot make a row appear twice or be skipped. It is also what S3's
+    /// `start-after` does, so a client that knows one knows the other.
+    pub fn list_objects_from(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ObjectMeta>> {
         let map = self.buckets.read().unwrap();
         let bl = map
             .get(bucket)
@@ -881,6 +897,10 @@ impl BlobStore {
             .iter()
             .filter(|(k, _)| match prefix {
                 Some(p) => k.starts_with(p),
+                None => true,
+            })
+            .filter(|(k, _)| match after {
+                Some(a) => k.as_str() > a,
                 None => true,
             })
             .collect();

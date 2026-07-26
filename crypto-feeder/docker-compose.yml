@@ -1,0 +1,68 @@
+services:
+  oxidb:
+    build:
+      context: ..
+      dockerfile: crypto-feeder/Dockerfile.oxidb
+    environment:
+      OXIDB_ADDR: "0.0.0.0:4444"
+      OXIDB_MQTT_PORT: "1883"
+      OXIDB_OXIMEM_PORT: "6380"
+      OXIDB_LOG_COMMANDS: "false"
+    ports:
+      - "4444:4444"
+      - "1883:1883"
+      - "6380:6380"
+    volumes:
+      - /Volumes/KINGSTON/oxidb_data:/oxidb_data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4444"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  ingest-binance:
+    build: ./ingest
+    depends_on:
+      oxidb:
+        condition: service_healthy
+    environment:
+      EXCHANGE: "binance"
+      MQTT_BROKER: "tcp://oxidb:1883"
+      OXIDB_HOST: "oxidb:4444"
+    restart: unless-stopped
+
+  ingest-coinbase:
+    build: ./ingest
+    depends_on:
+      oxidb:
+        condition: service_healthy
+    environment:
+      EXCHANGE: "coinbase"
+      MQTT_BROKER: "tcp://oxidb:1883"
+      OXIDB_HOST: "oxidb:4444"
+    restart: unless-stopped
+
+  ingest-kraken:
+    build: ./ingest
+    depends_on:
+      oxidb:
+        condition: service_healthy
+    environment:
+      EXCHANGE: "kraken"
+      MQTT_BROKER: "tcp://oxidb:1883"
+      OXIDB_HOST: "oxidb:4444"
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    depends_on:
+      oxidb:
+        condition: service_healthy
+    environment:
+      MQTT_BROKER: "tcp://oxidb:1883"
+      OXIDB_HOST: "oxidb:4444"
+      LISTEN_ADDR: ":3000"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+

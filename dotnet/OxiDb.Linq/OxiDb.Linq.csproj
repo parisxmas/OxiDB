@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OxiDb.Linq</RootNamespace>
+
+    <PackageId>OxiDb.Linq</PackageId>
+    <Description>Standalone LINQ provider for OxiDB. IQueryable&lt;T&gt; with Where/OrderBy/Skip/Take/First/Count/Any/Sum/projection, fluent UpdateAsync/DeleteAsync. No EF Core dependency.</Description>
+    <PackageTags>oxidb;linq;document-database;nosql;async</PackageTags>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OxiDb.Client.Tcp\OxiDb.Client.Tcp.csproj" />
+  </ItemGroup>
+
+</Project>

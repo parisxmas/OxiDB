@@ -9,6 +9,7 @@ import {
   downloadObject,
   deleteObject,
 } from "./dataApi.ts";
+import { PAGE_SIZE, Pager } from "./Pager.tsx";
 
 /** Files tab: the project's per-database blob store (buckets + objects). */
 export function FilesBrowser({ projectRef, apiKey }: { projectRef: string; apiKey: string }) {
@@ -120,11 +121,28 @@ function BucketView({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  // Keyset paging: `cursors[i]` is the key to start page i after. Page 0 starts
+  // at the beginning, so the stack grows as you go forward and pops going back.
+  const [cursors, setCursors] = useState<(string | undefined)[]>([undefined]);
+  const [page, setPage] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
 
-  async function refresh() {
+  async function refresh(p = page, stack = cursors) {
     setLoading(true);
     try {
-      setObjects(await listObjects(projectRef, apiKey, bucket));
+      const got = await listObjects(projectRef, apiKey, bucket, PAGE_SIZE + 1, stack[p]);
+      const shown = got.slice(0, PAGE_SIZE);
+      setHasNext(got.length > PAGE_SIZE);
+      setObjects(shown);
+      // Remember where the next page begins: after the last key on this one.
+      if (got.length > PAGE_SIZE && shown.length > 0) {
+        const next = shown[shown.length - 1].key;
+        setCursors((c) => {
+          const copy = [...c];
+          copy[p + 1] = next;
+          return copy;
+        });
+      }
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -134,9 +152,16 @@ function BucketView({
   }
 
   useEffect(() => {
-    refresh();
+    setPage(0);
+    setCursors([undefined]);
+    refresh(0, [undefined]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bucket]);
+
+  useEffect(() => {
+    refresh(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   async function upload(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -201,7 +226,7 @@ function BucketView({
       <div className="row between">
         <h3 style={{ margin: "4px 0" }}>{bucket}</h3>
         <div className="row" style={{ gap: 8 }}>
-          <button className="ghost" onClick={refresh}>
+          <button className="ghost" onClick={() => refresh()}>
             Refresh
           </button>
           <button className="ghost danger" disabled={busy} onClick={dropBucket}>
@@ -265,9 +290,14 @@ function BucketView({
               </tbody>
             </table>
           </div>
-          <div className="muted small">
-            {objects.length} object{objects.length === 1 ? "" : "s"}
-          </div>
+          <Pager
+            page={page}
+            hasNext={hasNext}
+            shown={objects.length}
+            onPage={setPage}
+            disabled={busy}
+            unit="objects"
+          />
         </>
       )}
     </div>

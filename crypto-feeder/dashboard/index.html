@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Order Book — OxiDB MQTT</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #07080c;
+    --surface: #0e1017;
+    --surface2: #151820;
+    --border: #1e2230;
+    --text: #c8cdd8;
+    --text-dim: #5a6178;
+    --green: #00e676;
+    --green-bg: rgba(0, 230, 118, 0.08);
+    --red: #ff1744;
+    --red-bg: rgba(255, 23, 68, 0.08);
+    --accent: #448aff;
+    --yellow: #ffd740;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .header h1 {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+
+  .header h1 span { color: var(--accent); }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+  }
+
+  .status-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .pair-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .pair-tab {
+    padding: 8px 20px;
+    border: none;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: 'Outfit', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.2s;
+  }
+
+  .pair-tab:hover { color: var(--text); background: var(--surface2); }
+  .pair-tab.active { color: var(--accent); background: rgba(68, 138, 255, 0.12); }
+
+  .pair-tab .price {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    margin-top: 2px;
+    color: var(--text-dim);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    padding: 1px;
+    background: var(--border);
+    flex: 1;
+  }
+
+  .exchange-panel {
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .exchange-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .exchange-name {
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .exchange-name.binance { color: #f0b90b; }
+  .exchange-name.coinbase { color: #0052ff; }
+  .exchange-name.kraken { color: #7b61ff; }
+
+  .exchange-spread {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .book-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    flex: 1;
+  }
+
+  .book-side { padding: 4px 0; }
+
+  .book-side-header {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 6px 12px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .book-side-header.asks { direction: rtl; }
+
+  .book-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 2px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 20px;
+    position: relative;
+    transition: background 0.15s;
+  }
+
+  .book-row:hover { background: var(--surface2); }
+
+  .book-row .bar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 0;
+    opacity: 0.15;
+    transition: width 0.3s ease;
+  }
+
+  .bids-side .book-row .bar { right: 0; background: var(--green); }
+  .asks-side .book-row .bar { left: 0; background: var(--red); }
+
+  .book-row span { position: relative; z-index: 1; }
+
+  .bids-side .price-cell { color: var(--green); text-align: left; }
+  .bids-side .qty-cell { text-align: right; color: var(--text-dim); }
+
+  .asks-side .price-cell { color: var(--red); text-align: right; }
+  .asks-side .qty-cell { text-align: left; color: var(--text-dim); }
+
+  .no-data {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    color: var(--text-dim);
+    font-size: 13px;
+    grid-column: 1 / -1;
+  }
+
+  .stats-bar {
+    display: flex;
+    gap: 24px;
+    padding: 8px 24px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .stats-bar span strong { color: var(--text); }
+
+  .flash { animation: flash 0.3s ease; }
+  @keyframes flash {
+    0% { background: rgba(68, 138, 255, 0.2); }
+    100% { background: transparent; }
+  }
+
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Crypto <span>Order Book</span></h1>
+  <div class="status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">connecting...</span>
+    <span id="msgRate"></span>
+  </div>
+</div>
+
+<div class="pair-tabs" id="pairTabs">
+  <button class="pair-tab active" data-pair="btcusdt">BTC<span class="price" id="price-btcusdt">—</span></button>
+  <button class="pair-tab" data-pair="ethusdt">ETH<span class="price" id="price-ethusdt">—</span></button>
+  <button class="pair-tab" data-pair="solusdt">SOL<span class="price" id="price-solusdt">—</span></button>
+  <button class="pair-tab" data-pair="xrpusdt">XRP<span class="price" id="price-xrpusdt">—</span></button>
+  <button class="pair-tab" data-pair="bnbusdt">BNB<span class="price" id="price-bnbusdt">—</span></button>
+</div>
+
+<div class="grid" id="grid">
+  <div class="exchange-panel" id="panel-binance">
+    <div class="exchange-header">
+      <span class="exchange-name binance">Binance</span>
+      <span class="exchange-spread" id="spread-binance">—</span>
+    </div>
+    <div class="book-container">
+      <div class="book-side bids-side">
+        <div class="book-side-header"><span>Price</span><span>Qty</span></div>
+        <div id="bids-binance" class="book-rows"></div>
+      </div>
+      <div class="book-side asks-side">
+        <div class="book-side-header asks"><span>Qty</span><span>Price</span></div>
+        <div id="asks-binance" class="book-rows"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="exchange-panel" id="panel-coinbase">
+    <div class="exchange-header">
+      <span class="exchange-name coinbase">Coinbase</span>
+      <span class="exchange-spread" id="spread-coinbase">—</span>
+    </div>
+    <div class="book-container">
+      <div class="book-side bids-side">
+        <div class="book-side-header"><span>Price</span><span>Qty</span></div>
+        <div id="bids-coinbase" class="book-rows"></div>
+      </div>
+      <div class="book-side asks-side">
+        <div class="book-side-header asks"><span>Qty</span><span>Price</span></div>
+        <div id="asks-coinbase" class="book-rows"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="exchange-panel" id="panel-kraken">
+    <div class="exchange-header">
+      <span class="exchange-name kraken">Kraken</span>
+      <span class="exchange-spread" id="spread-kraken">—</span>
+    </div>
+    <div class="book-container">
+      <div class="book-side bids-side">
+        <div class="book-side-header"><span>Price</span><span>Qty</span></div>
+        <div id="bids-kraken" class="book-rows"></div>
+      </div>
+      <div class="book-side asks-side">
+        <div class="book-side-header asks"><span>Qty</span><span>Price</span></div>
+        <div id="asks-kraken" class="book-rows"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="stats-bar">
+  <span>msgs: <strong id="statMsgs">0</strong></span>
+  <span>rate: <strong id="statRate">0</strong>/s</span>
+  <span>uptime: <strong id="statUptime">0s</strong></span>
+</div>
+
+<script>
+const DEPTH = 15;
+const exchanges = ['binance', 'coinbase', 'kraken'];
+let activePair = 'btcusdt';
+let msgCount = 0;
+let lastMsgCount = 0;
+let startTime = Date.now();
+let ws = null;
+
+// Latest order books: state[exchange][pair] = {bids, asks, timestamp}
+const state = {};
+exchanges.forEach(e => state[e] = {});
+
+// Pair tab click
+document.querySelectorAll('.pair-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.pair-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    activePair = tab.dataset.pair;
+    render();
+  });
+});
+
+function formatPrice(p) {
+  if (p >= 1000) return p.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  if (p >= 1) return p.toFixed(4);
+  return p.toFixed(6);
+}
+
+function formatQty(q) {
+  if (q >= 1000) return q.toFixed(2);
+  if (q >= 1) return q.toFixed(4);
+  return q.toFixed(6);
+}
+
+function renderBook(exchange) {
+  const data = state[exchange][activePair];
+  const bidsEl = document.getElementById(`bids-${exchange}`);
+  const asksEl = document.getElementById(`asks-${exchange}`);
+  const spreadEl = document.getElementById(`spread-${exchange}`);
+
+  if (!data || !data.bids || !data.asks) {
+    bidsEl.innerHTML = '<div class="no-data">Waiting for data...</div>';
+    asksEl.innerHTML = '';
+    spreadEl.textContent = '—';
+    return;
+  }
+
+  const bids = data.bids.slice(0, DEPTH);
+  const asks = data.asks.slice(0, DEPTH);
+
+  const maxBidQty = Math.max(...bids.map(l => l.qty), 0.001);
+  const maxAskQty = Math.max(...asks.map(l => l.qty), 0.001);
+
+  // Spread
+  if (bids.length > 0 && asks.length > 0) {
+    const sp = asks[0].price - bids[0].price;
+    const pct = (sp / asks[0].price * 100).toFixed(3);
+    spreadEl.textContent = `spread: ${formatPrice(sp)} (${pct}%)`;
+  }
+
+  // Bids
+  let bidsHTML = '';
+  for (const level of bids) {
+    const barW = (level.qty / maxBidQty * 100).toFixed(1);
+    bidsHTML += `<div class="book-row"><div class="bar" style="width:${barW}%"></div><span class="price-cell">${formatPrice(level.price)}</span><span class="qty-cell">${formatQty(level.qty)}</span></div>`;
+  }
+  bidsEl.innerHTML = bidsHTML;
+
+  // Asks
+  let asksHTML = '';
+  for (const level of asks) {
+    const barW = (level.qty / maxAskQty * 100).toFixed(1);
+    asksHTML += `<div class="book-row"><div class="bar" style="width:${barW}%"></div><span class="qty-cell">${formatQty(level.qty)}</span><span class="price-cell">${formatPrice(level.price)}</span></div>`;
+  }
+  asksEl.innerHTML = asksHTML;
+}
+
+function render() {
+  exchanges.forEach(renderBook);
+}
+
+function updatePriceTab(pair, exchange, bids) {
+  if (bids && bids.length > 0) {
+    const el = document.getElementById(`price-${pair}`);
+    if (el) el.textContent = '$' + formatPrice(bids[0].price);
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('connected');
+    document.getElementById('statusText').textContent = 'connected';
+  };
+
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('connected');
+    document.getElementById('statusText').textContent = 'reconnecting...';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (event) => {
+    msgCount++;
+    try {
+      const ob = JSON.parse(event.data);
+      state[ob.exchange][ob.pair] = ob;
+      updatePriceTab(ob.pair, ob.exchange, ob.bids);
+      if (ob.pair === activePair) {
+        renderBook(ob.exchange);
+      }
+    } catch(e) {}
+  };
+}
+
+// Stats update
+setInterval(() => {
+  document.getElementById('statMsgs').textContent = msgCount.toLocaleString();
+  const rate = msgCount - lastMsgCount;
+  lastMsgCount = msgCount;
+  document.getElementById('statRate').textContent = rate;
+  const uptime = Math.floor((Date.now() - startTime) / 1000);
+  const m = Math.floor(uptime / 60);
+  const s = uptime % 60;
+  document.getElementById('statUptime').textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
+}, 1000);
+
+connect();
+render();
+</script>
+</body>
+</html>

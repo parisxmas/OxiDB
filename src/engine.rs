@@ -3251,7 +3251,20 @@ impl OxiDb {
         prefix: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<Value>> {
-        let metas = self.blob_store.list_objects(bucket, prefix, limit)?;
+        self.list_objects_from(bucket, prefix, None, limit)
+    }
+
+    /// Objects after a given key — keyset paging, stable across writes.
+    pub fn list_objects_from(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let metas = self
+            .blob_store
+            .list_objects_from(bucket, prefix, after, limit)?;
         metas
             .into_iter()
             .map(|m| serde_json::to_value(&m).map_err(Error::from))

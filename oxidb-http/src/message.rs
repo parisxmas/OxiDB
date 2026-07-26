@@ -292,3 +292,153 @@ fn read_chunked(reader: &mut BufReader<impl Read>) -> Option<Vec<u8>> {
     }
     Some(body)
 }
+
+/// Who a request came from, as far as the edge in front will say.
+///
+/// Behind Cloudflare the socket peer is Cloudflare, so the useful identity is in
+/// headers: `CF-Connecting-IP` is the visitor, and the `CF-IP*` family carries
+/// coarse geolocation. Those location headers are **not sent by default** — they
+/// appear once "Add visitor location headers" is switched on for the zone
+/// (Cloudflare dashboard → Rules → Settings → Managed Transforms), except
+/// `CF-IPCountry`, which follows the IP Geolocation toggle.
+///
+/// Everything is borrowed and empty-when-absent, so logging it costs nothing on
+/// a deployment with no proxy in front.
+pub struct ClientMeta<'a> {
+    /// The visitor's address: `CF-Connecting-IP`, else the first hop of
+    /// `X-Forwarded-For`, else `X-Real-IP`. Empty when nothing said.
+    pub ip: &'a str,
+    /// ISO country, e.g. `TR`. `XX` means Cloudflare could not tell; `T1` is Tor.
+    pub country: &'a str,
+    pub city: &'a str,
+    pub region: &'a str,
+    pub continent: &'a str,
+    pub timezone: &'a str,
+    /// Approximate coordinates of the visitor's city, when the zone sends them.
+    /// Cloudflare's own accuracy caveat applies: it is a city, not a person.
+    pub latitude: &'a str,
+    pub longitude: &'a str,
+    /// Cloudflare's request id — the handle for finding the same request in
+    /// Cloudflare's own logs.
+    pub ray: &'a str,
+    pub user_agent: &'a str,
+}
+
+impl<'a> ClientMeta<'a> {
+    /// The non-empty fields, ready to attach to a log record.
+    pub fn fields(&self) -> Vec<(&'static str, &'a str)> {
+        [
+            ("ip", self.ip),
+            ("country", self.country),
+            ("city", self.city),
+            ("region", self.region),
+            ("continent", self.continent),
+            ("timezone", self.timezone),
+            ("lat", self.latitude),
+            ("lon", self.longitude),
+            ("cf_ray", self.ray),
+            ("user_agent", self.user_agent),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+    }
+}
+
+impl HttpRequest {
+    /// Read the caller's address and location off the edge's headers.
+    pub fn client_meta(&self) -> ClientMeta<'_> {
+        let h = |name: &str| self.headers.get(name).map(String::as_str).unwrap_or("");
+        // The first hop of X-Forwarded-For is the client; the rest are proxies.
+        let forwarded = h("x-forwarded-for")
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let ip = match h("cf-connecting-ip") {
+            "" => match forwarded {
+                "" => h("x-real-ip"),
+                f => f,
+            },
+            cf => cf,
+        };
+        ClientMeta {
+            ip,
+            country: h("cf-ipcountry"),
+            city: h("cf-ipcity"),
+            region: h("cf-region"),
+            continent: h("cf-ipcontinent"),
+            timezone: h("cf-timezone"),
+            latitude: h("cf-iplatitude"),
+            longitude: h("cf-iplongitude"),
+            ray: h("cf-ray"),
+            user_agent: h("user-agent"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_meta_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn req(headers: &[(&str, &str)]) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cloudflare_wins_over_the_forwarded_chain() {
+        let r = req(&[
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-forwarded-for", "203.0.113.7, 172.70.1.1"),
+        ]);
+        assert_eq!(r.client_meta().ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn the_first_hop_is_the_client() {
+        // The rest of the chain is proxies; logging the last one would record
+        // Cloudflare's address as the visitor's.
+        let r = req(&[("x-forwarded-for", "203.0.113.7, 172.70.1.1, 10.0.0.3")]);
+        assert_eq!(r.client_meta().ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn absent_headers_are_empty_not_missing_fields() {
+        let bare = req(&[]);
+        let meta = bare.client_meta();
+        assert_eq!(meta.ip, "");
+        assert!(meta.fields().is_empty(), "nothing to log when nothing is known");
+    }
+
+    #[test]
+    fn location_headers_are_carried_when_the_zone_sends_them() {
+        let r = req(&[
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("cf-ipcountry", "TR"),
+            ("cf-ipcity", "Istanbul"),
+            ("cf-ray", "9a1b2c3d4e5f6789-IST"),
+            ("cf-iplatitude", "41.01384"),
+            ("cf-iplongitude", "28.94966"),
+            ("user-agent", "curl/8"),
+        ]);
+        let meta = r.client_meta();
+        let fields = meta.fields();
+        assert!(fields.contains(&("country", "TR")));
+        assert!(fields.contains(&("city", "Istanbul")));
+        assert!(fields.contains(&("cf_ray", "9a1b2c3d4e5f6789-IST")));
+        assert!(fields.contains(&("lat", "41.01384")));
+        assert!(fields.contains(&("lon", "28.94966")));
+        // Not sent by the zone → not invented.
+        assert!(!fields.iter().any(|(k, _)| *k == "timezone"));
+    }
+}

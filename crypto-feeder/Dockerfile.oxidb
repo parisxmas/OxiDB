@@ -1,0 +1,9 @@
+FROM rust:latest AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p oxidb-server
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/oxidb-server /usr/local/bin/
+ENTRYPOINT ["oxidb-server"]

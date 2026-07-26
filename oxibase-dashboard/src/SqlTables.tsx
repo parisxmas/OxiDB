@@ -16,6 +16,7 @@ import {
   alterSqlColumnType,
   dropSqlTable,
 } from "./dataApi.ts";
+import { PAGE_SIZE, Pager } from "./Pager.tsx";
 
 export function SqlTables({ projectRef, apiKey }: { projectRef: string; apiKey: string }) {
   const [tables, setTables] = useState<SqlTable[]>([]);
@@ -112,18 +113,24 @@ function TableView({
   // "new" for the insert form, or null when no form is open.
   const [editing, setEditing] = useState<unknown[] | "new" | null>(null);
   const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
 
   const pk = schema.find((c) => c.primaryKey);
 
-  async function refresh() {
+  async function refresh(p = page) {
     setLoading(true);
     setError(null);
     try {
+      // LIMIT n+1 OFFSET p*n: the extra row answers "is there a next page"
+      // without a COUNT(*), which on a big table is a scan.
       const [r, s] = await Promise.all([
-        selectSqlRows(projectRef, apiKey, table, 100),
+        selectSqlRows(projectRef, apiKey, table, PAGE_SIZE + 1, p * PAGE_SIZE),
         describeSqlTable(projectRef, apiKey, table),
       ]);
-      setRows(r);
+      const got = r.rows ?? [];
+      setHasNext(got.length > PAGE_SIZE);
+      setRows({ ...r, rows: got.slice(0, PAGE_SIZE) });
       setSchema(parseSchema(s));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -134,9 +141,15 @@ function TableView({
 
   useEffect(() => {
     setEditing(null);
-    refresh();
+    setPage(0);
+    refresh(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [table]);
+
+  useEffect(() => {
+    refresh(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   async function mutate(op: () => Promise<unknown>) {
     setBusy(true);
@@ -189,7 +202,7 @@ function TableView({
               Schema
             </button>
           </div>
-          <button className="ghost" onClick={refresh}>
+          <button className="ghost" onClick={() => refresh()}>
             Refresh
           </button>
           {view === "rows" ? (
@@ -278,9 +291,10 @@ function TableView({
                 </tbody>
               </table>
             </div>
+            <Pager page={page} hasNext={hasNext} shown={dataRows.length} onPage={setPage} disabled={busy} />
             <div className="row between">
               <div className="muted small">
-                {dataRows.length} row{dataRows.length === 1 ? "" : "s"}
+                {dataRows.length} row{dataRows.length === 1 ? "" : "s"} on this page
               </div>
               {!pk && (
                 <div className="muted small">no primary key — row editing disabled</div>

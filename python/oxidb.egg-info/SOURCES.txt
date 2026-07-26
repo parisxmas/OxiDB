@@ -1,0 +1,7 @@
+README.md
+oxidb.py
+pyproject.toml
+oxidb.egg-info/PKG-INFO
+oxidb.egg-info/SOURCES.txt
+oxidb.egg-info/dependency_links.txt
+oxidb.egg-info/top_level.txt

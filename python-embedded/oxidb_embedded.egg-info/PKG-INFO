@@ -1,0 +1,73 @@
+Metadata-Version: 2.4
+Name: oxidb-embedded
+Version: 0.25.21
+Summary: Embedded OxiDB for Python — run the database in-process via FFI (no server required)
+Author: OxiDB
+License-Expression: LicenseRef-Proprietary
+Project-URL: Homepage, https://oxidb.baltavista.com
+Project-URL: Documentation, https://oxidb.baltavista.com/python-examples.html
+Project-URL: Downloads, https://oxidb.baltavista.com/downloads.html
+Keywords: database,document,nosql,oxidb,embedded,ffi
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Topic :: Database
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
+# oxidb-embedded
+
+Embedded OxiDB for Python. Run the database engine directly in your Python process via FFI — no server required, zero network overhead.
+
+## Install
+
+```bash
+pip install oxidb-embedded
+```
+
+You also need the native shared library (`liboxidb_embedded_ffi.dylib` on macOS, `.so` on Linux, `.dll` on Windows). Either:
+- Place it next to the installed package
+- Set `OXIDB_LIB_PATH=/path/to/liboxidb_embedded_ffi.dylib`
+- Install it to a system library path
+
+## Usage
+
+```python
+from oxidb_embedded import OxiDbEmbedded
+
+# Context manager (recommended)
+with OxiDbEmbedded("./mydata") as db:
+    db.insert("users", {"name": "Alice", "age": 30})
+    docs = db.find("users", {"name": "Alice"})
+    print(docs)
+
+# Manual open/close
+db = OxiDbEmbedded("./mydata")
+db.insert("users", {"name": "Bob"})
+db.close()
+```
+
+## Features
+
+- Full CRUD (insert, find, update, delete)
+- Indexes (single field, composite, unique, text)
+- Aggregation pipeline
+- Full-text search
+- Transactions (OCC)
+- Blob/object storage
+- Encryption at rest
+
+## Links
+
+- [OxiDB Website](https://oxidb.baltavista.com)
+- [Python Examples](https://oxidb.baltavista.com/python-examples.html)
+- [Downloads](https://oxidb.baltavista.com/downloads.html)

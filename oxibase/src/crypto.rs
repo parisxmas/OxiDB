@@ -27,7 +27,7 @@ fn b64url(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .ok()

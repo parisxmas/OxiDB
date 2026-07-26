@@ -205,6 +205,25 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, &'static str> {
 }
 
 /// Extract Bearer token from Authorization header value.
+/// The `sub` and `role` a token *claims*, without checking its signature.
+///
+/// For logging only, and only worth logging on a response the handler already
+/// accepted: reaching a 2xx means the token was verified on the way in, so the
+/// claim is the identity that was actually used. On a refusal the claim is
+/// whatever the caller wrote, which is not a fact about anybody.
+pub fn peek_claims(token: &str) -> Option<(String, String)> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = b64url_decode(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let sub = json.get("sub")?.as_str()?.to_string();
+    let role = json
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((sub, role))
+}
+
 pub fn extract_bearer(auth_header: &str) -> Option<&str> {
     auth_header
         .strip_prefix("Bearer ")

@@ -173,8 +173,11 @@ export interface ProjectUser {
   verified: boolean;
 }
 
-export function listProjectUsers(ref: string): Promise<ProjectUser[]> {
-  return req("GET", `/projects/${encodeURIComponent(ref)}/users`);
+export function listProjectUsers(ref: string, limit = 50, offset = 0): Promise<ProjectUser[]> {
+  return req(
+    "GET",
+    `/projects/${encodeURIComponent(ref)}/users?limit=${limit}&offset=${offset}`,
+  );
 }
 
 export function deleteProjectUser(ref: string, email: string): Promise<unknown> {
@@ -239,6 +242,27 @@ export interface LogRow {
   path: string;
   status?: number;
   ms?: number;
+  /** Which plane served it: `oxidb-server` (data) or `oxibase` (control). */
+  app?: string;
+  /** The caller, as the edge reported them. Absent when nothing said. */
+  ip?: string;
+  country?: string;
+  city?: string;
+  region?: string;
+  continent?: string;
+  timezone?: string;
+  /** Approximate coordinates of the caller's city, when the zone sends them. */
+  lat?: string;
+  lon?: string;
+  /** Cloudflare's request id — the handle for the same request in CF's logs. */
+  cf_ray?: string;
+  user_agent?: string;
+  /** Who was acting: an end user's address, or the project key's subject
+   *  (`read@<ref>` for the anon key, `admin@<ref>` for service_role). Recorded
+   *  only on requests that succeeded, since a refused token identifies nobody. */
+  user?: string;
+  /** The role that token carried — `read`, `authenticated`, `admin`. */
+  role?: string;
 }
 
 export function listProjectLogs(ref: string, limit = 50, offset = 0): Promise<LogRow[]> {

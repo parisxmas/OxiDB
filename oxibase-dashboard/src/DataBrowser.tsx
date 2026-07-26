@@ -12,6 +12,7 @@ import {
   createIndex,
   dropIndex,
 } from "./dataApi.ts";
+import { PAGE_SIZE, Pager } from "./Pager.tsx";
 
 export function DataBrowser({ projectRef, apiKey }: { projectRef: string; apiKey: string }) {
   const [collections, setCollections] = useState<string[]>([]);
@@ -99,15 +100,21 @@ function RowsTable({
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [showIdx, setShowIdx] = useState(false);
+  const [page, setPage] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
   const [draft, setDraft] = useState('{\n  "name": "example"\n}');
   // _id of the row being edited (JSON draft in `editDraft`), or null.
   const [editing, setEditing] = useState<unknown | null>(null);
   const [editDraft, setEditDraft] = useState("");
 
-  async function refresh() {
+  async function refresh(p = page) {
     setLoading(true);
     try {
-      setRows(await findRows(projectRef, collection, apiKey, 100));
+      // One extra row tells us whether a next page exists without counting the
+      // collection — a count is a scan, and this panel must never cause one.
+      const got = await findRows(projectRef, collection, apiKey, PAGE_SIZE + 1, p * PAGE_SIZE);
+      setHasNext(got.length > PAGE_SIZE);
+      setRows(got.slice(0, PAGE_SIZE));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -117,9 +124,15 @@ function RowsTable({
   }
 
   useEffect(() => {
-    refresh();
+    setPage(0);
+    refresh(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collection]);
+
+  useEffect(() => {
+    refresh(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   async function add() {
     let doc: unknown;
@@ -190,7 +203,7 @@ function RowsTable({
       <div className="row between">
         <h3 style={{ margin: "4px 0" }}>{collection}</h3>
         <div className="row" style={{ gap: 8 }}>
-          <button className="ghost" onClick={refresh}>
+          <button className="ghost" onClick={() => refresh()}>
             Refresh
           </button>
           <button className={showIdx ? "ghost active" : "ghost"} onClick={() => setShowIdx((s) => !s)}>
@@ -271,6 +284,9 @@ function RowsTable({
             </tbody>
           </table>
         </div>
+      )}
+      {!loading && (rows.length > 0 || page > 0) && (
+        <Pager page={page} hasNext={hasNext} shown={rows.length} onPage={setPage} />
       )}
     </div>
   );

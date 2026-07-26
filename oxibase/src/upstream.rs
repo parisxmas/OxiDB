@@ -96,6 +96,21 @@ impl Upstream {
             })
     }
 
+    /// Sorted, limited find in the control plane's own metadata database.
+    ///
+    /// The plain [`find`](Self::find) returns everything it matches, which is
+    /// fine for a project row and wrong for a user table.
+    pub fn find_page(
+        &self,
+        col: &str,
+        query: &Value,
+        sort: &Value,
+        limit: u64,
+        skip: u64,
+    ) -> Result<Vec<Value>, String> {
+        self.find_sorted_in(META_DB, col, query, sort, limit, skip)
+    }
+
     /// Sorted, limited find in an arbitrary database (raw wire `find` with
     /// options) — used to read the shared request-log sink in the default db.
     pub fn find_sorted_in(

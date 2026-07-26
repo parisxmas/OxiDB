@@ -1872,9 +1872,30 @@ fn main() {
         let mpack_addr = format!("0.0.0.0:{msgpack_port}");
         let mpack_collection =
             env::var("OXIDB_MSGPACK_COLLECTION").unwrap_or_else(|_| "_msgpack_logs".to_string());
-        oxidb_server::msgpack_ingest::start_msgpack_listener(
+        // The sink is queried — the dashboard's Logs tab pages it newest-first —
+        // and it is unbounded unless something expires it. Both facts want the
+        // same index on `_ts` (the epoch-ms stamp every record carries), so
+        // create it here rather than hoping it was set up by hand: a collection
+        // that gets dropped comes back without one, and the first thing anybody
+        // notices is a full scan per page over millions of rows.
+        //
+        // Retention defaults to 7 days; `OXIDB_MSGPACK_TTL_SECS=0` keeps
+        // everything, which is a choice to make deliberately.
+        let mpack_ttl: u64 = env::var("OXIDB_MSGPACK_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(604_800);
+        if mpack_ttl > 0 {
+            if let Err(e) = state.db.create_ttl_index(&mpack_collection, "_ts", mpack_ttl) {
+                eprintln!("[oxidb] could not set retention on '{mpack_collection}': {e}");
+            }
+        } else if let Err(e) = state.db.create_index(&mpack_collection, "_ts") {
+            eprintln!("[oxidb] could not index '{mpack_collection}._ts': {e}");
+        }
+        oxidb_server::msgpack_ingest::start_msgpack_listener_routed(
             &mpack_addr,
             Arc::clone(&state.db),
+            Some(Arc::clone(&state.db_manager)),
             mpack_collection.clone(),
         );
         server_log!(

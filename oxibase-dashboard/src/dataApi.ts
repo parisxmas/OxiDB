@@ -74,9 +74,20 @@ export async function countDocuments(ref: string, key: string): Promise<number> 
   return counts.reduce((a, b) => a + b, 0);
 }
 
-/** First `limit` rows of a collection. */
-export function findRows(ref: string, col: string, key: string, limit = 100): Promise<Row[]> {
-  return call("GET", ref, `/rest/v1/${encodeURIComponent(col)}?limit=${limit}`, key);
+/** One page of a collection. Never the whole thing. */
+export function findRows(
+  ref: string,
+  col: string,
+  key: string,
+  limit = 50,
+  offset = 0,
+): Promise<Row[]> {
+  return call(
+    "GET",
+    ref,
+    `/rest/v1/${encodeURIComponent(col)}?limit=${limit}&offset=${offset}`,
+    key,
+  );
 }
 
 // ── Indexes ─────────────────────────────────────────────────────────────────
@@ -205,9 +216,21 @@ export function describeSqlTable(ref: string, key: string, table: string): Promi
   return oneResult(ref, key, `DESCRIBE ${quoteIdent(table)}`);
 }
 
-/** First `limit` rows of a SQL table. */
-export function selectSqlRows(ref: string, key: string, table: string, limit = 100): Promise<SqlResult> {
-  return oneResult(ref, key, `SELECT * FROM ${quoteIdent(table)} LIMIT ${Math.max(1, limit | 0)}`);
+/** One page of a SQL table. */
+export function selectSqlRows(
+  ref: string,
+  key: string,
+  table: string,
+  limit = 50,
+  offset = 0,
+): Promise<SqlResult> {
+  const n = Math.max(1, limit | 0);
+  const skip = Math.max(0, offset | 0);
+  return oneResult(
+    ref,
+    key,
+    `SELECT * FROM ${quoteIdent(table)} LIMIT ${n}${skip ? ` OFFSET ${skip}` : ""}`,
+  );
 }
 
 // ── SQL table editing ───────────────────────────────────────────────────────
@@ -365,15 +388,24 @@ export function deleteBucket(ref: string, key: string, bucket: string): Promise<
   return call("DELETE", ref, `/api/storage/${encodeURIComponent(bucket)}`, key);
 }
 
+/** One page of a bucket's objects.
+ *
+ *  Paged by key rather than offset: `after` is the last key of the previous
+ *  page, so an upload or delete between two pages cannot duplicate or skip a
+ *  row. Same idea as S3's `start-after`.
+ */
 export async function listObjects(
   ref: string,
   key: string,
   bucket: string,
+  limit = 50,
+  after?: string,
 ): Promise<StorageObject[]> {
+  const q = `limit=${limit}${after ? `&after=${encodeURIComponent(after)}` : ""}`;
   const d = await call<{ objects: StorageObject[] }>(
     "GET",
     ref,
-    `/api/storage/${encodeURIComponent(bucket)}`,
+    `/api/storage/${encodeURIComponent(bucket)}?${q}`,
     key,
   );
   return d.objects ?? [];

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Multi-target so apps still on .NET 9 LTS pick the package up,
+         while the rest of the OxiDb.* family on net10 keeps a single
+         binary they can share. -->
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>OxiDb.Client.S3</RootNamespace>
+
+    <PackageId>OxiDb.Client.S3</PackageId>
+    <Description>S3-compatible client helpers for OxiDB. Wraps AWSSDK.S3 with OxiDB-friendly defaults (path-style addressing, SigV4, optional chunked-encoding bypass).</Description>
+    <PackageTags>$(PackageTags);s3;aws;blob-storage;sse</PackageTags>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pinned to a recent stable line that has UseChunkEncoding /
+         DisablePayloadSigning on AmazonS3Config, both of which we
+         rely on for the OxiDb defaults. -->
+    <PackageReference Include="AWSSDK.S3" Version="4.0.0.20" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="9.0.0" />
+  </ItemGroup>
+
+</Project>

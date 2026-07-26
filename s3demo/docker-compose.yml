@@ -1,0 +1,60 @@
+# Independent S3-compatible deployment, separate from ftsdemo. Reuses
+# the same oxidb-ftsdemo-oxidb image (S3 feature is on by default in
+# the binary) — no second QEMU build needed. Operators flip
+# OXIDB_S3_PORT and credentials via env.
+
+name: oxidb-s3demo
+
+services:
+  oxidb:
+    image: oxidb-ftsdemo-oxidb:latest
+    restart: unless-stopped
+    environment:
+      OXIDB_DATA: /data
+      # Native wire (used internally by future helpers; not exposed
+      # publicly because the S3 listener is the public surface).
+      OXIDB_ADDR: 0.0.0.0:14888
+      OXIDB_POOL_SIZE: "8"
+      OXIDB_IDLE_TIMEOUT: "0"
+
+      # ---- S3 HTTP API ----
+      OXIDB_S3_PORT: "9000"
+      # Demo SigV4 credentials. AWS-docs canonical example pair —
+      # any AWS SDK / aws-cli speaks them out of the box. Operators
+      # SHOULD rotate before any non-test traffic.
+      OXIDB_S3_ACCESS_KEY: "AKIAIOSFODNN7EXAMPLE"
+      OXIDB_S3_SECRET_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+      # SigV4 binds the signature to a region string; clients must
+      # use the same. us-east-1 keeps boto3/aws-cli defaults working.
+      OXIDB_S3_REGION: "us-east-1"
+
+      # SSE-S3 server-managed key (32 hex bytes = 64 chars). Demo
+      # value below — REPLACE before any non-test data lands. The
+      # key MUST persist across restarts; rotating it strands all
+      # previously-encrypted objects.
+      OXIDB_S3_ENCRYPTION_KEY: "6f786964622d733364656d6f2d65782d6b65792d3332622d3030312d61626364"
+
+      # When true, every PUT (with or without explicit SSE header)
+      # gets server-side encrypted. Off here so we can A/B test
+      # encrypted vs plaintext on disk.
+      OXIDB_S3_DEFAULT_ENCRYPTION: "false"
+
+      OXIDB_S3_CORS_ORIGIN: "*"
+    volumes:
+      - s3demo-data:/data
+    ports:
+      # Bound to localhost; nginx in front terminates TLS and
+      # proxies to this port.
+      - "127.0.0.1:9000:9000"
+    expose:
+      - "14888"
+    networks:
+      - s3demo
+
+networks:
+  s3demo:
+    driver: bridge
+
+volumes:
+  s3demo-data:
+    name: oxidb-s3demo-data

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { isAuthed, logout, currentEmail } from "./api.ts";
+import { navigate, parseRoute, usePath } from "./router.ts";
 import { Auth } from "./Auth.tsx";
 import { Console } from "./Console.tsx";
 import { Docs } from "./Docs.tsx";
@@ -7,21 +8,17 @@ import { ResetPassword } from "./ResetPassword.tsx";
 
 export default function App() {
   const [authed, setAuthed] = useState(isAuthed());
-  // Tiny router: /docs is the public JavaScript tutorial (no sign-in needed);
-  // everything else is the console. nginx serves index.html for any path.
-  const [path, setPath] = useState(window.location.pathname);
+  // /docs is the public JavaScript tutorial (no sign-in needed); /reset is where
+  // password-reset emails land. Everything else is the console, whose own view
+  // also comes from the path — see router.ts.
+  const route = parseRoute(usePath());
+  const go = navigate;
 
-  const go = (to: string) => {
-    window.history.pushState({}, "", to);
-    setPath(to);
-  };
-
-  if (path.startsWith("/docs")) {
+  if (route.view === "docs") {
     return <Docs onOpenConsole={() => go("/")} />;
   }
 
-  // Public landing page of password-reset emails — no sign-in.
-  if (path.startsWith("/reset")) {
+  if (route.view === "reset") {
     return <ResetPassword />;
   }
 

@@ -191,18 +191,50 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
                     matches!(segs.next(), Some("rest" | "api")).then(|| first.to_string())
                 })
                 .unwrap_or_default();
-            crate::gelf::log(
-                level,
-                &format!("{} {}", req.method, req.path),
-                &[
-                    ("app", "oxidb-server"),
-                    ("method", req.method.as_str()),
-                    ("path", req.path.as_str()),
-                    ("status", status.as_str()),
-                    ("ms", ms.as_str()),
-                    ("db", db.as_str()),
-                ],
-            );
+            // Resolved to the database's real name, not the segment as typed. A
+            // project is addressable by ref or slug, and a log that records
+            // whichever the caller used cannot be routed to that project's own
+            // database — every record would fall back to the shared one.
+            let db = state
+                .db_manager
+                .as_ref()
+                .filter(|_| !db.is_empty())
+                .and_then(|mgr| crate::tenant_auth::resolve_tenant(mgr, &db))
+                .unwrap_or(db);
+            // Who asked, and from where. Behind a proxy the socket peer is the
+            // proxy, so this comes off the edge's headers — empty and free when
+            // there is no edge.
+            let who = req.client_meta();
+            // Who was acting, when the request succeeded. A 2xx means the token
+            // was verified on the way in, so the subject it claims is the
+            // identity that was actually used — the project's anon key, its
+            // service key, or a signed-in end user.
+            let identity = (resp.status < 400)
+                .then(|| {
+                    let header = req
+                        .headers
+                        .get("authorization")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    crate::jwt::extract_bearer(header).and_then(crate::jwt::peek_claims)
+                })
+                .flatten();
+            let mut fields = vec![
+                ("app", "oxidb-server"),
+                ("method", req.method.as_str()),
+                ("path", req.path.as_str()),
+                ("status", status.as_str()),
+                ("ms", ms.as_str()),
+                ("db", db.as_str()),
+            ];
+            fields.extend(who.fields());
+            if let Some((sub, role)) = identity.as_ref() {
+                fields.push(("user", sub.as_str()));
+                if !role.is_empty() {
+                    fields.push(("role", role.as_str()));
+                }
+            }
+            crate::gelf::log(level, &format!("{} {}", req.method, req.path), &fields);
         }
         resp.write_to_keepalive(&mut stream, !wants_close);
 

@@ -51,6 +51,20 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+/// The `sub` a bearer token claims, unverified — for logging a request that was
+/// already accepted. On a refusal there is no identity to report, only an
+/// assertion the caller made, so callers pass this only for 2xx/3xx.
+fn bearer_subject(req: &HttpRequest) -> Option<String> {
+    let header = req.headers.get("authorization")?;
+    let token = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))?;
+    let payload = token.split('.').nth(1)?;
+    let bytes = crypto::b64url_decode(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(json.get("sub")?.as_str()?.to_string())
+}
+
 fn main() {
     let addr = env("OXIBASE_ADDR").unwrap_or_else(|| "127.0.0.1:4460".to_string());
     // Native OxiWire endpoint of the data plane (host:port).
@@ -83,9 +97,45 @@ fn main() {
 
     gelf::init(); // arm GELF (OXIDB_GELF_ADDR) — logs every request; no-op if unset
     eprintln!("[oxibase] control plane on {addr} → data plane {upstream_addr}");
+    // Access logging to stderr, so `docker logs` shows who tried what even with
+    // no log sink configured. `OXIBASE_ACCESS_LOG=0` silences it.
+    let access_log = std::env::var("OXIBASE_ACCESS_LOG")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
     let handler = move |req: &HttpRequest| {
         let start = SystemTime::now();
         let resp = route(req, &state);
+        if access_log {
+            let who = req.client_meta();
+            let actor = if resp.status < 400 { bearer_subject(req) } else { None };
+            let ms = start.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+            let mut where_from = String::new();
+            if !who.country.is_empty() {
+                where_from.push(' ');
+                where_from.push_str(who.country);
+                if !who.city.is_empty() {
+                    where_from.push('/');
+                    where_from.push_str(who.city);
+                }
+            }
+            if !who.ray.is_empty() {
+                where_from.push_str(" ray=");
+                where_from.push_str(who.ray);
+            }
+            eprintln!(
+                "[oxibase] {} {} {} {}ms ip={}{}{}",
+                resp.status,
+                req.method,
+                req.path,
+                ms,
+                if who.ip.is_empty() { "-" } else { who.ip },
+                where_from,
+                actor
+                    .as_ref()
+                    .map(|a| format!(" user={a}"))
+                    .unwrap_or_default(),
+            );
+        }
         if gelf::enabled() {
             let ms = start
                 .elapsed()
@@ -98,17 +148,20 @@ fn main() {
                 s if s >= 400 => gelf::Level::Warning,
                 _ => gelf::Level::Info,
             };
-            gelf::log(
-                level,
-                &format!("{} {}", req.method, req.path),
-                &[
-                    ("app", "oxibase"),
-                    ("method", req.method.as_str()),
-                    ("path", req.path.as_str()),
-                    ("status", status.as_str()),
-                    ("ms", ms.as_str()),
-                ],
-            );
+            let who = req.client_meta();
+            let actor = if resp.status < 400 { bearer_subject(req) } else { None };
+            let mut fields = vec![
+                ("app", "oxibase"),
+                ("method", req.method.as_str()),
+                ("path", req.path.as_str()),
+                ("status", status.as_str()),
+                ("ms", ms.as_str()),
+            ];
+            fields.extend(who.fields());
+            if let Some(a) = actor.as_deref() {
+                fields.push(("user", a));
+            }
+            gelf::log(level, &format!("{} {}", req.method, req.path), &fields);
         }
         resp
     };

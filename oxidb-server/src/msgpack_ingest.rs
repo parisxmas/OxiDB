@@ -12,12 +12,14 @@
 //!
 //! Enable with `OXIDB_MSGPACK_PORT=12202`.
 
+use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use oxidb::database_manager::DatabaseManager;
 use oxidb::OxiDb;
 
 /// Maximum datagram size (log records are small; one record per packet).
@@ -32,6 +34,27 @@ const BATCH_TIMEOUT: Duration = Duration::from_millis(5);
 pub fn start_msgpack_listener(
     addr: &str,
     db: Arc<OxiDb>,
+    collection: String,
+) -> Vec<std::thread::JoinHandle<()>> {
+    start_msgpack_listener_routed(addr, db, None, collection)
+}
+
+/// As [`start_msgpack_listener`], but a record carrying a `db` field is written
+/// to **that database's** copy of the collection.
+///
+/// One shared sink made every read of one project's logs walk past every other
+/// project's rows, and made one project's traffic burst everyone else's problem
+/// — retention, size and query cost were all shared. A tenant's requests are the
+/// tenant's data, so they live in the tenant's database: reads touch only that
+/// project, retention is per project, and dropping a project takes its logs with
+/// it.
+///
+/// Records with no `db` (the control plane's own requests) stay in the default
+/// database, which is where they belong: they are not any one project's.
+pub fn start_msgpack_listener_routed(
+    addr: &str,
+    db: Arc<OxiDb>,
+    manager: Option<Arc<DatabaseManager>>,
     collection: String,
 ) -> Vec<std::thread::JoinHandle<()>> {
     let num_receivers = std::thread::available_parallelism()
@@ -77,6 +100,7 @@ pub fn start_msgpack_listener(
     // Writers: channel → batch → insert_many (no indexing).
     for i in 0..num_writers {
         let db = Arc::clone(&db);
+        let manager = manager.clone();
         let collection = collection.clone();
         let rx = rx.clone();
         let handle = std::thread::Builder::new()
@@ -100,7 +124,45 @@ pub fn start_msgpack_listener(
                         }
                     }
                     let docs = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                    let _ = db.insert_many(&collection, docs);
+                    match &manager {
+                        // Split the batch by target database and write each part
+                        // once — a batch is a few milliseconds of traffic, so it
+                        // is usually one or two projects, not many.
+                        Some(mgr) => {
+                            let mut by_db: HashMap<String, Vec<Value>> = HashMap::new();
+                            for doc in docs {
+                                let target = doc
+                                    .get("db")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("")
+                                    .to_string();
+                                by_db.entry(target).or_default().push(doc);
+                            }
+                            for (target, docs) in by_db {
+                                if target.is_empty() {
+                                    let _ = db.insert_many(&collection, docs);
+                                    continue;
+                                }
+                                match mgr.get_database(&target) {
+                                    Ok(tenant) => {
+                                        ensure_log_indexes(&tenant, &target, &collection);
+                                        let _ = tenant.insert_many(&collection, docs);
+                                    }
+                                    // A `db` naming no database is a stale or
+                                    // hand-written value; the record is still a
+                                    // request that happened, so keep it rather
+                                    // than drop it.
+                                    Err(_) => {
+                                        let _ = db.insert_many(&collection, docs);
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = db.insert_many(&collection, docs);
+                        }
+                    }
                 }
             })
             .expect("failed to spawn msgpack writer thread");
@@ -155,4 +217,37 @@ fn bind_reuseport(addr: &str) -> UdpSocket {
         .unwrap_or_else(|e| panic!("failed to bind MessagePack UDP on {addr}: {e}"));
 
     UdpSocket::from(socket)
+}
+
+
+/// Retention and the index the dashboard's newest-first paging walks, created
+/// once per database per process.
+///
+/// A tenant database gets its log collection the first time it is written to,
+/// and a collection created that way has no indexes — which is how an unindexed,
+/// unbounded log collection appears without anybody deciding to make one.
+fn ensure_log_indexes(db: &Arc<OxiDb>, db_name: &str, collection: &str) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let done = DONE.get_or_init(|| Mutex::new(HashSet::new()));
+    // Keyed by name, not by the Arc's address: a database that is closed and
+    // reopened lands wherever the allocator puts it, and a freed address reused
+    // by a different database would make this skip the indexes for it.
+    let key = format!("{db_name}/{collection}");
+    {
+        let mut set = done.lock().unwrap();
+        if !set.insert(key) {
+            return;
+        }
+    }
+    let ttl: u64 = std::env::var("OXIDB_MSGPACK_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(604_800);
+    let _ = if ttl > 0 {
+        db.create_ttl_index(collection, "_ts", ttl)
+    } else {
+        db.create_index(collection, "_ts")
+    };
 }

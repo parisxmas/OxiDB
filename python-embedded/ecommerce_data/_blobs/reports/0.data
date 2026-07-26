@@ -1,0 +1,21 @@
+product,category,price,stock
+Python Crash Course,Books,35.99,159
+Rust Programming,Books,42.99,187
+Database Internals,Books,55.99,130
+Clean Code,Books,38.99,222
+Cotton T-Shirt,Clothing,19.99,212
+Denim Jacket,Clothing,79.99,481
+Wool Sweater,Clothing,65.0,488
+Wireless Mouse,Electronics,32.99,371
+Mechanical Keyboard,Electronics,98.99,228
+USB-C Hub,Electronics,54.99,189
+Monitor Stand,Electronics,43.99,183
+Webcam HD,Electronics,65.99,311
+Olive Oil,Food,12.99,306
+Dark Chocolate,Food,8.99,429
+Coffee Maker,Home,149.99,477
+Cast Iron Pan,Home,45.99,433
+Desk Lamp,Home,34.99,125
+Running Shoes,Sports,120.0,233
+Yoga Mat,Sports,25.99,120
+Dumbbell Set,Sports,89.99,403

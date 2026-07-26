@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+oxidb_embedded/__init__.py
+oxidb_embedded/liboxidb_embedded_ffi.dylib
+oxidb_embedded.egg-info/PKG-INFO
+oxidb_embedded.egg-info/SOURCES.txt
+oxidb_embedded.egg-info/dependency_links.txt
+oxidb_embedded.egg-info/top_level.txt

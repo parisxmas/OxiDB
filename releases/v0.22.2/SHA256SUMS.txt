@@ -1,0 +1,15 @@
+b26b17393a3020b8fd1a475745ea97c32f520751f46c61d2ef818dc031d82847  oxidb-cli-v0.22.2-darwin-amd64.tar.gz
+5d193ef8c675428ef90b9b82d44a6b322b70140ae77733a766f46aef864bc0ad  oxidb-cli-v0.22.2-darwin-arm64.tar.gz
+ffb45c2802bce6c2a5cced6a5bb47ee92869ffee50daa43d69debc878783d303  oxidb-cli-v0.22.2-linux-amd64.tar.gz
+e0b73245b84ade13f48978c9b74d43215bc3b87ed9eed21753662d90b13b6231  oxidb-cli-v0.22.2-linux-arm64.tar.gz
+50aa08e507561285f802900318099a6bae5dbcfec071eb1a665048bddd3e6b69  oxidb-server-v0.22.2-darwin-amd64.tar.gz
+ad60f7f2d807526e7f6bbf28debaee337225e9c57517f548bd229e6cdba00485  oxidb-server-v0.22.2-darwin-arm64.tar.gz
+425b912d75070bd1aa28c9c425428089b1b7fbc7af0f6735f6e7ddc5d6969d99  oxidb-server-v0.22.2-linux-amd64.tar.gz
+6baf04d7eb5a458bddb22c7af143b027834d5cd386ae0f16e0db11f4e1131c2a  oxidb-server-v0.22.2-linux-arm64.tar.gz
+3d66f1f0356da7dcfcd1eeb2112bf167dbdd0bc2de425614630e668fe7b158f4  oxipool-v0.22.2-darwin-amd64.tar.gz
+686a100f626e5582aeb0435a76ab22cd727a2411420fdbe94e35a04fe32f000f  oxipool-v0.22.2-darwin-arm64.tar.gz
+79ac136ecb0726db77851243946d642fc7844214ecbc8f1ae8d2492c903be75f  oxipool-v0.22.2-linux-amd64.tar.gz
+8a41c0713f513687af081e4a910e31ee46239f36c935e82e7d0e6f7ccc8c84c7  oxipool-v0.22.2-linux-arm64.tar.gz
+8394538568c69b693989b6f470ab6d845570e6532ce9a39527bb8f43a0596068  oxidb-cli-v0.22.2-windows-amd64.zip
+72204adb7164560d0a887ec9009d6772bd7518e237c82cdd8bca12f1b35ddb8f  oxidb-server-v0.22.2-windows-amd64.zip
+859f46e577ed5f9c5b48ebc0b82987a0d557c67014ab8eff7adf335f1af0af3f  oxipool-v0.22.2-windows-amd64.zip

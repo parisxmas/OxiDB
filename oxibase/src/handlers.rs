@@ -2283,10 +2283,23 @@ pub fn list_users(req: &HttpRequest, state: &State, project_ref: &str) -> HttpRe
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let project_ref = project_ref.as_str();
-    match state
-        .upstream
-        .find("users", &json!({ "project_ref": project_ref }))
-    {
+    // Paged: a project's user table is unbounded, and returning all of it was a
+    // full fetch waiting to become a problem the day someone's app got popular.
+    let qp = |key: &str| {
+        req.query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let limit = qp("limit=").unwrap_or(50).min(500);
+    let offset = qp("offset=").unwrap_or(0).min(1_000_000);
+    match state.upstream.find_page(
+        "users",
+        &json!({ "project_ref": project_ref }),
+        &json!({ "created_at": -1 }),
+        limit,
+        offset,
+    ) {
         Ok(users) => {
             let out: Vec<Value> = users
                 .iter()
@@ -2464,29 +2477,89 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
             .and_then(|v| v.parse::<u64>().ok())
     };
     let limit = qp("limit=").unwrap_or(50).min(500);
-    let offset = qp("offset=").unwrap_or(0).min(100_000);
-    let rows = match state.upstream.find_sorted_in(
-        "oxidb",
-        "_msgpack_logs",
-        &json!({ "db": { "$in": [project_ref, slug] } }),
-        &json!({ "ts": -1 }),
-        limit,
-        offset,
-    ) {
+    // Paging into a log is shallow by nature — you read the recent tail or you
+    // filter, you do not scroll to row 900,000. The cap matters because the two
+    // sources below are merged, which means fetching `limit + offset` from each:
+    // an offset of a million would ask for two million rows to serve fifty.
+    let offset = qp("offset=").unwrap_or(0).min(10_000);
+    // Sorted on `_ts`, not `ts`, and the difference is not cosmetic.
+    //
+    // The sink indexes `_ts` (it carries the TTL) and nothing else — by design,
+    // since a log stream is append-only and rarely queried by arbitrary field.
+    // Sorting by `ts` therefore had no index to walk: every page was a full scan
+    // of the collection plus a sort of every matching row. With a few thousand
+    // rows nobody noticed; after a burst wrote 3.4M, one Logs tab on live
+    // refresh — a page every five seconds — was enough to take the server to
+    // 4.6GB and an OOM kill.
+    //
+    // `_ts` is the insert time and `ts` the sender's clock, so newest-first is
+    // the same order to within a network hop, and the engine can iterate the
+    // index backwards and stop at limit+offset instead of reading everything.
+    // A project's requests live in the project's own database, so this reads one
+    // tenant's collection instead of filtering a sink shared by all of them —
+    // no walking past other projects' rows, and no project's traffic making
+    // everyone else's log queries slower.
+    //
+    // Older rows, written before the split, are still in the default database's
+    // copy; both are read and merged so a deployment does not appear to lose its
+    // history the moment it upgrades.
+    let page = |db: &str, query: Value| {
+        state
+            .upstream
+            .find_sorted_in(db, "_msgpack_logs", &query, &json!({ "_ts": -1 }), limit + offset, 0)
+    };
+    let own = match page(project_ref, json!({})) {
         Ok(r) => r,
-        Err(e) if e.contains("not found") => Vec::new(), // sink not created yet
+        Err(e) if e.contains("not found") => Vec::new(), // no traffic logged yet
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let legacy = page("oxidb", json!({ "db": { "$in": [project_ref, slug] } })).unwrap_or_default();
+    let mut rows = own;
+    rows.extend(legacy);
+    rows.sort_by(|a, b| {
+        let ts = |v: &Value| v.get("_ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
+        ts(b).partial_cmp(&ts(a)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
-            json!({
+            // Everything the edge told us about the caller rides along. Absent
+            // fields stay absent rather than becoming empty strings, so a blank
+            // in the dashboard means "the edge did not say" rather than "unknown
+            // place".
+            let mut out = json!({
                 "ts": r.get("ts"),
                 "method": r.get("method"),
                 "path": r.get("path"),
                 "status": r.get("status").and_then(|v| v.as_str()).and_then(|s| s.parse::<u16>().ok()),
                 "ms": r.get("ms").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()),
-            })
+            });
+            let map = out.as_object_mut().expect("object literal");
+            for key in [
+                "app",
+                "ip",
+                "country",
+                "city",
+                "region",
+                "continent",
+                "timezone",
+                "lat",
+                "lon",
+                "cf_ray",
+                "user_agent",
+                "user",
+                "role",
+            ] {
+                if let Some(v) = r.get(key) {
+                    map.insert(key.to_string(), v.clone());
+                }
+            }
+            out
         })
         .collect();
     resp(200, json!(out))

@@ -86,7 +86,10 @@ pub(super) fn handle(
                         .get("limit")
                         .and_then(|v| v.parse::<usize>().ok())
                         .map(|n| n.min(10_000));
-                    match db.list_objects(&bucket, prefix.as_deref(), limit) {
+                    // Keyset paging: `after` is the last key of the previous
+                    // page. Stable across uploads and deletes, unlike an offset.
+                    let after = params.get("after").map(|v| url_decode(v));
+                    match db.list_objects_from(&bucket, prefix.as_deref(), after.as_deref(), limit) {
                         Ok(objects) => json_response(200, "OK", json!({"objects": objects})),
                         Err(e) => storage_err(&e),
                     }

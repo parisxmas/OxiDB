@@ -7,6 +7,7 @@ import {
   verifyProjectUser,
 } from "./api.ts";
 import { ProvidersPanel } from "./ProvidersPanel.tsx";
+import { PAGE_SIZE, Pager } from "./Pager.tsx";
 
 /** Users tab: the project's end users (signup via `oxibase.auth`). */
 export function UsersPanel({ projectRef }: { projectRef: string }) {
@@ -14,11 +15,16 @@ export function UsersPanel({ projectRef }: { projectRef: string }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
 
-  async function refresh() {
+  async function refresh(p = page) {
     setLoading(true);
     try {
-      setUsers(await listProjectUsers(projectRef));
+      // A page, not the table: an app's user count is unbounded.
+      const got = await listProjectUsers(projectRef, PAGE_SIZE + 1, p * PAGE_SIZE);
+      setHasNext(got.length > PAGE_SIZE);
+      setUsers(got.slice(0, PAGE_SIZE));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -28,9 +34,15 @@ export function UsersPanel({ projectRef }: { projectRef: string }) {
   }
 
   useEffect(() => {
-    refresh();
+    setPage(0);
+    refresh(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectRef]);
+
+  useEffect(() => {
+    refresh(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   async function act(op: () => Promise<unknown>) {
     setBusy(true);
@@ -64,9 +76,12 @@ export function UsersPanel({ projectRef }: { projectRef: string }) {
     <div style={{ marginTop: 16 }}>
       <div className="row between">
         <h3 style={{ margin: "4px 0" }}>
-          End users <span className="muted small">({users.length})</span>
+          End users{" "}
+          <span className="muted small">
+            ({users.length} on this page{page > 0 ? `, page ${page + 1}` : ""})
+          </span>
         </h3>
-        <button className="ghost" onClick={refresh}>
+        <button className="ghost" onClick={() => refresh()}>
           Refresh
         </button>
       </div>
@@ -143,6 +158,16 @@ export function UsersPanel({ projectRef }: { projectRef: string }) {
             </tbody>
           </table>
         </div>
+      )}
+      {!loading && (users.length > 0 || page > 0) && (
+        <Pager
+          page={page}
+          hasNext={hasNext}
+          shown={users.length}
+          onPage={setPage}
+          disabled={busy}
+          unit="users"
+        />
       )}
 
       <ProvidersPanel projectRef={projectRef} />

@@ -20,13 +20,37 @@ import {
   IconTypes,
   IconUsers,
 } from "./icons.tsx";
+import { projectPath, replacePath } from "./router.ts";
 
 type Tab = "collections" | "sqltables" | "sql" | "files" | "users" | "logs" | "rules";
 
-export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack: () => void }) {
+const TABS: Tab[] = ["collections", "sqltables", "sql", "files", "users", "logs", "rules"];
+
+const isTab = (v: string | undefined): v is Tab => !!v && (TABS as string[]).includes(v);
+
+export function ProjectView({
+  projectRef,
+  tab: tabFromUrl,
+  onTab,
+  onBack,
+}: {
+  projectRef: string;
+  /** The tab segment of the URL; an unknown or missing one means the first tab. */
+  tab?: string;
+  onTab: (tab: Tab) => void;
+  onBack: () => void;
+}) {
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("collections");
+  const tab: Tab = isTab(tabFromUrl) ? tabFromUrl : "collections";
+  const setTab = onTab;
+
+  // /p/<ref> and /p/<ref>/nonsense both show the first tab; make the URL say so,
+  // without adding a history entry the reader did not ask for.
+  useEffect(() => {
+    if (!isTab(tabFromUrl)) replacePath(projectPath(projectRef, tab));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectRef, tabFromUrl]);
   const [backingUp, setBackingUp] = useState(false);
 
   async function genTypes() {
