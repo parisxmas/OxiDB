@@ -94,3 +94,7 @@ tests/rabbitmq-benchmark-go/rabbitmq-benchmark-go
 
 # dockerized deployment secrets
 deploy/.env
+
+# Dart client build artefacts
+oxibase-dart/.dart_tool/
+oxibase-dart/pubspec.lock

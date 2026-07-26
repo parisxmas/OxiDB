@@ -1,0 +1,19 @@
+name: oxibase
+description: Dart and Flutter client for OxiBase — documents with row-level rules, SQL, time-series, file storage, realtime and auth, behind one URL.
+version: 0.1.0
+repository: https://github.com/parisxmas/OxiDB
+issue_tracker: https://github.com/parisxmas/OxiDB/issues
+topics: [oxibase, oxidb, database, backend, postgrest]
+
+environment:
+  sdk: ^3.4.0
+
+dependencies:
+  # The two packages every Flutter app already has in its tree. Everything else
+  # here is dart:core — no code generation, no build_runner step.
+  http: ^1.2.0
+  web_socket_channel: ^3.0.0
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^4.0.0
