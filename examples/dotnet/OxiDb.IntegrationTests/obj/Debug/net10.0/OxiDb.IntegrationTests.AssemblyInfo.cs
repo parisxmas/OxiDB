@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("OxiDb.IntegrationTests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e3eac876ae5ed2efcd958b73f59865f0f476c44b")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+87f80f99d3258e5209d1d217ec3a33993d4e3894")]
 [assembly: System.Reflection.AssemblyProductAttribute("OxiDb.IntegrationTests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("OxiDb.IntegrationTests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

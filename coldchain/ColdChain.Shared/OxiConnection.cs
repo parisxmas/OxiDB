@@ -48,6 +48,12 @@ public sealed class OxiConnection : IAsyncDisposable
     }
 
     private static bool IsBrokenConnection(Exception ex) =>
+        // OxiDbConnectionException is what the client actually throws when the
+        // socket is dead — "Connection closed by server". Leaving it out meant
+        // this retry never fired, and a deploy left every request failing until
+        // the service itself was restarted. The client heals itself now; this
+        // stays as the outer belt for the cases it will not retry on its own.
+        ex is OxiDb.Client.Tcp.OxiDbConnectionException ||
         ex is IOException or ObjectDisposedException ||
         ex.InnerException is System.Net.Sockets.SocketException;
 

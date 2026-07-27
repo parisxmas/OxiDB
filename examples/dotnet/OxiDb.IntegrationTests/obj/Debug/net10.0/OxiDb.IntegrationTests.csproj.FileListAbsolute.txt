@@ -94,3 +94,8 @@
 /Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/obj/Debug/net10.0/OxiDb.IntegrationTests.pdb
 /Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/obj/Debug/net10.0/OxiDb.IntegrationTests.genruntimeconfig.cache
 /Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/obj/Debug/net10.0/ref/OxiDb.IntegrationTests.dll
+/Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/bin/Debug/net10.0/.msCoverageSourceRootsMapping_OxiDb.IntegrationTests
+/Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/bin/Debug/net10.0/CoverletSourceRootsMapping_OxiDb.IntegrationTests
+/Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/bin/Debug/net10.0/Microsoft.Extensions.DependencyInjection.Abstractions.dll
+/Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/bin/Debug/net10.0/OxiDb.Client.Tcp.dll
+/Users/barisakin/source/docdb/examples/dotnet/OxiDb.IntegrationTests/bin/Debug/net10.0/OxiDb.Client.Tcp.pdb

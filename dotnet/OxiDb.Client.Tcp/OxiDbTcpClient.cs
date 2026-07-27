@@ -11,17 +11,41 @@ namespace OxiDb.Client.Tcp;
 /// </summary>
 public sealed class OxiDbTcpClient : IOxiDbClient
 {
-    private readonly TcpClient _tcp;
-    private readonly NetworkStream _stream;
+    private TcpClient _tcp;
+    private NetworkStream _stream;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private bool _disposed;
     private bool _broken;
     private bool _useOxiWire;
 
-    private OxiDbTcpClient(TcpClient tcp)
+    // What a redial has to reproduce. A client that connected itself knows how
+    // to do it again; one built from a socket somebody else opened does not,
+    // and says so by leaving `_host` null.
+    private readonly string? _host;
+    private readonly int _port;
+    private readonly TimeSpan? _timeout;
+    private Func<OxiDbTcpClient, CancellationToken, Task>? _authenticate;
+    /// <summary>Open transaction: session state a new socket would not have.</summary>
+    private bool _inTransaction;
+
+    /// <summary>
+    /// Re-dial and re-authenticate when the connection is found dead, instead
+    /// of failing every call from then on.
+    ///
+    /// A plain TCP client connects once and stays connected, which is fine
+    /// until the server restarts — a deploy, a crash — and every holder of a
+    /// socket has a broken pipe it never recovers from. Retries are bounded by
+    /// what is safe: see <see cref="OxiDbConnectionException.Retryable"/>.
+    /// </summary>
+    public bool AutoReconnect { get; set; } = true;
+
+    private OxiDbTcpClient(TcpClient tcp, string? host = null, int port = 0, TimeSpan? timeout = null)
     {
         _tcp = tcp;
         _stream = tcp.GetStream();
+        _host = host;
+        _port = port;
+        _timeout = timeout;
     }
 
     public static async Task<OxiDbTcpClient> ConnectAsync(
@@ -37,7 +61,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
             cts.CancelAfter(timeout ?? TimeSpan.FromSeconds(5));
             await tcp.ConnectAsync(host, port, cts.Token);
             tcp.NoDelay = true;
-            return new OxiDbTcpClient(tcp);
+            return new OxiDbTcpClient(tcp, host, port, timeout);
         }
         catch
         {
@@ -61,6 +85,9 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         try
         {
             await client.AuthSimpleAsync(username, password, ct);
+            // Remembered so a redial arrives authenticated. Same credentials the
+            // caller already handed us; nothing new is stored that was not.
+            client._authenticate = (c, token) => c.AuthSimpleAsync(username, password, token);
             return client;
         }
         catch
@@ -213,16 +240,105 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     /// </summary>
     private async Task<byte[]> ExchangeAsync(byte[] reqBytes, CancellationToken ct)
     {
+        var sent = false;
         try
         {
             await SendAsync(reqBytes, ct);
+            sent = true;
             return await ReceiveAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _broken = true;
+            // A failure while writing means the server never got a whole frame
+            // to act on, so re-sending cannot apply anything twice. A failure
+            // while reading is ambiguous: the request may have been applied
+            // and the answer lost.
+            // Inside a transaction the connection *is* the transaction: the
+            // server holds its state per session, so a new socket cannot
+            // continue it. Say that plainly — the caller has to start again,
+            // and silently reconnecting would let their next write land outside
+            // the transaction they think they are in.
+            if (_inTransaction)
+            {
+                throw new OxiDbConnectionException(
+                    $"connection lost inside a transaction; it cannot be resumed — begin a new one: {ex.Message}",
+                    retryable: false);
+            }
+            throw new OxiDbConnectionException(
+                sent
+                    ? $"connection lost after the request was sent; the outcome is unknown: {ex.Message}"
+                    : $"connection lost before the request was sent: {ex.Message}",
+                retryable: !sent);
         }
         catch
         {
             _broken = true;
             throw;
         }
+    }
+
+    /// <summary>
+    /// Commands that change nothing, so losing the answer costs only the
+    /// answer. These can be re-sent on a fresh connection whatever the failure;
+    /// anything else is re-sent only when it provably never arrived.
+    /// </summary>
+    private static bool IsReadOnly(Dictionary<string, object?> payload)
+    {
+        if (payload.TryGetValue("cmd", out var c) && c is string cmd)
+        {
+            switch (cmd)
+            {
+                case "find":
+                case "find_one":
+                case "count":
+                case "aggregate":
+                case "explain":
+                case "list_collections":
+                case "list_databases":
+                case "list_indexes":
+                case "get":
+                case "stats":
+                case "ping":
+                case "hello":
+                case "text_search":
+                    return true;
+                case "sql":
+                    // A SELECT changes nothing; anything else might.
+                    return payload.TryGetValue("sql", out var q)
+                        && q is string text
+                        && text.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Dial again and restore what a socket carries: the negotiated protocol
+    /// and the authenticated identity. Refuses inside a transaction — that is
+    /// session state on the server, and a new socket does not have it.
+    /// </summary>
+    private async Task ReconnectAsync(CancellationToken ct)
+    {
+        if (_host is null)
+            throw new OxiDbConnectionException("this client cannot redial: it was built from a socket it did not open");
+        if (_inTransaction)
+            throw new OxiDbConnectionException("connection lost inside a transaction; it cannot be resumed — begin a new one");
+
+        var tcp = new TcpClient();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(_timeout ?? TimeSpan.FromSeconds(5));
+        await tcp.ConnectAsync(_host, _port, cts.Token);
+        tcp.NoDelay = true;
+
+        try { _stream.Dispose(); } catch { /* already gone */ }
+        try { _tcp.Dispose(); } catch { /* already gone */ }
+        _tcp = tcp;
+        _stream = tcp.GetStream();
+        _broken = false;
+
+        if (_authenticate is { } auth)
+            await auth(this, ct);
     }
 
     // ── Low-level protocol ──────────────────────────────────────────────
@@ -287,7 +403,24 @@ public sealed class OxiDbTcpClient : IOxiDbClient
                 ? OxiWire.EncodeRequest(payload)
                 : JsonSerializer.SerializeToUtf8Bytes(payload);
 
-            var respBytes = await ExchangeAsync(reqBytes, ct);
+            byte[] respBytes;
+            try
+            {
+                respBytes = await ExchangeAsync(reqBytes, ct);
+            }
+            catch (OxiDbConnectionException lost)
+                when (AutoReconnect && _host is not null && !_inTransaction
+                      && (lost.Retryable || IsReadOnly(payload)))
+            {
+                // The socket was dead — usually one the server closed while this
+                // client was idle, which is what a restart leaves behind. Dial
+                // again and send it once more: safe here either because nothing
+                // was sent, or because the command changes nothing.
+                await ReconnectAsync(ct);
+                if (_useOxiWire)
+                    reqBytes = OxiWire.EncodeRequest(payload);
+                respBytes = await ExchangeAsync(reqBytes, ct);
+            }
 
             // For OxiWire-encoded responses, DecodeResponse already
             // returns the full envelope as a JsonElement.
@@ -338,7 +471,24 @@ public sealed class OxiDbTcpClient : IOxiDbClient
             else
                 reqBytes = JsonSerializer.SerializeToUtf8Bytes(payload);
 
-            var respBytes = await ExchangeAsync(reqBytes, ct);
+            byte[] respBytes;
+            try
+            {
+                respBytes = await ExchangeAsync(reqBytes, ct);
+            }
+            catch (OxiDbConnectionException lost)
+                when (AutoReconnect && _host is not null && !_inTransaction
+                      && (lost.Retryable || IsReadOnly(payload)))
+            {
+                // The socket was dead — usually one the server closed while this
+                // client was idle, which is what a restart leaves behind. Dial
+                // again and send it once more: safe here either because nothing
+                // was sent, or because the command changes nothing.
+                await ReconnectAsync(ct);
+                if (_useOxiWire)
+                    reqBytes = OxiWire.EncodeRequest(payload);
+                respBytes = await ExchangeAsync(reqBytes, ct);
+            }
 
             if (_useOxiWire && OxiWire.IsOxiWire(respBytes))
             {
@@ -584,17 +734,43 @@ public sealed class OxiDbTcpClient : IOxiDbClient
 
     public async Task<JsonElement> BeginTransactionAsync(CancellationToken ct = default)
     {
-        return await RequestAsync(new() { ["cmd"] = "begin_tx" }, ct);
+        // Marked before the call: a transaction that opened but whose reply was
+        // lost is still open on the server, and a silent redial would leave the
+        // caller writing into a session that no longer exists.
+        _inTransaction = true;
+        try
+        {
+            return await RequestAsync(new() { ["cmd"] = "begin_tx" }, ct);
+        }
+        catch
+        {
+            _inTransaction = false;
+            throw;
+        }
     }
 
     public async Task CommitTransactionAsync(CancellationToken ct = default)
     {
-        await RequestAsync(new() { ["cmd"] = "commit_tx" }, ct);
+        try
+        {
+            await RequestAsync(new() { ["cmd"] = "commit_tx" }, ct);
+        }
+        finally
+        {
+            _inTransaction = false;
+        }
     }
 
     public async Task RollbackTransactionAsync(CancellationToken ct = default)
     {
-        await RequestAsync(new() { ["cmd"] = "rollback_tx" }, ct);
+        try
+        {
+            await RequestAsync(new() { ["cmd"] = "rollback_tx" }, ct);
+        }
+        finally
+        {
+            _inTransaction = false;
+        }
     }
 
     public async Task WithTransactionAsync(Func<Task> action, CancellationToken ct = default)

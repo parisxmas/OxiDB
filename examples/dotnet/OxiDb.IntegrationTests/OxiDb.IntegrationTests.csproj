@@ -18,4 +18,10 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The reconnect tests drive the real client, not this project's
+         hand-rolled one: the behaviour under test is the library's. -->
+    <ProjectReference Include="../../../dotnet/OxiDb.Client.Tcp/OxiDb.Client.Tcp.csproj" />
+  </ItemGroup>
+
 </Project>

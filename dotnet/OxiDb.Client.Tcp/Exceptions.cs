@@ -109,6 +109,21 @@ public sealed class OxiDbImmutableException : OxiDbException
 public sealed class OxiDbConnectionException : OxiDbException
 {
     public OxiDbConnectionException(string message) : base(message) { }
+
+    public OxiDbConnectionException(string message, bool retryable) : base(message)
+        => Retryable = retryable;
+
+    /// <summary>
+    /// True when the request provably never reached the server, so re-sending
+    /// it on a fresh connection cannot apply anything twice.
+    ///
+    /// The distinction is the whole difficulty of retrying a database call. A
+    /// socket that was already dead when the request was written is safe to
+    /// retry; a connection lost *after* the request went out is not, because
+    /// the server may have applied it and died before answering. Only the first
+    /// kind sets this.
+    /// </summary>
+    public bool Retryable { get; }
 }
 
 /// <summary>
