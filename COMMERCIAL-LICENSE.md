@@ -23,7 +23,7 @@ A commercial license is negotiated directly and can cover:
 
 **To obtain a commercial license, contact:**
 
-> **[ FILL IN: your commercial-licensing email or contact ]**
+> **barisakin@gmail.com**
 
 ## 2. Client libraries
 
