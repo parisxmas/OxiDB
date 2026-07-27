@@ -2993,10 +2993,12 @@ impl OxiDb {
                 let applied = col.apply_prepared_pending(&mut mutations, &mut ops);
                 #[cfg(target_arch = "wasm32")]
                 let applied = col.apply_prepared(&mut mutations);
+                // Always carried, even when empty: the count it settles is
+                // what keeps a snapshot from capturing this transaction before
+                // it commits, which is the in-RAM mode's version of the same
+                // problem.
                 #[cfg(not(target_arch = "wasm32"))]
-                if !ops.is_empty() {
-                    deferred.push((Arc::clone(&col), ops));
-                }
+                deferred.push((Arc::clone(&col), ops));
                 if let Err(e) = applied {
                     apply_result = Err(e);
                     break 'apply;

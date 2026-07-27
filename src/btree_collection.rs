@@ -4178,10 +4178,13 @@ impl BTreeCollection {
         ops: &mut crate::btree_storage::PendingOps,
     ) -> Result<()> {
         let res = self.apply_prepared_inner(mutations, Some(ops));
-        if !ops.is_empty() {
-            // Hold off compaction and checkpointing until this is settled.
-            self.storage.note_deferred();
-        }
+        // Noted even when there is nothing to defer. In the in-RAM mode there
+        // are no records to hold back — durability there is the periodic
+        // snapshot of the tree, which would otherwise capture this
+        // transaction's applied-but-uncommitted state and make it survive a
+        // crash the transaction did not. The count is what makes `sync_writes`
+        // wait for the commit point in both modes.
+        self.storage.note_deferred();
         res
     }
 
