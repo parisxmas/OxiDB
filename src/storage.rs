@@ -75,6 +75,22 @@ use crate::error::Result;
 const RECORD_ACTIVE: u8 = 0;
 #[cfg(not(target_arch = "wasm32"))]
 const RECORD_DELETED: u8 = 1;
+/// Written by a transaction that has not reached its commit point.
+///
+/// In disk-first mode a record is in the data file the moment a transaction
+/// applies it — before the commit mark is durable — and the index is rebuilt on
+/// open by scanning for *active* records. So a crash between apply and commit
+/// used to resurrect one collection's half of a transaction while the other
+/// half, still only in an unmarked WAL, was correctly discarded: a transaction
+/// recovered half-applied.
+///
+/// A pending record is skipped by that scan. The commit path flips it to
+/// [`RECORD_ACTIVE`] once the transaction is durably committed; if a crash
+/// falls between the mark and the flip, WAL replay restores the write, because
+/// replay is gated on the same commit log. Either way the transaction is
+/// all-or-nothing.
+#[cfg(not(target_arch = "wasm32"))]
+const RECORD_PENDING: u8 = 2;
 
 #[cfg(not(target_arch = "wasm32"))]
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -129,6 +145,10 @@ impl StorageInner {
     /// leftover tail garbage would desync every later `DocLocation` from the
     /// physical file and corrupt the framing for the next open.
     fn write_record(&mut self, payload: &[u8]) -> Result<DocLocation> {
+        self.write_record_with_status(payload, RECORD_ACTIVE)
+    }
+
+    fn write_record_with_status(&mut self, payload: &[u8], status: u8) -> Result<DocLocation> {
         let offset = self.current_offset;
         let length = payload.len() as u32;
         // The offset index packs (offset, length) into a single u64. Reject a
@@ -141,7 +161,7 @@ impl StorageInner {
         }
         let res = (|| -> Result<()> {
             self.file.seek(SeekFrom::End(0))?;
-            self.file.write_all(&[RECORD_ACTIVE])?;
+            self.file.write_all(&[status])?;
             self.file.write_all(&length.to_le_bytes())?;
             self.file.write_all(payload)?;
             Ok(())
@@ -583,6 +603,30 @@ impl Storage {
         let payload = self.prepare_payload(doc_bytes)?;
         let mut inner = self.inner.lock();
         inner.write_record(&payload)
+    }
+
+    /// Append a record a transaction has applied but not yet committed.
+    ///
+    /// Invisible to a rebuild-on-open until [`activate`](Self::activate) flips
+    /// it, which the commit path does once the transaction is durable. See
+    /// [`RECORD_PENDING`].
+    pub fn append_pending_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
+        let payload = self.prepare_payload(doc_bytes)?;
+        let mut inner = self.inner.lock();
+        inner.write_record_with_status(&payload, RECORD_PENDING)
+    }
+
+    /// Publish a pending record: the transaction that wrote it has committed.
+    ///
+    /// Not fsynced here. A flip lost to a crash costs nothing: the transaction
+    /// is in the commit log, its WAL entry is still there (the WAL is only
+    /// truncated at a checkpoint, which waits for these flips), so replay puts
+    /// the write back.
+    pub fn activate(&self, loc: DocLocation) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.file.seek(SeekFrom::Start(loc.offset()))?;
+        inner.file.write_all(&[RECORD_ACTIVE])?;
+        Ok(())
     }
 
     /// Append multiple documents without fsync, acquiring the mutex only once.

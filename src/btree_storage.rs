@@ -173,6 +173,10 @@ const BTREE_HEADER_SIZE: usize = 8;
 /// - No soft-delete / compaction needed — updates are in-place
 /// - Lock-free concurrent reads and writes via scc bucket-level locking
 pub struct BTreeStorage {
+    /// Transactions whose deferred file work (publish written records, retire
+    /// displaced ones) has not been performed yet. See `note_deferred`.
+    #[cfg(not(target_arch = "wasm32"))]
+    deferred_txs: AtomicU64,
     /// The concurrent map: doc_id → JSONB-encoded document bytes.
     tree: SccMap<u64, Vec<u8>>,
     /// Total bytes stored (for stats). Updated atomically.
@@ -450,12 +454,38 @@ impl ReverseCursor {
     }
 }
 
+/// Durability work a transaction has deferred until it commits.
+///
+/// A transaction applies its writes in memory before its commit mark is
+/// durable, so anything it does to the data file before that point can outlive
+/// a transaction that never committed. These are the two such acts — publishing
+/// a record it wrote, and retiring the record it displaced or deleted — held
+/// here and performed together once the commit is durable, or dropped if the
+/// transaction never gets there.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default, Debug)]
+pub struct PendingOps {
+    /// Records written pending; flip to active on commit.
+    pub activate: Vec<crate::storage::DocLocation>,
+    /// Records displaced or deleted; mark deleted on commit.
+    pub retire: Vec<crate::storage::DocLocation>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PendingOps {
+    pub fn is_empty(&self) -> bool {
+        self.activate.is_empty() && self.retire.is_empty()
+    }
+}
+
 impl BTreeStorage {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Self {
         Self {
             tree: SccMap::new(),
             total_bytes: AtomicU64::new(0),
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_txs: AtomicU64::new(0),
             data_dir: data_dir.to_path_buf(),
             name: name.to_string(),
             encryption,
@@ -477,6 +507,8 @@ impl BTreeStorage {
         Self {
             tree: SccMap::new(),
             total_bytes: AtomicU64::new(0),
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_txs: AtomicU64::new(0),
             data_dir: PathBuf::new(),
             name: name.to_string(),
             encryption: None,
@@ -671,6 +703,8 @@ impl BTreeStorage {
         Ok(Self {
             tree: SccMap::new(), // unused in disk-first mode
             total_bytes: AtomicU64::new(total),
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_txs: AtomicU64::new(0),
             data_dir: data_dir.to_path_buf(),
             name: name.to_string(),
             encryption,
@@ -819,6 +853,27 @@ impl BTreeStorage {
     /// Uses atomic `fetch_add` / `fetch_sub` for `total_bytes` to avoid
     /// load+store races under concurrent inserts.
     pub fn insert(&self, key: u64, value: Vec<u8>) -> Option<Vec<u8>> {
+        self.insert_inner(key, value, None)
+    }
+
+    /// Insert on behalf of a transaction that has not committed yet.
+    ///
+    /// The record goes in as *pending*, so a rebuild-on-open ignores it, and the
+    /// record it displaces is left active — retiring it now would make an
+    /// uncommitted update durable in the same way. Both are settled by
+    /// [`settle_pending`](Self::settle_pending) once the transaction commits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn insert_pending(&self, key: u64, value: Vec<u8>, ops: &mut PendingOps) {
+        self.insert_inner(key, value, Some(ops));
+    }
+
+    fn insert_inner(
+        &self,
+        key: u64,
+        value: Vec<u8>,
+        #[cfg(not(target_arch = "wasm32"))] pending: Option<&mut PendingOps>,
+        #[cfg(target_arch = "wasm32")] _pending: Option<&mut PendingOps>,
+    ) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
             // Read guard: shared with other readers/writers, excluded only by
@@ -839,13 +894,25 @@ impl BTreeStorage {
                     .and_then(|loc| data.read_lockfree(loc).ok());
                 (Arc::clone(g), prior)
             });
-            match data.append_no_sync(&value) {
+            let appended = match pending {
+                Some(_) => data.append_pending_no_sync(&value),
+                None => data.append_no_sync(&value),
+            };
+            match appended {
                 Ok(new_loc) => {
                     let old_loc = d.index.upsert_sync(key, new_loc);
                     if let Some((gate, prior)) = prior_for_gate {
                         gate.record(&self.name, key, prior.as_deref());
                     }
-                    if let Some(old) = old_loc {
+                    if let Some(ops) = pending {
+                        // Publish and retire together, after the commit point.
+                        ops.activate.push(new_loc);
+                        if let Some(old) = old_loc {
+                            ops.retire.push(old);
+                            self.total_bytes
+                                .fetch_sub(old.length() as u64, Ordering::AcqRel);
+                        }
+                    } else if let Some(old) = old_loc {
                         let _ = data.mark_deleted_no_sync(old);
                         self.total_bytes
                             .fetch_sub(old.length() as u64, Ordering::AcqRel);
@@ -900,6 +967,26 @@ impl BTreeStorage {
 
     /// Remove a key-value pair. Returns the removed value.
     pub fn remove(&self, key: u64) -> Option<Vec<u8>> {
+        self.remove_inner(key, None)
+    }
+
+    /// Delete on behalf of a transaction that has not committed yet.
+    ///
+    /// The record stays active on disk — flipping it now would make an
+    /// uncommitted delete survive a crash, losing a document no committed
+    /// transaction ever removed. It is retired by
+    /// [`settle_pending`](Self::settle_pending) once the commit is durable.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn remove_pending(&self, key: u64, ops: &mut PendingOps) {
+        self.remove_inner(key, Some(ops));
+    }
+
+    fn remove_inner(
+        &self,
+        key: u64,
+        #[cfg(not(target_arch = "wasm32"))] pending: Option<&mut PendingOps>,
+        #[cfg(target_arch = "wasm32")] _pending: Option<&mut PendingOps>,
+    ) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
             let data = d.data.read();
@@ -910,7 +997,12 @@ impl BTreeStorage {
                     let prior = data.read_lockfree(old).ok();
                     g.record(&self.name, key, prior.as_deref());
                 }
-                let _ = data.mark_deleted_no_sync(old);
+                match pending {
+                    Some(ops) => ops.retire.push(old),
+                    None => {
+                        let _ = data.mark_deleted_no_sync(old);
+                    }
+                }
                 self.total_bytes
                     .fetch_sub(old.length() as u64, Ordering::AcqRel);
             }
@@ -928,6 +1020,50 @@ impl BTreeStorage {
             self.total_bytes.fetch_sub(len, Ordering::AcqRel);
         }
         old
+    }
+
+    /// Perform a committed transaction's deferred durability work: publish the
+    /// records it wrote, retire the ones it displaced.
+    ///
+    /// Called after the commit mark is durable. Not fsynced — a flip lost to a
+    /// crash is restored by WAL replay, which is gated on the same commit log,
+    /// and a checkpoint waits for these before it may truncate that WAL.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn settle_pending(&self, ops: &PendingOps) {
+        if let Some(d) = &self.disk {
+            let data = d.data.read();
+            for loc in &ops.activate {
+                let _ = data.activate(*loc);
+            }
+            for loc in &ops.retire {
+                let _ = data.mark_deleted_no_sync(*loc);
+            }
+        }
+        self.deferred_txs.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Register that a transaction has deferred work here. Compaction and
+    /// checkpointing stand off until it is settled: compaction would rewrite a
+    /// pending record as a live one, and a checkpoint would truncate the WAL
+    /// that is the only other copy of a commit whose flips have not landed yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn note_deferred(&self) {
+        self.deferred_txs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// True while any transaction's deferred file work is outstanding.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn has_deferred(&self) -> bool {
+        self.deferred_txs.load(Ordering::Acquire) > 0
+    }
+
+    /// Drop a transaction's deferred work without performing it: the records it
+    /// wrote stay pending (invisible to a rebuild, reclaimed by compaction) and
+    /// what it would have retired stays live.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn discard_pending(&self, ops: &PendingOps) {
+        let _ = ops;
+        self.deferred_txs.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Attach the engine's snapshot gate (ADR-0017). Called once, after
@@ -981,6 +1117,14 @@ impl BTreeStorage {
     /// `DocLocation` is never used against the swapped file.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn compact(&self) -> Result<(u64, u64)> {
+        // Not while a transaction has records here it has not committed:
+        // compaction copies what the index points at, and a pending record
+        // copied into the fresh file would arrive live — durable before the
+        // transaction that wrote it. It stays dirty; the next tick compacts.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.has_deferred() {
+            return Ok((0, 0));
+        }
         let d = match &self.disk {
             Some(d) => d,
             None => {

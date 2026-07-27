@@ -870,6 +870,15 @@ impl BTreeCollection {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(()); // nothing changed since last persist
         }
+        // A commit whose file work has not landed yet is still only in the WAL.
+        // Checkpointing here could seal and truncate that WAL, and a crash then
+        // loses a transaction the caller was told had committed. The window is
+        // microseconds; skipping this tick costs nothing.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.storage.has_deferred() {
+            self.dirty.store(true, Ordering::Release);
+            return Ok(());
+        }
         // Capture the current btree state to disk via atomic rename.
         //
         // This used to persist WITHOUT touching the WAL, because truncating
@@ -4141,6 +4150,63 @@ impl BTreeCollection {
         &self,
         mutations: &mut Vec<crate::collection::PreparedMutation>,
     ) -> Result<()> {
+        self.apply_prepared_inner(mutations, None)
+    }
+
+    /// Apply a transaction's mutations, deferring the parts that would make them
+    /// durable before the transaction commits.
+    ///
+    /// The in-memory state changes exactly as before — readers see the write the
+    /// moment the commit lock is released. What is held back is the data file:
+    /// the record is written *pending* and whatever it displaces stays live,
+    /// until [`settle_pending`](crate::btree_storage::BTreeStorage::settle_pending)
+    /// publishes both at the commit point. Without this a crash in the window
+    /// between apply and commit left one collection's half of a transaction on
+    /// disk and discarded the other's, which WAL replay correctly refused to
+    /// resurrect — a transaction recovered half-applied.
+    /// Publish this transaction's deferred file work — see
+    /// [`apply_prepared_pending`](Self::apply_prepared_pending).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn settle_pending(&self, ops: &crate::btree_storage::PendingOps) {
+        self.storage.settle_pending(ops);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_prepared_pending(
+        &self,
+        mutations: &mut Vec<crate::collection::PreparedMutation>,
+        ops: &mut crate::btree_storage::PendingOps,
+    ) -> Result<()> {
+        let res = self.apply_prepared_inner(mutations, Some(ops));
+        if !ops.is_empty() {
+            // Hold off compaction and checkpointing until this is settled.
+            self.storage.note_deferred();
+        }
+        res
+    }
+
+    /// Abandon a transaction's deferred work: its pending records stay pending
+    /// (invisible on rebuild, reclaimed by a later compaction) and what it would
+    /// have retired stays live.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn discard_pending(&self, ops: &crate::btree_storage::PendingOps) {
+        self.storage.discard_pending(ops);
+    }
+
+    /// True while any transaction's deferred file work is outstanding here.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn has_deferred_writes(&self) -> bool {
+        self.storage.has_deferred()
+    }
+
+    fn apply_prepared_inner(
+        &self,
+        mutations: &mut Vec<crate::collection::PreparedMutation>,
+        #[cfg(not(target_arch = "wasm32"))] mut pending: Option<
+            &mut crate::btree_storage::PendingOps,
+        >,
+        #[cfg(target_arch = "wasm32")] _pending: Option<&mut ()>,
+    ) -> Result<()> {
         let mut fi = self.field_indexes.write();
         let mut ci = self.composite_indexes.write();
         let mut ti = self.text_index.write();
@@ -4149,6 +4215,14 @@ impl BTreeCollection {
         for m in mutations.iter() {
             if m.is_delete {
                 // Remove from B-tree
+                #[cfg(not(target_arch = "wasm32"))]
+                match pending.as_deref_mut() {
+                    Some(ops) => self.storage.remove_pending(m.doc_id, ops),
+                    None => {
+                        self.storage.remove(m.doc_id);
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
                 self.storage.remove(m.doc_id);
                 self.invalidate_bytes_cache(m.doc_id);
                 self.doc_cache.remove(m.doc_id);
@@ -4168,6 +4242,14 @@ impl BTreeCollection {
                 }
             } else {
                 // Insert or update in B-tree
+                #[cfg(not(target_arch = "wasm32"))]
+                match pending.as_deref_mut() {
+                    Some(ops) => self.storage.insert_pending(m.doc_id, m.new_bytes.clone(), ops),
+                    None => {
+                        self.storage.insert(m.doc_id, m.new_bytes.clone());
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
                 self.storage.insert(m.doc_id, m.new_bytes.clone());
 
                 if let Some(ref old_data) = m.old_data {

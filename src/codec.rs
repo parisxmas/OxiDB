@@ -89,6 +89,33 @@ pub fn extract_fields(bytes: &[u8], fields: &[&str]) -> Vec<(String, Value)> {
 /// the payload is treated as JSON text; otherwise it is decoded as JSONB binary.
 /// This allows transparent reading of legacy JSON `.dat` files alongside new
 /// JSONB records without requiring a migration step.
+/// Does this look like a JSONB document at all?
+///
+/// The parser trusts its input: it reads a length out of the header and slices
+/// by it, so bytes that are not JSONB — ciphertext read without the key, a
+/// corrupt record — panic with an out-of-range slice instead of returning an
+/// error. Nothing that arrives here is guaranteed to be ours, so the shape is
+/// checked before the parser sees it.
+///
+/// JSONB's header is a 4-byte big-endian word: a 3-bit kind in the top bits and
+/// a count, followed by that many 4-byte entries. Anything claiming more
+/// entries than the payload could hold is not a document.
+fn looks_like_jsonb(bytes: &[u8]) -> bool {
+    // Four bytes is a whole document: `{}` is a header with a count of zero.
+    if bytes.len() < 4 {
+        return false;
+    }
+    let header = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let kind = header & 0xE000_0000;
+    // Scalar, object and array containers — the only three kinds there are.
+    if !matches!(kind, 0x2000_0000 | 0x4000_0000 | 0x8000_0000) {
+        return false;
+    }
+    let count = (header & 0x00FF_FFFF) as usize;
+    // Every entry costs a 4-byte jentry plus at least one byte of payload.
+    bytes.len() >= 4 + count.saturating_mul(4)
+}
+
 pub fn decode_doc(bytes: &[u8]) -> Result<Value> {
     if bytes.is_empty() {
         return Err(Error::Codec("empty payload".into()));
@@ -101,6 +128,11 @@ pub fn decode_doc(bytes: &[u8]) -> Result<Value> {
         }
         _ => {
             // JSONB binary
+            if !looks_like_jsonb(bytes) {
+                return Err(Error::Codec(
+                    "payload is not a document — wrong encryption key, or a corrupt record".into(),
+                ));
+            }
             let raw = jsonb::RawJsonb::new(bytes);
             jsonb::from_raw_jsonb(&raw).map_err(|e| Error::Codec(e.to_string()))
         }
@@ -226,5 +258,44 @@ mod tests {
         let text = decode_doc_to_text(&encoded).unwrap();
         let reparsed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(val, reparsed);
+    }
+}
+
+#[cfg(test)]
+mod not_a_document_tests {
+    use super::*;
+
+    #[test]
+    fn ciphertext_errors_instead_of_panicking() {
+        // What an encrypted collection read without its key hands the decoder.
+        // The parser trusts a length it reads out of the header, so before this
+        // guard these bytes sliced out of range and took the process down —
+        // reachable by opening an encrypted database with the wrong key.
+        let ciphertext: Vec<u8> = (0u8..=255).cycle().take(173).collect();
+        let out = decode_doc(&ciphertext);
+        assert!(out.is_err(), "random bytes must not parse as a document");
+    }
+
+    #[test]
+    fn a_truncated_record_errors() {
+        let doc = encode_doc(&serde_json::json!({"a": 1, "b": "two"})).unwrap();
+        for cut in [1usize, 2, 3, 5, 7] {
+            if cut < doc.len() {
+                let _ = decode_doc(&doc[..cut]); // must not panic
+            }
+        }
+    }
+
+    #[test]
+    fn real_documents_still_decode() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"nested": {"x": [1, 2, 3]}}),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let bytes = encode_doc(&v).unwrap();
+            assert_eq!(decode_doc(&bytes).unwrap(), v, "round trip for {v}");
+        }
     }
 }

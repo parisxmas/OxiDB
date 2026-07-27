@@ -2800,7 +2800,7 @@ impl OxiDb {
         // buffered file appends; the fsyncs happen in phase 2 OUTSIDE the
         // lock, so other commits run their phase 1 while we flush and the
         // next flush covers them all (group commit).
-        let (my_ticket, wal_cols, pending_events, apply_result) = {
+        let (my_ticket, wal_cols, pending_events, apply_result, deferred) = {
             let _commit_guard = self.commit_lock.write();
 
             // 3. OCC validation: verify all recorded versions match current versions
@@ -2979,9 +2979,25 @@ impl OxiDb {
             // in-memory state — the same semantics as the old ordering,
             // where an apply error happened after the commit point.
             let mut apply_result: Result<()> = Ok(());
+            // What each collection deferred until this transaction's commit
+            // point: records written pending, records it displaced. Settled in
+            // phase 2 once the mark is durable — see `apply_prepared_pending`.
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut deferred: Vec<(Arc<BTreeCollection>, crate::btree_storage::PendingOps)> =
+                Vec::with_capacity(all_mutations.len());
             'apply: for (col_name, mut mutations) in all_mutations {
                 let col = col_map.get(&col_name).unwrap();
-                if let Err(e) = col.apply_prepared(&mut mutations) {
+                #[cfg(not(target_arch = "wasm32"))]
+                let mut ops = crate::btree_storage::PendingOps::default();
+                #[cfg(not(target_arch = "wasm32"))]
+                let applied = col.apply_prepared_pending(&mut mutations, &mut ops);
+                #[cfg(target_arch = "wasm32")]
+                let applied = col.apply_prepared(&mut mutations);
+                #[cfg(not(target_arch = "wasm32"))]
+                if !ops.is_empty() {
+                    deferred.push((Arc::clone(&col), ops));
+                }
+                if let Err(e) = applied {
                     apply_result = Err(e);
                     break 'apply;
                 }
@@ -2999,7 +3015,11 @@ impl OxiDb {
             // wait on our turn forever.
             let my_ticket = self.commit_ticket.fetch_add(1, Ordering::SeqCst);
 
-            (my_ticket, wal_cols, pending_events, apply_result)
+            #[cfg(not(target_arch = "wasm32"))]
+            let carried = deferred;
+            #[cfg(target_arch = "wasm32")]
+            let carried: Vec<()> = Vec::new();
+            (my_ticket, wal_cols, pending_events, apply_result, carried)
         };
 
         // Writes are applied and versioned — the pessimistic doc locks have
@@ -3051,6 +3071,13 @@ impl OxiDb {
             // Poison durability so no checkpoint persists the untrusted
             // state; recovery rebuilds from the last durable snapshot +
             // marked-WAL replay (this tx was never marked). See the field.
+            //
+            // Its file work is abandoned rather than performed: the records it
+            // wrote stay pending, so no rebuild will see them.
+            #[cfg(not(target_arch = "wasm32"))]
+            for (col, ops) in &deferred {
+                col.discard_pending(ops);
+            }
             self.durability_poisoned.store(true, Ordering::SeqCst);
             return Err(e);
         }
@@ -3059,15 +3086,51 @@ impl OxiDb {
         // mark. Many commits wait here concurrently on the same batch.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let rx = mark_rx.expect("mark submitted when WAL sync succeeded")?;
+            let rx = match mark_rx.expect("mark submitted when WAL sync succeeded") {
+                Ok(rx) => rx,
+                Err(e) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for (col, ops) in &deferred {
+                        col.discard_pending(ops);
+                    }
+                    return Err(e);
+                }
+            };
             match rx.recv() {
-                Ok(r) => r?,
+                Ok(Ok(())) => {}
+                // Never reached its commit point: leave the file as if it never
+                // happened.
+                Ok(Err(e)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for (col, ops) in &deferred {
+                        col.discard_pending(ops);
+                    }
+                    return Err(e);
+                }
                 Err(_) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for (col, ops) in &deferred {
+                        col.discard_pending(ops);
+                    }
                     return Err(Error::Io(std::io::Error::other(
                         "tx commit-log writer thread is gone",
                     )));
                 }
             }
+        }
+
+        // d) The transaction is durable now, so its deferred file work can be
+        // done: publish the records it wrote, retire the ones it displaced.
+        // Before the commit point either act would have survived a crash that
+        // this transaction did not, which is how a transaction spanning two
+        // collections came back half-applied.
+        //
+        // Not fsynced, and not fatal if it does not happen: a lost flip is
+        // rebuilt by WAL replay, which is gated on the commit log this
+        // transaction is now in.
+        #[cfg(not(target_arch = "wasm32"))]
+        for (col, ops) in &deferred {
+            col.settle_pending(ops);
         }
 
         // The tx_id intentionally STAYS in the commit log here. WAL
