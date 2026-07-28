@@ -928,7 +928,7 @@ fn fk_action(a: &Option<sp::ReferentialAction>) -> crate::catalog::FkAction {
 }
 
 fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
-    let mut pk_col: Option<String> = None;
+    let mut pk_cols: Vec<String> = Vec::new();
     let mut unique_cols: Vec<String> = Vec::new();
     let mut fks: Vec<crate::catalog::ForeignKey> = Vec::new();
     for c in &ct.constraints {
@@ -961,14 +961,18 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
                     }
                 }
             }
-            // Table-level `[CONSTRAINT name] PRIMARY KEY (col)` — the form
-            // EF Core migrations and pg_dump emit. A single column gets full
-            // PK semantics; composite keys are accepted and not enforced
-            // (documented, like FKs) so EF models with composite keys create.
+            // Table-level `[CONSTRAINT name] PRIMARY KEY (col, ...)` — the form
+            // EF Core migrations and pg_dump emit. One column or several: a
+            // composite key gets the same full PK semantics, enforced as one
+            // key tuple.
             sp::TableConstraint::PrimaryKey { columns, .. } => {
-                if let [_] = columns.as_slice() {
-                    pk_col = Some(single_index_column(columns, "PRIMARY KEY")?);
+                if !pk_cols.is_empty() {
+                    return Err(SqlError::Unsupported(
+                        "multiple PRIMARY KEY constraints (a table has at most one primary key)"
+                            .into(),
+                    ));
                 }
+                pk_cols = index_columns(columns, "PRIMARY KEY")?;
             }
             sp::TableConstraint::Unique { columns, .. } => {
                 if let [_] = columns.as_slice() {
@@ -985,27 +989,45 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
     for col in &ct.columns {
         columns.push(translate_column(col)?);
     }
-    for (target, is_pk) in pk_col
-        .iter()
-        .map(|c| (c, true))
-        .chain(unique_cols.iter().map(|c| (c, false)))
-    {
+    // Column-level `col INT PRIMARY KEY` — at most one such column, and never
+    // alongside a table-level PRIMARY KEY constraint.
+    if columns.iter().filter(|c| c.primary_key).count() > 1 {
+        return Err(SqlError::Unsupported(
+            "multiple PRIMARY KEY columns (a table has at most one primary key)".into(),
+        ));
+    }
+    if !pk_cols.is_empty() && columns.iter().any(|c| c.primary_key) {
+        return Err(SqlError::Unsupported(
+            "both a column-level and a table-level PRIMARY KEY (a table has at most one primary key)"
+                .into(),
+        ));
+    }
+    // A composite PRIMARY KEY marks every member column: uniqueness is over the
+    // whole tuple, and each member is implicitly NOT NULL (as SQL requires, and
+    // as a column-level `PRIMARY KEY` already does).
+    for (i, target) in pk_cols.iter().enumerate() {
+        if pk_cols[..i].contains(target) {
+            return Err(SqlError::Unsupported(format!(
+                "column {target} appears twice in the PRIMARY KEY"
+            )));
+        }
         let col = columns
             .iter_mut()
             .find(|c| &c.name == target)
             .ok_or_else(|| {
                 SqlError::Unsupported(format!("table constraint on unknown column {target}"))
             })?;
-        if is_pk {
-            col.primary_key = true;
-        } else {
-            col.unique = true;
-        }
+        col.primary_key = true;
+        col.nullable = false;
     }
-    if columns.iter().filter(|c| c.primary_key).count() > 1 {
-        return Err(SqlError::Unsupported(
-            "multiple PRIMARY KEY columns (a table has at most one primary key)".into(),
-        ));
+    for target in &unique_cols {
+        let col = columns
+            .iter_mut()
+            .find(|c| &c.name == target)
+            .ok_or_else(|| {
+                SqlError::Unsupported(format!("table constraint on unknown column {target}"))
+            })?;
+        col.unique = true;
     }
     for c in &columns {
         if c.auto_increment && !(c.primary_key && c.ty == SqlType::Int) {
@@ -1086,6 +1108,24 @@ fn single_index_column(cols: &[sp::IndexColumn], what: &str) -> Result<String> {
             "table-level {what} constraint on expression {other:?}"
         ))),
     }
+}
+
+/// A table-level constraint's column names, in the order written. Used by
+/// `PRIMARY KEY (a, b)`, which may name several columns.
+fn index_columns(cols: &[sp::IndexColumn], what: &str) -> Result<Vec<String>> {
+    if cols.is_empty() {
+        return Err(SqlError::Unsupported(format!(
+            "table-level {what} constraint without columns"
+        )));
+    }
+    cols.iter()
+        .map(|ic| match &ic.column.expr {
+            sp::Expr::Identifier(id) => Ok(id.value.clone()),
+            other => Err(SqlError::Unsupported(format!(
+                "table-level {what} constraint on expression {other:?}"
+            ))),
+        })
+        .collect()
 }
 
 fn translate_column(col: &sp::ColumnDef) -> Result<Column> {

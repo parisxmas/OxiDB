@@ -148,9 +148,18 @@ impl Table {
         self.columns.len()
     }
 
-    /// Position of the PRIMARY KEY column, if the table has one.
-    pub fn pk_pos(&self) -> Option<usize> {
-        self.columns.iter().position(|c| c.primary_key)
+    /// Positions of the PRIMARY KEY columns, in column order. Empty when the
+    /// table has no primary key, one entry for a single-column key, several for
+    /// a composite one — every member column carries the `primary_key` flag
+    /// (as MySQL's `DESCRIBE` shows `PRI` on each key part).
+    ///
+    /// Key *order* is column order, not the order written in
+    /// `PRIMARY KEY (b, a)`: uniqueness is set-semantics and lookups are
+    /// full-key equality, so the two differ only in how the key is reported.
+    pub fn pk_cols(&self) -> Vec<usize> {
+        (0..self.columns.len())
+            .filter(|&i| self.columns[i].primary_key)
+            .collect()
     }
 
     /// Physical slot indices of the live (non-dropped) columns, in order. Maps

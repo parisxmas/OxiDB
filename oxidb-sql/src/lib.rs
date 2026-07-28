@@ -127,10 +127,12 @@ struct TableState {
     next_auto: i64,
     /// Secondary indexes keyed by index name.
     indexes: BTreeMap<String, SecondaryIndex>,
-    /// PRIMARY KEY column position (if any) and its value -> row_id map,
-    /// used to enforce uniqueness on writes.
-    pk_pos: Option<usize>,
-    pk_map: BTreeMap<IndexKey, u64>,
+    /// PRIMARY KEY column positions (empty when the table has none) and the
+    /// key tuple -> row_id map used to enforce uniqueness on writes. A
+    /// single-column key is simply a one-element tuple, so composite and
+    /// simple primary keys take one code path.
+    pk_cols: Vec<usize>,
+    pk_map: BTreeMap<Vec<IndexKey>, u64>,
     /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
     /// NULLs are exempt (per SQL).
     uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
@@ -153,7 +155,7 @@ struct TableState {
 
 impl TableState {
     fn empty(def: Table, disk_first: bool) -> Self {
-        let pk_pos = def.pk_pos();
+        let pk_cols = def.pk_cols();
         let auto_pos = def.columns.iter().position(|c| c.auto_increment);
         let uniques = def
             .columns
@@ -169,7 +171,7 @@ impl TableState {
             auto_pos,
             next_auto: 1,
             indexes: BTreeMap::new(),
-            pk_pos,
+            pk_cols,
             pk_map: BTreeMap::new(),
             uniques,
             has_dropped: false,
@@ -223,10 +225,24 @@ impl TableState {
         Ok(self.to_physical(cells))
     }
 
+    /// This row's PRIMARY KEY tuple, or `None` when the table has no primary
+    /// key. `cells` is a **physical** row (`pk_cols` are physical positions).
+    fn pk_key(&self, cells: &[Value]) -> Option<Vec<IndexKey>> {
+        if self.pk_cols.is_empty() {
+            return None;
+        }
+        Some(
+            self.pk_cols
+                .iter()
+                .map(|&p| IndexKey(cells[p].clone()))
+                .collect(),
+        )
+    }
+
     /// Recompute the schema-derived positions and reseed every constraint
     /// map from the current rows (used after `ALTER TABLE`).
     fn rebuild_meta(&mut self) {
-        self.pk_pos = self.def.pk_pos();
+        self.pk_cols = self.def.pk_cols();
         self.auto_pos = self.def.columns.iter().position(|c| c.auto_increment);
         self.uniques = self
             .def
@@ -245,8 +261,8 @@ impl TableState {
             seeds.push((rid, cells.into_owned()));
         }
         for (rid, cells) in seeds {
-            if let Some(p) = self.pk_pos {
-                self.pk_map.insert(IndexKey(cells[p].clone()), rid);
+            if let Some(key) = self.pk_key(&cells) {
+                self.pk_map.insert(key, rid);
             }
             for (pos, map) in self.uniques.iter_mut() {
                 if !matches!(cells[*pos], Value::Null) {
@@ -304,8 +320,8 @@ impl TableState {
             let key = idx.key_of(cells);
             idx.map.entry(key).or_default().insert(row_id);
         }
-        if let Some(p) = self.pk_pos {
-            self.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+        if let Some(key) = self.pk_key(cells) {
+            self.pk_map.insert(key, row_id);
         }
         for (pos, map) in self.uniques.iter_mut() {
             if !matches!(cells[*pos], Value::Null) {
@@ -324,8 +340,7 @@ impl TableState {
                 }
             }
         }
-        if let Some(p) = self.pk_pos {
-            let key = IndexKey(cells[p].clone());
+        if let Some(key) = self.pk_key(cells) {
             // Only remove the mapping if it still points at this row (an
             // idempotent WAL replay can re-insert before the old delete).
             if self.pk_map.get(&key) == Some(&row_id) {
@@ -341,16 +356,17 @@ impl TableState {
     }
 
     /// Error if `cells`' PRIMARY KEY value already belongs to a row other
-    /// than `exclude_row`.
+    /// than `exclude_row`. A composite key collides only when *every* member
+    /// matches.
     fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
-        if let Some(p) = self.pk_pos {
-            let key = IndexKey(cells[p].clone());
+        if let Some(key) = self.pk_key(cells) {
             if let Some(&existing) = self.pk_map.get(&key)
                 && Some(existing) != exclude_row
             {
                 return Err(SqlError::DuplicateKey(format!(
-                    "PRIMARY KEY value {:?} already exists in {:?}",
-                    cells[p], self.def.name
+                    "PRIMARY KEY value {} already exists in {:?}",
+                    types::render_key(&self.pk_cols, cells),
+                    self.def.name
                 )));
             }
         }
@@ -484,8 +500,8 @@ impl SqlEngine {
                     for (row_id, cells) in snap.entries() {
                         state.observe_row_id(row_id);
                         state.observe_auto(&cells);
-                        if let Some(p) = state.pk_pos {
-                            state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                        if let Some(key) = state.pk_key(&cells) {
+                            state.pk_map.insert(key, row_id);
                         }
                         for (pos, map) in state.uniques.iter_mut() {
                             if !matches!(cells[*pos], Value::Null) {
@@ -499,8 +515,8 @@ impl SqlEngine {
                 for (row_id, cells) in storage::read_snapshot(&load_dir, name, def.arity())? {
                     state.observe_row_id(row_id);
                     state.observe_auto(&cells);
-                    if let Some(p) = state.pk_pos {
-                        state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                    if let Some(key) = state.pk_key(&cells) {
+                        state.pk_map.insert(key, row_id);
                     }
                     for (pos, map) in state.uniques.iter_mut() {
                         if !matches!(cells[*pos], Value::Null) {
@@ -1048,17 +1064,17 @@ impl SqlEngine {
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        let mut batch_keys: BTreeSet<IndexKey> = BTreeSet::new();
+        let mut batch_keys: BTreeSet<Vec<IndexKey>> = BTreeSet::new();
         let mut phys_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for cells in rows {
             let cells = state.prepare_write(cells)?;
             state.check_pk(&cells, None)?;
-            if let Some(p) = state.pk_pos
-                && !batch_keys.insert(IndexKey(cells[p].clone()))
+            if let Some(key) = state.pk_key(&cells)
+                && !batch_keys.insert(key)
             {
                 return Err(SqlError::DuplicateKey(format!(
-                    "PRIMARY KEY value {:?} appears twice in the same INSERT",
-                    cells[p]
+                    "PRIMARY KEY value {} appears twice in the same INSERT",
+                    types::render_key(&state.pk_cols, &cells)
                 )));
             }
             phys_rows.push(cells);
@@ -1248,21 +1264,26 @@ impl SqlEngine {
             .collect())
     }
 
-    /// The committed row currently owning `key` in a table's PRIMARY KEY or
-    /// UNIQUE map at column position `pos` (`None` for unknown tables — e.g.
-    /// ones created inside an open transaction). Transactions probe this for
-    /// uniqueness checks instead of seeding a snapshot of the whole table.
+    /// The committed row currently owning `key` in a table's UNIQUE map at
+    /// column position `pos` (`None` for unknown tables — e.g. ones created
+    /// inside an open transaction). Transactions probe this for uniqueness
+    /// checks instead of seeding a snapshot of the whole table.
     pub(crate) fn unique_owner(&self, table: &str, pos: usize, key: &IndexKey) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
         let state = inner.tables.get(table)?;
-        if state.pk_pos == Some(pos) {
-            return state.pk_map.get(key).copied();
-        }
         state
             .uniques
             .iter()
             .find(|(p, _)| *p == pos)
             .and_then(|(_, map)| map.get(key).copied())
+    }
+
+    /// The committed row currently owning PRIMARY KEY tuple `key` — the
+    /// composite-aware sibling of [`unique_owner`](Self::unique_owner). `key`
+    /// must be built from the table's `pk_cols` in order.
+    pub(crate) fn pk_owner(&self, table: &str, key: &[IndexKey]) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.tables.get(table)?.pk_map.get(key).copied()
     }
 
     /// Look up rows using a secondary index whose columns are all present in
@@ -1273,20 +1294,29 @@ impl SqlEngine {
             return Err(SqlError::NoSuchTable(table.to_string()));
         };
         // PRIMARY KEY: a unique equality lookup is the most selective index
-        // there is, and the pk_map already maps value -> row_id. Use it before
-        // considering (redundant) secondary indexes.
-        if let Some(p) = state.pk_pos
-            && let Some((_, v)) = eqs
+        // there is, and the pk_map already maps the key tuple -> row_id. Use it
+        // before considering (redundant) secondary indexes. A composite key
+        // qualifies only when *every* member column has an equality pair —
+        // a partial key isn't unique, so it would miss rows.
+        if !state.pk_cols.is_empty() {
+            let key: Option<Vec<IndexKey>> = state
+                .pk_cols
                 .iter()
-                .find(|(col, _)| *col == state.def.columns[p].name)
-        {
-            let rows: store::Rows = state
-                .pk_map
-                .get(&IndexKey(v.clone()))
-                .and_then(|id| state.rows.get(*id).map(|c| (*id, c)))
-                .into_iter()
+                .map(|&p| {
+                    eqs.iter()
+                        .find(|(col, _)| *col == state.def.columns[p].name)
+                        .map(|(_, v)| IndexKey(v.clone()))
+                })
                 .collect();
-            return Ok(Some(rows));
+            if let Some(key) = key {
+                let rows: store::Rows = state
+                    .pk_map
+                    .get(&key)
+                    .and_then(|id| state.rows.get(*id).map(|c| (*id, c)))
+                    .into_iter()
+                    .collect();
+                return Ok(Some(rows));
+            }
         }
         // Find an index all of whose columns have an equality pair. Prefer
         // wider indexes (more matched columns = more selective).

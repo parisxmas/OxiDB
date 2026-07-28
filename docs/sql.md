@@ -169,13 +169,23 @@ CREATE TABLE IF NOT EXISTS users (...);
 DROP TABLE users;
 DROP TABLE IF EXISTS users;
 
--- Table-level single-column constraints (the shape EF Core migrations and
--- pg_dump emit); FOREIGN KEY clauses parse but are not enforced (documented).
+-- Table-level constraints (the shape EF Core migrations and pg_dump emit).
 CREATE TABLE orders (
   id      INT NOT NULL AUTO_INCREMENT,
   email   TEXT,
   CONSTRAINT pk_orders PRIMARY KEY (id),
   CONSTRAINT uq_email  UNIQUE (email)
+);
+
+-- A composite PRIMARY KEY names several columns. Uniqueness is over the whole
+-- tuple: two rows may share `student` or `course`, never both. Every member
+-- column is implicitly NOT NULL, and none of them can later be dropped or
+-- retyped. Table-level UNIQUE still takes a single column.
+CREATE TABLE enrolment (
+  student INT,
+  course  TEXT,
+  grade   INT,
+  CONSTRAINT pk_enrolment PRIMARY KEY (student, course)
 );
 
 ALTER TABLE users ADD COLUMN city TEXT DEFAULT 'n/a';  -- one operation per statement
@@ -210,7 +220,8 @@ transactions leave gaps, as in every SQL engine.
 
 A duplicate `PRIMARY KEY` value is rejected with a `duplicate key` error —
 on plain INSERTs, multi-row INSERTs (checked across the whole batch before
-anything is applied), UPDATEs, and inside transactions.
+anything is applied), UPDATEs, and inside transactions. A composite key
+collides only when every member column matches.
 
 Secondary indexes serve equality seeks on single-table SELECTs (a
 multi-column index applies when the WHERE clause has `col = value` conjuncts
@@ -479,8 +490,9 @@ statement in their request in cluster mode.
 
 - `EXCEPT`, `INTERSECT`, `DISTINCT ON`, aggregate `DISTINCT`, and explicit
   window frames are not supported; `LATERAL` derived tables are not either
-- Table-level `PRIMARY KEY`/`UNIQUE` constraints take a single column
-  (multi-column PKs are not supported)
+- Table-level `UNIQUE` constraints take a single column (`PRIMARY KEY` may
+  be composite). A single-column `FOREIGN KEY` cannot reference a table
+  whose primary key is composite
 - Correlated subqueries reach one level up and are not allowed inside
   aggregated queries or window functions
 - `FOREIGN KEY` clauses parse but referential integrity is not enforced

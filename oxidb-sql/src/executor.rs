@@ -549,16 +549,20 @@ fn fk_parent_column<S: Store>(store: &S, fk: &crate::catalog::ForeignKey) -> Res
     let pdef = store
         .table_def(&fk.parent_table)
         .ok_or_else(|| SqlError::NoSuchTable(fk.parent_table.clone()))?;
-    pdef.columns
-        .iter()
-        .find(|c| c.primary_key)
-        .map(|c| c.name.clone())
-        .ok_or_else(|| {
-            SqlError::Unsupported(format!(
-                "FOREIGN KEY references {} which has no PRIMARY KEY",
-                fk.parent_table
-            ))
-        })
+    match pdef.pk_cols().as_slice() {
+        [p] => Ok(pdef.columns[*p].name.clone()),
+        [] => Err(SqlError::Unsupported(format!(
+            "FOREIGN KEY references {} which has no PRIMARY KEY",
+            fk.parent_table
+        ))),
+        // A single-column FK can't stand in for a composite key; there is no
+        // one parent column to resolve to.
+        _ => Err(SqlError::Unsupported(format!(
+            "FOREIGN KEY references {} whose PRIMARY KEY is composite \
+             (name the parent column explicitly)",
+            fk.parent_table
+        ))),
+    }
 }
 
 fn fk_col_pos(def: &crate::catalog::Table, col: &str) -> Result<usize> {

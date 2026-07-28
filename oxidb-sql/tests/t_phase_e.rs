@@ -135,8 +135,8 @@ fn table_level_unique_constraint() {
 #[test]
 fn table_level_constraint_errors() {
     let (_d, db) = open();
-    // Multi-column table-level PK is accepted and not enforced (documented,
-    // like FKs) so EF models with composite keys can create their tables.
+    // Multi-column table-level PK creates and is enforced as one key tuple
+    // (see t_composite_pk.rs).
     assert!(
         db.execute("CREATE TABLE p (a INT, b INT, CONSTRAINT pk PRIMARY KEY (a, b))")
             .is_ok()

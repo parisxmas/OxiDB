@@ -137,6 +137,18 @@ impl Ord for IndexKey {
     }
 }
 
+/// How a key reads in a constraint-violation message: the bare value for a
+/// single column (`Int(1)`), a tuple for a composite one (`(Int(1), Text("a"))`).
+pub(crate) fn render_key(cols: &[usize], cells: &[Value]) -> String {
+    match cols {
+        [p] => format!("{:?}", cells[*p]),
+        _ => {
+            let parts: Vec<String> = cols.iter().map(|&p| format!("{:?}", cells[p])).collect();
+            format!("({})", parts.join(", "))
+        }
+    }
+}
+
 // Cell tags. NULL has its own tag so a nullable column round-trips exactly.
 const TAG_NULL: u8 = 0;
 const TAG_INT: u8 = 1;

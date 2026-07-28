@@ -24,9 +24,19 @@ use crate::SqlEngine;
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
 type RowChange = Option<Vec<Value>>;
 
-/// Per-table uniqueness maps: `(column position, value -> row_id)` for the
-/// PRIMARY KEY and each UNIQUE column.
-type UniqueMaps = Vec<(usize, BTreeMap<IndexKey, u64>)>;
+/// One uniqueness constraint's in-transaction key map: the PRIMARY KEY (its
+/// member columns in key order — one for a simple key, several for a composite
+/// one) or a single UNIQUE column.
+#[derive(Clone)]
+struct UniqueMap {
+    cols: Vec<usize>,
+    is_pk: bool,
+    map: BTreeMap<Vec<IndexKey>, u64>,
+}
+
+/// Per-table uniqueness maps: the PRIMARY KEY (when there is one) followed by
+/// each UNIQUE column.
+type UniqueMaps = Vec<UniqueMap>;
 
 #[derive(Default, Clone)]
 pub(crate) struct TxnState {
@@ -44,8 +54,8 @@ pub(crate) struct TxnState {
     /// Indexes created / dropped within the transaction.
     indexes_created: BTreeMap<String, IndexDef>,
     indexes_dropped: BTreeSet<String>,
-    /// Uniqueness state per table: one `(column position, value -> row_id)`
-    /// map for the PRIMARY KEY and each UNIQUE column, holding ONLY keys
+    /// Uniqueness state per table: one `key tuple -> row_id` map for the
+    /// PRIMARY KEY and each UNIQUE column, holding ONLY keys
     /// written by this transaction. Committed base rows are probed through
     /// the engine's persistent maps at check time (with this overlay
     /// superseding base ownership), so cost scales with the transaction's
@@ -247,61 +257,95 @@ impl<'a> Transaction<'a> {
         cells: &[Value],
         exclude: Option<u64>,
     ) -> Result<()> {
-        // Constrained positions: the PRIMARY KEY plus every UNIQUE column.
-        let positions: Vec<usize> = def
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(i, c)| c.primary_key || (c.unique && def.pk_pos() != Some(*i)))
-            .map(|(i, _)| i)
-            .collect();
-        if positions.is_empty() {
+        // Constrained keys: the PRIMARY KEY (one entry, however many columns)
+        // plus every UNIQUE column.
+        let constraints = Self::constraints_of(def);
+        if constraints.is_empty() {
             return Ok(());
         }
         self.state
             .borrow_mut()
             .pk_seen
             .entry(table.to_string())
-            .or_insert_with(|| positions.iter().map(|&p| (p, BTreeMap::new())).collect());
+            .or_insert(constraints);
 
-        let dup = |p: usize| {
-            let is_pk = def.pk_pos() == Some(p);
+        let dup = |c: &UniqueMap| {
             Err(SqlError::DuplicateKey(format!(
-                "{} value {:?} already exists in {table:?}",
-                if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
-                cells[p]
+                "{} value {} already exists in {table:?}",
+                if c.is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+                crate::types::render_key(&c.cols, cells)
             )))
         };
-        // The engine's constraint maps key on physical positions; `p` is a
-        // logical position. They differ only when a column has been dropped.
+        // The engine's constraint maps key on physical positions; `cols` are
+        // logical positions. They differ only when a column has been dropped.
         let layout = self.phys_layout(table);
         let st = self.state.borrow();
         let maps = st.pk_seen.get(table).expect("initialized above");
         let overlay = st.rows.get(table);
         let base_exists = !st.created.contains_key(table);
-        for (p, map) in maps {
-            if matches!(cells[*p], Value::Null) {
-                continue; // NULLs never collide (and the PK is NOT NULL anyway)
+        for c in maps {
+            // NULLs never collide (and PK columns are NOT NULL anyway). For a
+            // composite key, a NULL in any member exempts the whole row — SQL's
+            // rule for a multi-column UNIQUE.
+            if c.cols.iter().any(|&p| matches!(cells[p], Value::Null)) {
+                continue;
             }
-            let key = IndexKey(cells[*p].clone());
+            let key: Vec<IndexKey> = c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             // Owned by a row this transaction wrote?
-            if let Some(&rid) = map.get(&key)
+            if let Some(&rid) = c.map.get(&key)
                 && Some(rid) != exclude
             {
-                return dup(*p);
+                return dup(c);
             }
             // Owned by a committed base row this transaction hasn't touched?
             // The engine's constraint maps key on physical positions.
-            let phys_p = layout.as_ref().map(|(live, _)| live[*p]).unwrap_or(*p);
-            if base_exists
-                && let Some(rid) = self.engine.unique_owner(table, phys_p, &key)
+            let owner = if !base_exists {
+                None
+            } else if c.is_pk {
+                // The key is *values*, so no logical->physical translation is
+                // needed: a dropped column can never be a PK member, so both
+                // sides list the same columns in the same relative order.
+                self.engine.pk_owner(table, &key)
+            } else {
+                let phys_p = layout
+                    .as_ref()
+                    .map(|(live, _)| live[c.cols[0]])
+                    .unwrap_or(c.cols[0]);
+                self.engine.unique_owner(table, phys_p, &key[0])
+            };
+            if let Some(rid) = owner
                 && Some(rid) != exclude
                 && overlay.is_none_or(|o| !o.contains_key(&rid))
             {
-                return dup(*p);
+                return dup(c);
             }
         }
         Ok(())
+    }
+
+    /// The uniqueness constraints of `def`, as empty in-transaction key maps:
+    /// the PRIMARY KEY (all its columns as one key) then each UNIQUE column
+    /// that isn't already part of the primary key.
+    fn constraints_of(def: &Table) -> UniqueMaps {
+        let pk = def.pk_cols();
+        let mut out: UniqueMaps = Vec::new();
+        if !pk.is_empty() {
+            out.push(UniqueMap {
+                cols: pk,
+                is_pk: true,
+                map: BTreeMap::new(),
+            });
+        }
+        for (i, col) in def.columns.iter().enumerate() {
+            if col.unique && !col.primary_key {
+                out.push(UniqueMap {
+                    cols: vec![i],
+                    is_pk: false,
+                    map: BTreeMap::new(),
+                });
+            }
+        }
+        out
     }
 
     /// Record a write's effect on the transaction's key maps (no-op when the
@@ -313,15 +357,17 @@ impl<'a> Transaction<'a> {
         let Some(maps) = st.pk_seen.get_mut(table) else {
             return;
         };
-        for (p, map) in maps.iter_mut() {
+        for c in maps.iter_mut() {
             // Any prior key owned by this row is gone (update changes the
             // key, delete removes the row). The map holds only this
             // transaction's writes, so the sweep is small.
-            map.retain(|_, rid| *rid != row_id);
+            c.map.retain(|_, rid| *rid != row_id);
             if let Some(cells) = cells
-                && !matches!(cells[*p], Value::Null)
+                && !c.cols.iter().any(|&p| matches!(cells[p], Value::Null))
             {
-                map.insert(IndexKey(cells[*p].clone()), row_id);
+                let key: Vec<IndexKey> =
+                    c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+                c.map.insert(key, row_id);
             }
         }
     }
