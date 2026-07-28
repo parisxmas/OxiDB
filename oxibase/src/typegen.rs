@@ -34,9 +34,14 @@ pub fn generate(upstream: &Upstream, db_ref: &str, project_name: &str) -> Result
     // ── SQL tables (exact, from DESCRIBE) ───────────────────────────────
     if let Ok(results) = sql(upstream, db_ref, "SHOW TABLES") {
         for row in rows_of(results.first()) {
-            let Some(table) = row.first().and_then(|v| v.as_str()) else { continue };
-            let Ok(desc) = sql(upstream, db_ref, &format!("DESCRIBE \"{}\"", table.replace('"', "\"\"")))
-            else {
+            let Some(table) = row.first().and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(desc) = sql(
+                upstream,
+                db_ref,
+                &format!("DESCRIBE \"{}\"", table.replace('"', "\"\"")),
+            ) else {
                 continue;
             };
             let iface = interface_name(table);
@@ -141,11 +146,7 @@ fn rows_of(result: Option<&Value>) -> Vec<Vec<Value>> {
     result
         .and_then(|r| r.get("rows"))
         .and_then(|r| r.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.as_array().cloned())
-                .collect()
-        })
+        .map(|rows| rows.iter().filter_map(|r| r.as_array().cloned()).collect())
         .unwrap_or_default()
 }
 
@@ -194,16 +195,19 @@ fn interface_name(name: &str) -> String {
             out.push(c);
         }
     }
-    if out.is_empty() { "Unnamed".into() } else { out }
+    if out.is_empty() {
+        "Unnamed".into()
+    } else {
+        out
+    }
 }
 
 /// A property name, quoted when it isn't a valid TS identifier.
 fn prop(name: &str) -> String {
     let valid = !name.is_empty()
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c == '_' || c == '$' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()));
+        && name.chars().enumerate().all(|(i, c)| {
+            c == '_' || c == '$' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+        });
     if valid {
         name.to_string()
     } else {

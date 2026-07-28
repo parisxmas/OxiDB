@@ -136,10 +136,10 @@ impl IndexValue {
             return IndexValue::DateTime(dt.and_utc().timestamp_millis());
         }
         // Try date only: "2024-01-15"
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-                return IndexValue::DateTime(dt.and_utc().timestamp_millis());
-            }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            && let Some(dt) = d.and_hms_opt(0, 0, 0)
+        {
+            return IndexValue::DateTime(dt.and_utc().timestamp_millis());
         }
         IndexValue::String(s.to_string())
     }
@@ -156,7 +156,7 @@ impl IndexValue {
             IndexValue::DateTime(ms) => {
                 // Convert back to ISO 8601 string
                 let secs = ms / 1000;
-                let nsecs = ((ms % 1000).abs() as u32) * 1_000_000;
+                let nsecs = ((ms % 1000).unsigned_abs() as u32) * 1_000_000;
                 if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
                     JsonValue::String(dt.to_rfc3339())
                 } else {
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn float_from_json() {
-        let v = IndexValue::from_json(&serde_json::json!(3.14));
+        let v = IndexValue::from_json(&serde_json::json!(2.75));
         assert!(matches!(v, IndexValue::Float(_)));
     }
 
@@ -417,7 +417,7 @@ mod tests {
             IndexValue::Integer(-42),
             IndexValue::Integer(i64::MAX),
             IndexValue::Integer(i64::MIN),
-            IndexValue::Float(3.14),
+            IndexValue::Float(2.75),
             IndexValue::Float(f64::NEG_INFINITY),
             IndexValue::DateTime(1_700_000_000_000),
             IndexValue::DateTime(-1_000),

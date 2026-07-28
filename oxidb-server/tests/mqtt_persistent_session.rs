@@ -57,6 +57,8 @@ fn start_broker() -> Broker {
     let dir = tempfile::tempdir().unwrap();
     let port = test_port(21000, 8);
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_MQTT_PORT", port.to_string())
         .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
@@ -66,9 +68,14 @@ fn start_broker() -> Broker {
         .spawn()
         .expect("start oxidb-server");
 
-    for _ in 0..600 {  // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
+    for _ in 0..600 {
+        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Broker { child, port, _dir: dir };
+            return Broker {
+                child,
+                port,
+                _dir: dir,
+            };
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -97,7 +104,21 @@ fn sub_once(port: u16, id: Option<&str>, persistent: bool, topic: &str, wait: u3
 fn subscribe_and_leave(port: u16, id: &str, topic: &str) {
     // -W 1 → times out after 1s with no message, then disconnects.
     let _ = Command::new("mosquitto_sub")
-        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-i", id, "-c", "-q", "1", "-t", topic, "-W", "1"])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-i",
+            id,
+            "-c",
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-W",
+            "1",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -105,7 +126,18 @@ fn subscribe_and_leave(port: u16, id: &str, topic: &str) {
 
 fn publish(port: u16, topic: &str, msg: &str, retain: bool) {
     let mut cmd = Command::new("mosquitto_pub");
-    cmd.args(["-h", "127.0.0.1", "-p", &port.to_string(), "-q", "1", "-t", topic, "-m", msg]);
+    cmd.args([
+        "-h",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-q",
+        "1",
+        "-t",
+        topic,
+        "-m",
+        msg,
+    ]);
     if retain {
         cmd.arg("-r");
     }
@@ -152,7 +184,18 @@ fn a_clean_session_does_not_resurrect_offline_messages() {
 
     // A clean (non-persistent) subscriber subscribes and leaves.
     let _ = Command::new("mosquitto_sub")
-        .args(["-h", "127.0.0.1", "-p", &b.port.to_string(), "-i", "clean-1", "-t", "cc/z", "-W", "1"])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &b.port.to_string(),
+            "-i",
+            "clean-1",
+            "-t",
+            "cc/z",
+            "-W",
+            "1",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -180,7 +223,10 @@ fn live_pubsub_and_retained_still_work() {
     publish(b.port, "ret/w", "retained-value", true);
     settle();
     let got = sub_once(b.port, None, false, "ret/w", 2);
-    assert_eq!(got, "retained-value", "retained message must be delivered on subscribe");
+    assert_eq!(
+        got, "retained-value",
+        "retained message must be delivered on subscribe"
+    );
 }
 
 #[test]
@@ -193,7 +239,18 @@ fn a_takeover_connection_wins_and_the_old_one_exits() {
 
     // First connection with a fixed id, held open.
     let mut first = Command::new("mosquitto_sub")
-        .args(["-h", "127.0.0.1", "-p", &b.port.to_string(), "-i", "solo", "-t", "cc/take", "-W", "5"])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &b.port.to_string(),
+            "-i",
+            "solo",
+            "-t",
+            "cc/take",
+            "-W",
+            "5",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

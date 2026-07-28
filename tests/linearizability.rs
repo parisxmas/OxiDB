@@ -289,7 +289,7 @@ fn history_is_serializable() {
             );
         }
     }
-    for (&v, _) in &appended {
+    for &v in appended.keys() {
         assert!(
             in_final.contains(&v),
             "acked append {v} lost from final state"
@@ -343,17 +343,17 @@ fn history_is_serializable() {
                 // rw: reader missed the NEXT value in the final list →
                 // reader → writer(next).
                 let p = pos_in_key[&(*k, last)];
-                if let Some(&next_v) = final_lists[k].get(p + 1) {
-                    if let Some(&tn) = writer_of.get(&next_v) {
-                        add(&mut adj, r.id, tn);
-                    }
+                if let Some(&next_v) = final_lists[k].get(p + 1)
+                    && let Some(&tn) = writer_of.get(&next_v)
+                {
+                    add(&mut adj, r.id, tn);
                 }
             } else {
                 // Read an empty list → reader precedes the FIRST writer.
-                if let Some(&first) = final_lists[k].first() {
-                    if let Some(&tf) = writer_of.get(&first) {
-                        add(&mut adj, r.id, tf);
-                    }
+                if let Some(&first) = final_lists[k].first()
+                    && let Some(&tf) = writer_of.get(&first)
+                {
+                    add(&mut adj, r.id, tf);
                 }
             }
         }

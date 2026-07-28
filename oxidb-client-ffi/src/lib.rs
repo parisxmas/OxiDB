@@ -37,6 +37,10 @@ unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(s) }.to_str().ok()
 }
 
+/// # Safety
+/// `host` must be a valid, NUL-terminated C string, or NULL. The returned
+/// handle is owned by the caller and must be released with
+/// [`oxidb_disconnect`]; NULL means the connection failed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_connect(host: *const c_char, port: u16) -> *mut OxiDbConn {
     let host_str = match unsafe { cstr_to_str(host) } {
@@ -50,6 +54,10 @@ pub unsafe extern "C" fn oxidb_connect(host: *const c_char, port: u16) -> *mut O
     }
 }
 
+/// # Safety
+/// `conn` must be a handle returned by [`oxidb_connect`] that has not already
+/// been passed to this function. It is invalid afterwards and must not be
+/// used again. NULL is accepted and ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_disconnect(conn: *mut OxiDbConn) {
     if !conn.is_null() {
@@ -57,12 +65,24 @@ pub unsafe extern "C" fn oxidb_disconnect(conn: *mut OxiDbConn) {
     }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_ping(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "ping"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_insert(
     conn: *mut OxiDbConn,
@@ -85,6 +105,12 @@ pub unsafe extern "C" fn oxidb_insert(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_insert_many(
     conn: *mut OxiDbConn,
@@ -107,6 +133,12 @@ pub unsafe extern "C" fn oxidb_insert_many(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_find(
     conn: *mut OxiDbConn,
@@ -129,6 +161,12 @@ pub unsafe extern "C" fn oxidb_find(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_find_one(
     conn: *mut OxiDbConn,
@@ -151,6 +189,12 @@ pub unsafe extern "C" fn oxidb_find_one(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_update(
     conn: *mut OxiDbConn,
@@ -183,6 +227,12 @@ pub unsafe extern "C" fn oxidb_update(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_update_one(
     conn: *mut OxiDbConn,
@@ -214,6 +264,12 @@ pub unsafe extern "C" fn oxidb_update_one(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete(
     conn: *mut OxiDbConn,
@@ -236,6 +292,12 @@ pub unsafe extern "C" fn oxidb_delete(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete_one(
     conn: *mut OxiDbConn,
@@ -258,6 +320,12 @@ pub unsafe extern "C" fn oxidb_delete_one(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_count(
     conn: *mut OxiDbConn,
@@ -271,6 +339,12 @@ pub unsafe extern "C" fn oxidb_count(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_compact(
     conn: *mut OxiDbConn,
@@ -284,6 +358,12 @@ pub unsafe extern "C" fn oxidb_compact(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_index(
     conn: *mut OxiDbConn,
@@ -302,6 +382,12 @@ pub unsafe extern "C" fn oxidb_create_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_unique_index(
     conn: *mut OxiDbConn,
@@ -320,6 +406,12 @@ pub unsafe extern "C" fn oxidb_create_unique_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_composite_index(
     conn: *mut OxiDbConn,
@@ -343,6 +435,12 @@ pub unsafe extern "C" fn oxidb_create_composite_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_text_index(
     conn: *mut OxiDbConn,
@@ -365,6 +463,12 @@ pub unsafe extern "C" fn oxidb_create_text_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_indexes(
     conn: *mut OxiDbConn,
@@ -378,6 +482,12 @@ pub unsafe extern "C" fn oxidb_list_indexes(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_drop_index(
     conn: *mut OxiDbConn,
@@ -396,6 +506,12 @@ pub unsafe extern "C" fn oxidb_drop_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_text_search(
     conn: *mut OxiDbConn,
@@ -418,12 +534,24 @@ pub unsafe extern "C" fn oxidb_text_search(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_collections(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "list_collections"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_collection(
     conn: *mut OxiDbConn,
@@ -437,6 +565,12 @@ pub unsafe extern "C" fn oxidb_create_collection(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_drop_collection(
     conn: *mut OxiDbConn,
@@ -450,6 +584,12 @@ pub unsafe extern "C" fn oxidb_drop_collection(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_aggregate(
     conn: *mut OxiDbConn,
@@ -476,6 +616,12 @@ pub unsafe extern "C" fn oxidb_aggregate(
 // Blob storage + FTS
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_bucket(
     conn: *mut OxiDbConn,
@@ -489,12 +635,24 @@ pub unsafe extern "C" fn oxidb_create_bucket(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_buckets(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "list_buckets"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete_bucket(
     conn: *mut OxiDbConn,
@@ -508,6 +666,12 @@ pub unsafe extern "C" fn oxidb_delete_bucket(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_put_object(
     conn: *mut OxiDbConn,
@@ -545,6 +709,12 @@ pub unsafe extern "C" fn oxidb_put_object(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_get_object(
     conn: *mut OxiDbConn,
@@ -563,6 +733,12 @@ pub unsafe extern "C" fn oxidb_get_object(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_head_object(
     conn: *mut OxiDbConn,
@@ -581,6 +757,12 @@ pub unsafe extern "C" fn oxidb_head_object(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete_object(
     conn: *mut OxiDbConn,
@@ -599,6 +781,12 @@ pub unsafe extern "C" fn oxidb_delete_object(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_objects(
     conn: *mut OxiDbConn,
@@ -620,6 +808,12 @@ pub unsafe extern "C" fn oxidb_list_objects(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_search(
     conn: *mut OxiDbConn,
@@ -645,24 +839,48 @@ pub unsafe extern "C" fn oxidb_search(
 // Transaction commands
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_begin_tx(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "begin_tx"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_commit_tx(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "commit_tx"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_rollback_tx(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "rollback_tx"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_sql(conn: *mut OxiDbConn, query: *const c_char) -> *mut c_char {
     let q = match unsafe { cstr_to_str(query) } {
@@ -677,6 +895,12 @@ pub unsafe extern "C" fn oxidb_sql(conn: *mut OxiDbConn, query: *const c_char) -
 // Cron scheduler
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_schedule(
     conn: *mut OxiDbConn,
@@ -694,12 +918,24 @@ pub unsafe extern "C" fn oxidb_create_schedule(
     unsafe { send_request(conn, &def) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_schedules(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "list_schedules"});
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_get_schedule(
     conn: *mut OxiDbConn,
@@ -713,6 +949,12 @@ pub unsafe extern "C" fn oxidb_get_schedule(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete_schedule(
     conn: *mut OxiDbConn,
@@ -726,6 +968,12 @@ pub unsafe extern "C" fn oxidb_delete_schedule(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_enable_schedule(
     conn: *mut OxiDbConn,
@@ -739,6 +987,12 @@ pub unsafe extern "C" fn oxidb_enable_schedule(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_disable_schedule(
     conn: *mut OxiDbConn,
@@ -756,6 +1010,12 @@ pub unsafe extern "C" fn oxidb_disable_schedule(
 // Vector index
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_create_vector_index(
     conn: *mut OxiDbConn,
@@ -783,6 +1043,12 @@ pub unsafe extern "C" fn oxidb_create_vector_index(
     unsafe { send_request(conn, &req) }
 }
 
+/// # Safety
+/// `conn` must be a live handle returned by [`oxidb_connect`] and not yet passed
+/// to [`oxidb_disconnect`]. Every other pointer argument must be either NULL or
+/// a valid, NUL-terminated C string that stays readable for the duration of the
+/// call. The returned string, when non-NULL, is owned by the caller and must be
+/// released with [`oxidb_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_vector_search(
     conn: *mut OxiDbConn,
@@ -834,6 +1100,11 @@ pub struct RawResponse {
     pub len: u32,
 }
 
+/// # Safety
+/// `conn` must be a live handle from [`oxidb_connect`]; `data` must point to
+/// `len` readable bytes; `out_len` must be a valid, writable `usize`. The
+/// returned buffer is owned by the caller and must be released with
+/// [`oxidb_free_raw`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_send_raw(
     conn: *mut OxiDbConn,
@@ -914,6 +1185,10 @@ pub unsafe extern "C" fn oxidb_execute(
 }
 
 /// Free a string returned by any `oxidb_*` function.
+///
+/// # Safety
+/// `s` must be a string returned by this library and not already freed. Each
+/// returned string must be freed exactly once. NULL is accepted and ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

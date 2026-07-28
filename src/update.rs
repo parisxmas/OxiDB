@@ -392,10 +392,10 @@ fn remove_field(doc: &mut Value, path: &str) {
             // removal shifts every later index, corrupting concurrent
             // positional logic ($set "arr.2", etc.) written against the
             // original positions.
-            if let Ok(idx) = last.parse::<usize>() {
-                if idx < arr.len() {
-                    arr[idx] = Value::Null;
-                }
+            if let Ok(idx) = last.parse::<usize>()
+                && idx < arr.len()
+            {
+                arr[idx] = Value::Null;
             }
         }
         _ => {}
@@ -416,7 +416,6 @@ fn number_to_value(n: f64) -> Value {
 // Tests
 // ===========================================================================
 
-
 /// Expand `arrayFilters` placeholders in an update document against a
 /// concrete target document: every operator key containing `$[ident]` (or
 /// the all-elements `$[]`) is rewritten into zero or more keys with real
@@ -425,11 +424,7 @@ fn number_to_value(n: f64) -> Value {
 /// placeholders multiply out. Keys whose placeholders match nothing are
 /// dropped (that operator becomes a no-op for this document, as in
 /// MongoDB).
-pub(crate) fn expand_array_filters(
-    doc: &Value,
-    update: &Value,
-    filters: &Value,
-) -> Result<Value> {
+pub(crate) fn expand_array_filters(doc: &Value, update: &Value, filters: &Value) -> Result<Value> {
     use crate::query;
     // ident -> parsed element filter
     let mut fmap: std::collections::HashMap<String, query::Query> =
@@ -461,13 +456,10 @@ pub(crate) fn expand_array_filters(
     ) -> Result<Vec<String>> {
         use crate::query;
         // (concrete path so far, current position in the doc)
-        let mut frontier: Vec<(String, Option<Value>)> =
-            vec![(String::new(), Some(doc.clone()))];
+        let mut frontier: Vec<(String, Option<Value>)> = vec![(String::new(), Some(doc.clone()))];
         for seg in key.split('.') {
             let mut next = Vec::new();
-            let ident: Option<&str> = seg
-                .strip_prefix("$[")
-                .and_then(|r| r.strip_suffix(']'));
+            let ident: Option<&str> = seg.strip_prefix("$[").and_then(|r| r.strip_suffix(']'));
             for (path, cur) in frontier {
                 match ident {
                     None => {

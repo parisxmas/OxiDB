@@ -221,11 +221,7 @@ pub fn parse_request_from_reader(
     };
 
     let mut headers = HashMap::new();
-    loop {
-        let hline = match read_line_bounded(reader, MAX_LINE_SIZE) {
-            Some(l) => l,
-            None => break,
-        };
+    while let Some(hline) = read_line_bounded(reader, MAX_LINE_SIZE) {
         let hline = hline.trim_end();
         if hline.is_empty() {
             break;
@@ -350,11 +346,7 @@ impl HttpRequest {
     pub fn client_meta(&self) -> ClientMeta<'_> {
         let h = |name: &str| self.headers.get(name).map(String::as_str).unwrap_or("");
         // The first hop of X-Forwarded-For is the client; the rest are proxies.
-        let forwarded = h("x-forwarded-for")
-            .split(',')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let forwarded = h("x-forwarded-for").split(',').next().unwrap_or("").trim();
         let ip = match h("cf-connecting-ip") {
             "" => match forwarded {
                 "" => h("x-real-ip"),
@@ -417,7 +409,10 @@ mod client_meta_tests {
         let bare = req(&[]);
         let meta = bare.client_meta();
         assert_eq!(meta.ip, "");
-        assert!(meta.fields().is_empty(), "nothing to log when nothing is known");
+        assert!(
+            meta.fields().is_empty(),
+            "nothing to log when nothing is known"
+        );
     }
 
     #[test]

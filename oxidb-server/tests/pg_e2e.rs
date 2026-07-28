@@ -76,6 +76,8 @@ impl Drop for ServerGuard {
 fn start(port: u16, data: &Path) -> ServerGuard {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join("server.log")).expect("create log");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_PG_PORT", port.to_string())
         .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))

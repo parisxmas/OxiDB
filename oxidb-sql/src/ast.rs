@@ -113,7 +113,10 @@ pub enum Statement {
 pub enum AlterOp {
     AddColumn(crate::catalog::Column),
     DropColumn(String),
-    RenameColumn { old: String, new: String },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
     /// `ALTER COLUMN <col> [SET DATA] TYPE <ty>` (PG) / `MODIFY COLUMN` (MySQL).
     /// Existing values are cast eagerly; any value that cannot cast aborts the
     /// statement before anything is written.

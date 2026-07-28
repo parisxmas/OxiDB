@@ -134,14 +134,15 @@ impl WormSet {
     /// Release is the only way to clear; it goes through `release()`.
     pub fn lock(&self, doc_id: u64, locked_until_micros: u64) -> Result<()> {
         let mut locks = self.locks.lock();
-        if let Some(&existing) = locks.get(&doc_id) {
-            if existing > 0 && locked_until_micros < existing {
-                return Err(Error::InvalidQuery(format!(
-                    "worm_lock: refuse to lower existing lock on doc {} \
+        if let Some(&existing) = locks.get(&doc_id)
+            && existing > 0
+            && locked_until_micros < existing
+        {
+            return Err(Error::InvalidQuery(format!(
+                "worm_lock: refuse to lower existing lock on doc {} \
                      (existing locked_until={} requested={})",
-                    doc_id, existing, locked_until_micros
-                )));
-            }
+                doc_id, existing, locked_until_micros
+            )));
         }
         let mut log = self.log.lock();
         write_record(&mut log, OP_LOCK, doc_id, locked_until_micros)?;

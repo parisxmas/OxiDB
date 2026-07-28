@@ -218,13 +218,12 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     if let (Ok(want_u), Ok(want_p)) = (
         std::env::var("OXIDB_MQTT_USER"),
         std::env::var("OXIDB_MQTT_PASSWORD"),
-    ) {
-        if username != want_u || password != want_p {
-            // 0x04 = bad user name or password
-            let _ = write_packet(&mut writer, CONNACK, 0, &[0x00, 0x04]);
-            let _ = writer.flush();
-            return;
-        }
+    ) && (username != want_u || password != want_p)
+    {
+        // 0x04 = bad user name or password
+        let _ = write_packet(&mut writer, CONNACK, 0, &[0x00, 0x04]);
+        let _ = writer.flush();
+        return;
     }
 
     // clean_session (conn flag bit 1). false => resume a persistent session and
@@ -335,10 +334,10 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                if let Some(limit) = ka_limit {
-                    if last_activity.elapsed() > limit {
-                        break; // keepalive expired → abnormal close (will fires)
-                    }
+                if let Some(limit) = ka_limit
+                    && last_activity.elapsed() > limit
+                {
+                    break; // keepalive expired → abnormal close (will fires)
                 }
                 continue;
             }
@@ -415,10 +414,11 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     // The dedup id itself must survive a crash for a durable
                     // publisher, or its post-restart retransmission fans out a
                     // second copy — exactly-once has to hold across the crash.
-                    if qos == 2 && durable {
-                        if let Some(pid) = ack_pkt_id {
-                            sessions.persist_rx2(&session_key, pid);
-                        }
+                    if qos == 2
+                        && durable
+                        && let Some(pid) = ack_pkt_id
+                    {
+                        sessions.persist_rx2(&session_key, pid);
                     }
                 }
 
@@ -589,10 +589,8 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     let acked = sessions.with(&session_key, |sess| {
                         sess.inflight.remove(&pkt_id).map(|inf| inf.seq)
                     });
-                    if durable {
-                        if let Some(Some(seq)) = acked {
-                            sessions.ack_durable(&session_key, seq);
-                        }
+                    if durable && let Some(Some(seq)) = acked {
+                        sessions.ack_durable(&session_key, seq);
                     }
                 }
             }
@@ -624,11 +622,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                             inf.seq
                         })
                     });
-                    if durable {
-                        if let Some(Some(seq)) = acked {
-                            sessions.ack_durable(&session_key, seq);
-                            sessions.persist_rel(&session_key, pid);
-                        }
+                    if durable && let Some(Some(seq)) = acked {
+                        sessions.ack_durable(&session_key, seq);
+                        sessions.persist_rel(&session_key, pid);
                     }
                     // Always answer — a duplicate PUBREC means our PUBREL was
                     // lost, and the reply is the same either way (MQTT-4.3.3).
@@ -675,17 +671,15 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
 
     // Last Will: published on any abnormal termination (socket error or
     // keepalive expiry) — a clean DISCONNECT discards it (MQTT-3.14.4-3).
-    if !clean_close {
-        if let Some((wt, wm)) = &will {
-            if will_retain {
-                store.retain_set(wt, wm);
-            }
-            store.publish(wt, wm);
-            // The will crosses the bridge like any other publish would have.
-            crate::amqp_queue::AmqpBroker::global().publish_from_mqtt(wt, wm.as_bytes(), 0);
-            if log {
-                eprintln!("[mqtt] will published topic=\"{wt}\"");
-            }
+    if !clean_close && let Some((wt, wm)) = &will {
+        if will_retain {
+            store.retain_set(wt, wm);
+        }
+        store.publish(wt, wm);
+        // The will crosses the bridge like any other publish would have.
+        crate::amqp_queue::AmqpBroker::global().publish_from_mqtt(wt, wm.as_bytes(), 0);
+        if log {
+            eprintln!("[mqtt] will published topic=\"{wt}\"");
         }
     }
 

@@ -311,13 +311,13 @@ impl HnswGraph {
                         if let Some(nv) = vectors.get(&neighbor_doc) {
                             let mut scored: Vec<(f32, usize)> = self.nodes[neighbor_idx].layers[l]
                                 .iter()
-                                .filter_map(|&ni| {
+                                .map(|&ni| {
                                     let nd = self.nodes[ni].doc_id;
                                     let d = vectors
                                         .get(&nd)
                                         .map(|v| compute_distance(nv, v, metric))
                                         .unwrap_or(f32::INFINITY);
-                                    Some((d, ni))
+                                    (d, ni)
                                 })
                                 .collect();
                             scored.sort_by(|a, b| {

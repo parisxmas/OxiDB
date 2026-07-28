@@ -71,10 +71,13 @@ pub fn global() -> Arc<SharedBytes> {
     static G: OnceLock<Arc<SharedBytes>> = OnceLock::new();
     Arc::clone(G.get_or_init(|| Arc::new(SharedBytes::new(default_capacity()))))
 }
+/// One lock-striped shard. `None` until the shard is first used, so an
+/// untouched cache costs a lock and nothing else.
+type CacheShard = Mutex<Option<LruCache<CacheKey, Arc<[u8]>>>>;
 
 pub struct SharedBytes {
     per_shard_cap: AtomicUsize,
-    shards: Vec<Mutex<Option<LruCache<CacheKey, Arc<[u8]>>>>>,
+    shards: Vec<CacheShard>,
     hits: AtomicU64,
     misses: AtomicU64,
 }

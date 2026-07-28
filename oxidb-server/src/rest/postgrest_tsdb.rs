@@ -19,6 +19,7 @@
 //! - extension params `agg` (default `mean`; `p` for percentile), `interval`
 //!   (GROUP BY time, ms) and `group_by` (tags) shape the aggregation.
 //! - `order=ts.desc` and `limit` apply to the flattened output.
+//!
 //! The series result is **flattened to rows** — one `{ts, value, <tags…>}` per
 //! point — so it looks like every other PostgREST response.
 //!

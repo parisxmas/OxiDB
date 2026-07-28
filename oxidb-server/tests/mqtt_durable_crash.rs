@@ -45,6 +45,8 @@ fn test_port(base: u16, span_per_pid: u16) -> u16 {
 fn start(port: u16, data: &Path, log: &str) -> Child {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create broker log");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_MQTT_PERSIST", "1")
         .env("OXIDB_MQTT_PORT", port.to_string())
@@ -54,7 +56,8 @@ fn start(port: u16, data: &Path, log: &str) -> Child {
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {  // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
+    for _ in 0..600 {
+        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return child;
         }
@@ -69,7 +72,21 @@ fn read_log(data: &Path, log: &str) -> String {
 
 fn subscribe_and_leave(port: u16, id: &str, topic: &str) {
     let _ = Command::new("mosquitto_sub")
-        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-i", id, "-c", "-q", "1", "-t", topic, "-W", "1"])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-i",
+            id,
+            "-c",
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-W",
+            "1",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -77,7 +94,18 @@ fn subscribe_and_leave(port: u16, id: &str, topic: &str) {
 
 fn publish_q1(port: u16, topic: &str, msg: &str) {
     let _ = Command::new("mosquitto_pub")
-        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-q", "1", "-t", topic, "-m", msg])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-m",
+            msg,
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -85,7 +113,23 @@ fn publish_q1(port: u16, topic: &str, msg: &str) {
 
 fn sub_once(port: u16, id: &str, topic: &str, wait: u32) -> String {
     let out = Command::new("mosquitto_sub")
-        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-i", id, "-c", "-q", "1", "-t", topic, "-C", "1", "-W", &wait.to_string()])
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-i",
+            id,
+            "-c",
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-C",
+            "1",
+            "-W",
+            &wait.to_string(),
+        ])
         .output()
         .expect("run mosquitto_sub");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -126,7 +170,8 @@ fn an_acked_qos1_message_survives_sigkill() {
     broker2.wait().ok();
 
     assert_eq!(
-        got, "survives-the-kill",
+        got,
+        "survives-the-kill",
         "an acknowledged QoS-1 message must survive a SIGKILL and be redelivered \
          after restart — this is the whole point of OXIDB_MQTT_PERSIST\n\
          --- broker1 (pre-kill) stderr ---\n{}\n--- broker2 (recovery) stderr ---\n{}",
@@ -152,7 +197,10 @@ fn a_delivered_and_acked_message_is_not_redelivered_after_a_crash() {
 
     // Reconnect and CONSUME it (the sub PUBACKs on receipt), then it is done.
     let got = sub_once(port, "ack-sub", "ack/topic", 3);
-    assert_eq!(got, "consume-me", "precondition: the message is delivered and acked");
+    assert_eq!(
+        got, "consume-me",
+        "precondition: the message is delivered and acked"
+    );
     std::thread::sleep(Duration::from_millis(400));
 
     // Crash and restart. The acked message must NOT come back — an at-least-once

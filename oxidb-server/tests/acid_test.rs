@@ -97,6 +97,8 @@ impl TestServer {
 fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
     let mut active_tx: Option<u64> = None;
 
+    // The explicit arms document what ends the loop.
+    #[allow(clippy::while_let_loop)]
     loop {
         let msg = match read_message(&mut stream) {
             Ok(m) => m,

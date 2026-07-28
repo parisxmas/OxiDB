@@ -14,12 +14,12 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::SqlEngine;
 use crate::catalog::{IndexDef, Table};
 use crate::error::{Result, SqlError};
 use crate::store::Store;
 use crate::types::{IndexKey, KeyTuple, Value};
 use crate::wal::WalRecord;
-use crate::SqlEngine;
 
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
 type RowChange = Option<Vec<Value>>;
@@ -106,8 +106,10 @@ pub(crate) struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     pub(crate) fn new(engine: &'a SqlEngine) -> Self {
-        let mut state = TxnState::default();
-        state.lock_owner = engine.alloc_lock_owner();
+        let state = TxnState {
+            lock_owner: engine.alloc_lock_owner(),
+            ..TxnState::default()
+        };
         Transaction {
             engine,
             state: RefCell::new(state),
@@ -370,8 +372,7 @@ impl<'a> Transaction<'a> {
             if let Some(cells) = cells
                 && !c.cols.iter().any(|&p| matches!(cells[p], Value::Null))
             {
-                let key: KeyTuple =
-                    c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+                let key: KeyTuple = c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
                 c.map.insert(key, row_id);
             }
         }

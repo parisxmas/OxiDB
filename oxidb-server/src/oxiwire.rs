@@ -173,7 +173,7 @@ fn ok_docs_response_parallel(docs: &[Arc<Value>]) -> Vec<u8> {
         return ok_docs_response(docs);
     }
 
-    let chunk_size = (docs.len() + num_cpus - 1) / num_cpus;
+    let chunk_size = docs.len().div_ceil(num_cpus);
 
     let chunk_bufs: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = docs
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn decode_roundtrip_array() {
-        let original = json!([1, "hello", null, false, 3.14]);
+        let original = json!([1, "hello", null, false, 2.75]);
         let mut buf = Vec::new();
         encode_value(&original, &mut buf);
         let mut pos = 0;

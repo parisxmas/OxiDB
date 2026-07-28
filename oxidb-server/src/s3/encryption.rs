@@ -4,8 +4,8 @@
 //!   Triggered by header `x-amz-server-side-encryption: AES256`.
 //! - **SSE-C**: Customer-provided key per request.
 //!   Headers: `x-amz-server-side-encryption-customer-algorithm: AES256`,
-//!            `x-amz-server-side-encryption-customer-key: <base64 32-byte key>`,
-//!            `x-amz-server-side-encryption-customer-key-md5: <base64 MD5 of key>`.
+//!   `x-amz-server-side-encryption-customer-key: <base64 32-byte key>`,
+//!   `x-amz-server-side-encryption-customer-key-md5: <base64 MD5 of key>`.
 //! - **Default bucket encryption**: If `OXIDB_S3_DEFAULT_ENCRYPTION=true`, all PUTs
 //!   without explicit encryption headers are auto-encrypted with the server key.
 
@@ -163,10 +163,10 @@ pub fn parse_sse_headers(
     }
 
     // Default encryption if configured
-    if let Some(enc) = server_encryption {
-        if enc.default_encryption {
-            return Ok(SseMode::S3);
-        }
+    if let Some(enc) = server_encryption
+        && enc.default_encryption
+    {
+        return Ok(SseMode::S3);
     }
 
     Ok(SseMode::None)

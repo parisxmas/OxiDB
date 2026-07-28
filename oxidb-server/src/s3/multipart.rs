@@ -5,8 +5,8 @@ use super::encryption::{
     SseMode, add_encryption_headers, encrypt_data, parse_sse_headers, sse_metadata_marker,
 };
 use super::helpers::{md5_hex, xml_escape};
-use md5::{Digest, Md5};
 use super::http::{HttpRequest, HttpResponse, error_response};
+use md5::{Digest, Md5};
 
 pub fn handle_create_multipart(
     state: &S3State,

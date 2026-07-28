@@ -4,9 +4,11 @@ use md5::{Digest, Md5};
 
 /// Hex MD5 — the form S3 uses for every ETag it hands out.
 pub fn md5_hex(data: &[u8]) -> String {
-    Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Md5::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
-
 
 pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -73,7 +75,7 @@ pub fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
 pub fn extract_xml_tag_pairs(xml: &str) -> Vec<(String, String)> {
     let keys = extract_xml_values(xml, "Key");
     let values = extract_xml_values(xml, "Value");
-    keys.into_iter().zip(values.into_iter()).collect()
+    keys.into_iter().zip(values).collect()
 }
 
 /// Convert ISO 8601 timestamp (e.g. "2026-03-17T17:03:25Z") to HTTP-date (RFC 7231).
@@ -181,6 +183,10 @@ mod tests {
         // The canonical MD5 of "hello world" — if this drifts, every S3 client
         // that verifies an ETag starts reporting corrupted uploads.
         assert_eq!(md5_hex(b"hello world"), "5eb63bbbe01eeed093cb22bb8f5acdc3");
-        assert_eq!(md5_hex(b"").len(), 32, "even an empty object has a 32-char ETag");
+        assert_eq!(
+            md5_hex(b"").len(),
+            32,
+            "even an empty object has a 32-char ETag"
+        );
     }
 }

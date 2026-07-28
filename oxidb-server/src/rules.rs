@@ -362,10 +362,10 @@ fn remove_rules(db: &OxiDb, collection: &str) {
         return;
     };
     for d in docs {
-        if d.get("collection").and_then(|v| v.as_str()) == Some(collection) {
-            if let Some(id) = d.get("_id") {
-                let _ = db.delete(RULES_COLLECTION, &json!({ "_id": id }));
-            }
+        if d.get("collection").and_then(|v| v.as_str()) == Some(collection)
+            && let Some(id) = d.get("_id")
+        {
+            let _ = db.delete(RULES_COLLECTION, &json!({ "_id": id }));
         }
     }
 }

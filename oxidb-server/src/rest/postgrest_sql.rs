@@ -387,15 +387,15 @@ fn group(kw: &str, raw: &str, params: &mut Vec<Value>) -> PgResult<String> {
 
 /// A condition inside a logic group: `col.op.value` or a nested `or(...)`/`and(...)`.
 fn dotted_condition(cond: &str, params: &mut Vec<Value>) -> PgResult<String> {
-    if let Some(rest) = cond.strip_prefix("or") {
-        if rest.starts_with('(') {
-            return group("OR", rest, params);
-        }
+    if let Some(rest) = cond.strip_prefix("or")
+        && rest.starts_with('(')
+    {
+        return group("OR", rest, params);
     }
-    if let Some(rest) = cond.strip_prefix("and") {
-        if rest.starts_with('(') {
-            return group("AND", rest, params);
-        }
+    if let Some(rest) = cond.strip_prefix("and")
+        && rest.starts_with('(')
+    {
+        return group("AND", rest, params);
     }
     let (col, spec) = cond.split_once('.').ok_or((
         400,
@@ -646,10 +646,11 @@ fn distinct_values(rows: &[Value], field: &str) -> Vec<Value> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for r in rows {
-        if let Some(v) = r.get(field) {
-            if !v.is_null() && seen.insert(key(v)) {
-                out.push(v.clone());
-            }
+        if let Some(v) = r.get(field)
+            && !v.is_null()
+            && seen.insert(key(v))
+        {
+            out.push(v.clone());
         }
     }
     out

@@ -21,6 +21,12 @@ pub struct IndexBundle {
     pub ttl_index: std::collections::BTreeMap<u64, Vec<DocumentId>>,
 }
 
+impl Default for IndexBundle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndexBundle {
     /// Create an empty index bundle.
     pub fn new() -> Self {

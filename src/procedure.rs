@@ -1007,7 +1007,7 @@ mod tests {
 
     /// Helper: compile OxiScript source and execute with params
     fn run_oxiscript(db: &OxiDb, src: &str, params: Value) -> Result<Value> {
-        let compiled = crate::oxiscript::compile(src).map_err(|e| Error::ProcedureError(e))?;
+        let compiled = crate::oxiscript::compile(src).map_err(Error::ProcedureError)?;
         // Register procedure so call_procedure can find it
         let name = compiled["name"].as_str().unwrap().to_string();
         db.create_procedure(&name, compiled)?;
@@ -1016,7 +1016,7 @@ mod tests {
 
     /// Helper: compile multiple procs, register all, call the last one
     fn run_oxiscript_multi(db: &OxiDb, src: &str, call_name: &str, params: Value) -> Result<Value> {
-        let procs = crate::oxiscript::compile_all(src).map_err(|e| Error::ProcedureError(e))?;
+        let procs = crate::oxiscript::compile_all(src).map_err(Error::ProcedureError)?;
         for p in &procs {
             let name = p["name"].as_str().unwrap().to_string();
             db.create_procedure(&name, p.clone())?;

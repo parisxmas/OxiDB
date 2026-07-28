@@ -144,12 +144,12 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
             // stage) fall through to Passthrough, concatenating per-shard
             // ranks/running totals as if they were global.
             for stage in pipeline {
-                if let Some((name, _)) = stage_parts(stage) {
-                    if !is_streaming_safe(name) {
-                        return SplitPlan::Unsupported(format!(
-                            "stage {name} is not supported in cross-shard aggregation"
-                        ));
-                    }
+                if let Some((name, _)) = stage_parts(stage)
+                    && !is_streaming_safe(name)
+                {
+                    return SplitPlan::Unsupported(format!(
+                        "stage {name} is not supported in cross-shard aggregation"
+                    ));
                 }
             }
             return SplitPlan::Passthrough;
@@ -161,12 +161,12 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
     // (It can't contain a reducing stage by construction; verify it's a stage
     // shape we recognize as safe.)
     for stage in &pipeline[..boundary] {
-        if let Some((name, _)) = stage_parts(stage) {
-            if !is_streaming_safe(name) {
-                return SplitPlan::Unsupported(format!(
-                    "stage {name} before the first reducing stage is not supported across shards"
-                ));
-            }
+        if let Some((name, _)) = stage_parts(stage)
+            && !is_streaming_safe(name)
+        {
+            return SplitPlan::Unsupported(format!(
+                "stage {name} before the first reducing stage is not supported across shards"
+            ));
         }
     }
 
@@ -190,9 +190,8 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
             // subset of the union of per-shard top-(S+N)s. The merge
             // re-sorts and the tail re-applies the real skip/limit.
             let mut shard = vec![blocker.clone()];
-            match window_bound(tail) {
-                Some(bound) => shard.push(json!({ "$limit": bound })),
-                None => {}
+            if let Some(bound) = window_bound(tail) {
+                shard.push(json!({ "$limit": bound }))
             }
             (shard, vec![blocker.clone()])
         }
@@ -208,10 +207,9 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
             let mut shard = vec![];
             if let (Some(s), Some(("$limit", tb))) =
                 (body.as_u64(), tail.first().and_then(stage_parts))
+                && let Some(n) = tb.as_u64()
             {
-                if let Some(n) = tb.as_u64() {
-                    shard.push(json!({ "$limit": s.saturating_add(n) }));
-                }
+                shard.push(json!({ "$limit": s.saturating_add(n) }));
             }
             (shard, vec![blocker.clone()])
         }

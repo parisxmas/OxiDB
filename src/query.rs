@@ -94,37 +94,37 @@ pub struct FindOptions {
 pub fn parse_find_options(request: &JsonValue) -> Result<FindOptions> {
     let mut opts = FindOptions::default();
 
-    if let Some(sort_val) = request.get("sort") {
-        if let Some(obj) = sort_val.as_object() {
-            let mut sort_fields = Vec::new();
-            for (field, dir) in obj {
-                let order = match dir.as_i64() {
-                    Some(1) => SortOrder::Asc,
-                    Some(-1) => SortOrder::Desc,
-                    _ => {
-                        return Err(Error::InvalidQuery(
-                            "sort direction must be 1 (asc) or -1 (desc)".into(),
-                        ));
-                    }
-                };
-                sort_fields.push((field.clone(), order));
-            }
-            if !sort_fields.is_empty() {
-                opts.sort = Some(sort_fields);
-            }
+    if let Some(sort_val) = request.get("sort")
+        && let Some(obj) = sort_val.as_object()
+    {
+        let mut sort_fields = Vec::new();
+        for (field, dir) in obj {
+            let order = match dir.as_i64() {
+                Some(1) => SortOrder::Asc,
+                Some(-1) => SortOrder::Desc,
+                _ => {
+                    return Err(Error::InvalidQuery(
+                        "sort direction must be 1 (asc) or -1 (desc)".into(),
+                    ));
+                }
+            };
+            sort_fields.push((field.clone(), order));
+        }
+        if !sort_fields.is_empty() {
+            opts.sort = Some(sort_fields);
         }
     }
 
-    if let Some(skip_val) = request.get("skip") {
-        if let Some(n) = skip_val.as_u64() {
-            opts.skip = Some(n);
-        }
+    if let Some(skip_val) = request.get("skip")
+        && let Some(n) = skip_val.as_u64()
+    {
+        opts.skip = Some(n);
     }
 
-    if let Some(limit_val) = request.get("limit") {
-        if let Some(n) = limit_val.as_u64() {
-            opts.limit = Some(n);
-        }
+    if let Some(limit_val) = request.get("limit")
+        && let Some(n) = limit_val.as_u64()
+    {
+        opts.limit = Some(n);
     }
 
     Ok(opts)
@@ -497,10 +497,10 @@ fn parse_expr(val: &JsonValue) -> Result<ExprCondition> {
 }
 
 fn parse_expr_arg(val: &JsonValue) -> ExprArg {
-    if let Some(s) = val.as_str() {
-        if let Some(field) = s.strip_prefix('$') {
-            return ExprArg::FieldRef(field.to_string());
-        }
+    if let Some(s) = val.as_str()
+        && let Some(field) = s.strip_prefix('$')
+    {
+        return ExprArg::FieldRef(field.to_string());
     }
     ExprArg::Literal(IndexValue::from_json(val))
 }

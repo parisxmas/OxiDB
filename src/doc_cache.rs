@@ -48,6 +48,9 @@ pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY_FALLBACK;
 /// Must be a power of two for fast modulo via bitmask.
 const NUM_SHARDS: usize = 16;
 const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
+/// One lock-striped shard. `None` until the shard is first used, so an
+/// untouched cache costs a lock and nothing else.
+type CacheShard = Mutex<Option<LruCache<CacheKey, Arc<Value>>>>;
 
 /// A bounded, sharded LRU document cache with interior mutability.
 ///
@@ -69,7 +72,7 @@ pub struct Shared {
     /// NonZeroUsize) so resize is lock-free; constructor + readers
     /// enforce the `>= 1` invariant.
     per_shard_cap: AtomicUsize,
-    shards: Vec<Mutex<Option<LruCache<CacheKey, Arc<Value>>>>>,
+    shards: Vec<CacheShard>,
     /// Cumulative cache hits (Relaxed — counter is observational, not
     /// load-bearing; missing a few under contention is fine).
     hits: AtomicU64,
@@ -223,6 +226,10 @@ impl Shared {
     }
 
     /// Number of entries currently in the cache.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         self.shards
             .iter()

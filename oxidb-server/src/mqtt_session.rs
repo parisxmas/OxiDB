@@ -189,10 +189,30 @@ impl Session {
             if qos >= 1 {
                 let qos = qos.min(2);
                 let pid = self.next_id();
-                self.inflight.insert(pid, Inflight { topic: topic.clone(), message: message.clone(), seq, qos });
-                out.push(Delivery { topic, message, qos, pkt_id: pid, dup: false });
+                self.inflight.insert(
+                    pid,
+                    Inflight {
+                        topic: topic.clone(),
+                        message: message.clone(),
+                        seq,
+                        qos,
+                    },
+                );
+                out.push(Delivery {
+                    topic,
+                    message,
+                    qos,
+                    pkt_id: pid,
+                    dup: false,
+                });
             } else {
-                out.push(Delivery { topic, message, qos: 0, pkt_id: 0, dup: false });
+                out.push(Delivery {
+                    topic,
+                    message,
+                    qos: 0,
+                    pkt_id: 0,
+                    dup: false,
+                });
             }
         }
         (out, rels)
@@ -266,8 +286,12 @@ impl MqttSessions {
     /// subscription — its receiver is a dead channel — so recovery does not need
     /// the store at all.
     fn recover(&self, db: &Arc<OxiDb>) -> (usize, usize) {
-        let subs = db.find(MQTT_COLLECTION, &json!({ "_kind": "sub" })).unwrap_or_default();
-        let msgs = db.find(MQTT_COLLECTION, &json!({ "_kind": "msg" })).unwrap_or_default();
+        let subs = db
+            .find(MQTT_COLLECTION, &json!({ "_kind": "sub" }))
+            .unwrap_or_default();
+        let msgs = db
+            .find(MQTT_COLLECTION, &json!({ "_kind": "msg" }))
+            .unwrap_or_default();
 
         let mut map = self.inner.lock().unwrap();
         let mut max_seq = 0u64;
@@ -346,7 +370,10 @@ impl MqttSessions {
         // Both are per-client sets; a client can have these with no live subs
         // (it unsubscribed mid-handshake), so entries create sessions too.
         for kind in ["rel", "rx2"] {
-            for doc in db.find(MQTT_COLLECTION, &json!({ "_kind": kind })).unwrap_or_default() {
+            for doc in db
+                .find(MQTT_COLLECTION, &json!({ "_kind": kind }))
+                .unwrap_or_default()
+            {
                 let (Some(client), Some(pkt_id)) = (
                     doc.get("client").and_then(|v| v.as_str()),
                     doc.get("pkt_id").and_then(|v| v.as_u64()),
@@ -388,17 +415,20 @@ impl MqttSessions {
     /// clean_start on a durable client also wipes its persisted records, so a
     /// deliberate fresh start does not silently resume from disk.
     pub fn attach_durable(&self, client_id: &str, clean_start: bool, durable: bool) -> (bool, u64) {
-        if clean_start && durable {
-            if let Some(db) = self.db() {
-                let _ = db.delete(MQTT_COLLECTION, &json!({ "client": client_id }));
-            }
+        if clean_start
+            && durable
+            && let Some(db) = self.db()
+        {
+            let _ = db.delete(MQTT_COLLECTION, &json!({ "client": client_id }));
         }
         let mut map = self.inner.lock().unwrap();
         if clean_start {
             map.remove(client_id);
         }
         let existed = map.contains_key(client_id);
-        let sess = map.entry(client_id.to_string()).or_insert_with(Session::new);
+        let sess = map
+            .entry(client_id.to_string())
+            .or_insert_with(Session::new);
         sess.connected = true;
         sess.durable = durable;
         sess.generation = sess.generation.wrapping_add(1);
@@ -509,7 +539,8 @@ impl MqttSessions {
                 writes.push((client.clone(), seq, qos));
                 // Enqueue in memory now so a connected session delivers promptly;
                 // the durable record below is what survives a crash.
-                sess.queue.push_back((topic.to_string(), message.to_string(), qos, Some(seq)));
+                sess.queue
+                    .push_back((topic.to_string(), message.to_string(), qos, Some(seq)));
                 while sess.queue.len() > MAX_QUEUED {
                     // The bound applies to disk too: a dropped message's durable
                     // record must go with it, or a dead consumer grows the
@@ -606,7 +637,10 @@ impl MqttSessions {
     /// restart. Empty payload clears (MQTT-3.3.1-11).
     pub fn persist_retained(&self, topic: &str, message: &str) {
         if let Some(db) = self.db() {
-            let _ = db.delete(MQTT_COLLECTION, &json!({ "_kind": "retain", "topic": topic }));
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "retain", "topic": topic }),
+            );
             if !message.is_empty() {
                 let _ = db.insert(
                     MQTT_COLLECTION,
@@ -619,7 +653,10 @@ impl MqttSessions {
     /// Restore retained messages into the store on startup.
     pub fn recover_retained(&self, store: &crate::oximem::OxiMemStore) {
         if let Some(db) = self.db() {
-            for doc in db.find(MQTT_COLLECTION, &json!({ "_kind": "retain" })).unwrap_or_default() {
+            for doc in db
+                .find(MQTT_COLLECTION, &json!({ "_kind": "retain" }))
+                .unwrap_or_default()
+            {
                 if let (Some(t), Some(p)) = (
                     doc.get("topic").and_then(|v| v.as_str()),
                     doc.get("payload").and_then(|v| v.as_str()),
@@ -691,14 +728,26 @@ mod tests {
         assert!(!present, "first connect has nothing to resume");
         reg.with("c2", |s| {
             s.subs.push(sub("topic"));
-            s.inflight.insert(7, Inflight { topic: "t".into(), message: "m".into(), seq: None, qos: 1 });
+            s.inflight.insert(
+                7,
+                Inflight {
+                    topic: "t".into(),
+                    message: "m".into(),
+                    seq: None,
+                    qos: 1,
+                },
+            );
         });
         reg.detach("c2", g, true); // persistent
 
         let (present, _) = reg.attach("c2", false);
         assert!(present, "the session must resume");
         assert_eq!(reg.with("c2", |s| s.subs.len()), Some(1));
-        assert_eq!(reg.with("c2", |s| s.inflight.len()), Some(1), "inflight survives to be resent");
+        assert_eq!(
+            reg.with("c2", |s| s.inflight.len()),
+            Some(1),
+            "inflight survives to be resent"
+        );
     }
 
     #[test]
@@ -738,7 +787,9 @@ mod tests {
         assert_eq!(len, MAX_QUEUED, "the queue is capped");
         assert_eq!(dropped, 100, "the overflow is counted, not silent");
         // Drop-oldest: the newest message survived, the oldest did not.
-        let newest = reg.with("c4", |s| s.queue.back().unwrap().1.clone()).unwrap(); // .1 = payload
+        let newest = reg
+            .with("c4", |s| s.queue.back().unwrap().1.clone())
+            .unwrap(); // .1 = payload
         assert_eq!(newest, format!("{}", MAX_QUEUED + 99));
     }
 

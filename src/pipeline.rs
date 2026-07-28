@@ -479,9 +479,8 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
         match current {
             Value::Object(map) => {
                 if let Some(idx) = part.parse::<usize>().ok().filter(|_| {
-                    map.get(*part)
-                        .map_or(false, |v| v.is_array() || v.is_object())
-                        == false
+                    !map.get(*part)
+                        .is_some_and(|v| v.is_array() || v.is_object())
                         && !map.contains_key(*part)
                 }) {
                     // Numeric key but no existing entry — can't create array out of thin air
@@ -489,10 +488,11 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
                     map.insert(part.to_string(), json!({}));
                 } else if !map.contains_key(*part) {
                     map.insert(part.to_string(), json!({}));
-                } else if let Some(v) = map.get(*part) {
-                    if !v.is_object() && !v.is_array() {
-                        map.insert(part.to_string(), json!({}));
-                    }
+                } else if let Some(v) = map.get(*part)
+                    && !v.is_object()
+                    && !v.is_array()
+                {
+                    map.insert(part.to_string(), json!({}));
                 }
                 current = map.get_mut(*part).unwrap();
             }
@@ -535,7 +535,7 @@ fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
     }
@@ -1524,11 +1524,12 @@ fn exec_fill(
                             continue;
                         }
                         for i in (a + 1)..b {
-                            if ys[i].is_none() && is_missing(&part[i], field) {
-                                if let Some(x) = xs[i] {
-                                    let y = ya + (yb - ya) * (x - xa) / (xb - xa);
-                                    set_field(&mut part[i], field, json!(y));
-                                }
+                            if ys[i].is_none()
+                                && is_missing(&part[i], field)
+                                && let Some(x) = xs[i]
+                            {
+                                let y = ya + (yb - ya) * (x - xa) / (xb - xa);
+                                set_field(&mut part[i], field, json!(y));
                             }
                         }
                     }
@@ -2463,10 +2464,10 @@ fn update_accumulator(state: &mut AccumulatorState, acc: &Accumulator, doc: &Val
             }
         }
         (Accumulator::Percentile(expr, _), AccumulatorState::Percentile { values, .. }) => {
-            if let Some(n) = expr.eval_num(doc) {
-                if n.is_finite() {
-                    values.push(n);
-                }
+            if let Some(n) = expr.eval_num(doc)
+                && n.is_finite()
+            {
+                values.push(n);
             }
         }
         _ => {}
@@ -2489,28 +2490,28 @@ fn update_accumulator_raw(state: &mut AccumulatorState, acc: &Accumulator, raw: 
             }
         }
         (Accumulator::Min(expr), AccumulatorState::Min(current)) => {
-            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
-                if let Some(new_iv) = raw_to_index_value(&owned) {
-                    let should_replace = match current {
-                        None => true,
-                        Some((_, cur_iv)) => new_iv < *cur_iv,
-                    };
-                    if should_replace {
-                        *current = Some((raw_owned_to_value(&owned), new_iv));
-                    }
+            if let Some(owned) = eval_expr_raw_owned(expr, raw)
+                && let Some(new_iv) = raw_to_index_value(&owned)
+            {
+                let should_replace = match current {
+                    None => true,
+                    Some((_, cur_iv)) => new_iv < *cur_iv,
+                };
+                if should_replace {
+                    *current = Some((raw_owned_to_value(&owned), new_iv));
                 }
             }
         }
         (Accumulator::Max(expr), AccumulatorState::Max(current)) => {
-            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
-                if let Some(new_iv) = raw_to_index_value(&owned) {
-                    let should_replace = match current {
-                        None => true,
-                        Some((_, cur_iv)) => new_iv > *cur_iv,
-                    };
-                    if should_replace {
-                        *current = Some((raw_owned_to_value(&owned), new_iv));
-                    }
+            if let Some(owned) = eval_expr_raw_owned(expr, raw)
+                && let Some(new_iv) = raw_to_index_value(&owned)
+            {
+                let should_replace = match current {
+                    None => true,
+                    Some((_, cur_iv)) => new_iv > *cur_iv,
+                };
+                if should_replace {
+                    *current = Some((raw_owned_to_value(&owned), new_iv));
                 }
             }
         }
@@ -2518,10 +2519,10 @@ fn update_accumulator_raw(state: &mut AccumulatorState, acc: &Accumulator, raw: 
             *c += 1;
         }
         (Accumulator::First(expr), AccumulatorState::First(current)) => {
-            if current.is_none() {
-                if let Some(owned) = eval_expr_raw_owned(expr, raw) {
-                    *current = Some(raw_owned_to_value(&owned));
-                }
+            if current.is_none()
+                && let Some(owned) = eval_expr_raw_owned(expr, raw)
+            {
+                *current = Some(raw_owned_to_value(&owned));
             }
         }
         (Accumulator::Last(expr), AccumulatorState::Last(current)) => {
@@ -2777,10 +2778,8 @@ fn exec_project(docs: Vec<Value>, fields: &[(String, ProjectionField)]) -> Vec<V
                 // produces the nested {"address": {"city": ..}} structure
                 // (MongoDB), not a flattened literal "address.city" key.
                 let mut out = Value::Object(Map::new());
-                if !id_excluded {
-                    if let Some(id_val) = doc.as_object().and_then(|m| m.get("_id")) {
-                        set_field(&mut out, "_id", id_val.clone());
-                    }
+                if !id_excluded && let Some(id_val) = doc.as_object().and_then(|m| m.get("_id")) {
+                    set_field(&mut out, "_id", id_val.clone());
                 }
 
                 for (name, pf) in fields {
@@ -3404,7 +3403,9 @@ pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<(
         let parts: Vec<&str> = path.split('.').collect();
         let mut cur = doc;
         for (i, part) in parts.iter().enumerate() {
-            let Some(obj) = cur.as_object_mut() else { return };
+            let Some(obj) = cur.as_object_mut() else {
+                return;
+            };
             if i == parts.len() - 1 {
                 obj.remove(*part);
                 return;
@@ -3421,7 +3422,10 @@ pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<(
         .ok_or_else(|| Error::InvalidQuery("pipeline update must be an array".into()))?;
     let kept_id = doc.get("_id").cloned();
     for st in stages {
-        let Some((name, arg)) = st.as_object().filter(|o| o.len() == 1).and_then(|o| o.iter().next())
+        let Some((name, arg)) = st
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .and_then(|o| o.iter().next())
         else {
             return Err(Error::InvalidQuery(
                 "each update pipeline stage must be a single-key object".into(),
@@ -3429,9 +3433,9 @@ pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<(
         };
         match name.as_str() {
             "$set" | "$addFields" => {
-                let fields = arg.as_object().ok_or_else(|| {
-                    Error::InvalidQuery(format!("{name} requires an object"))
-                })?;
+                let fields = arg
+                    .as_object()
+                    .ok_or_else(|| Error::InvalidQuery(format!("{name} requires an object")))?;
                 // Evaluate against the PRE-stage document, then assign.
                 let mut computed = Vec::with_capacity(fields.len());
                 for (path, expr_json) in fields {
@@ -3480,12 +3484,11 @@ pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<(
                 *doc = new_root;
             }
             "$project" => {
-                let fields = arg.as_object().ok_or_else(|| {
-                    Error::InvalidQuery("$project requires an object".into())
-                })?;
-                let truthy = |v: &Value| {
-                    v.as_i64().map(|n| n != 0).or(v.as_bool()).unwrap_or(false)
-                };
+                let fields = arg
+                    .as_object()
+                    .ok_or_else(|| Error::InvalidQuery("$project requires an object".into()))?;
+                let truthy =
+                    |v: &Value| v.as_i64().map(|n| n != 0).or(v.as_bool()).unwrap_or(false);
                 let inclusion = fields
                     .iter()
                     .any(|(k, v)| k != "_id" && (truthy(v) || v.is_object() || v.is_string()));
@@ -3520,10 +3523,10 @@ pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<(
             }
         }
         // _id is immutable: restore it after every stage.
-        if let Some(id) = &kept_id {
-            if let Some(obj) = doc.as_object_mut() {
-                obj.insert("_id".to_string(), id.clone());
-            }
+        if let Some(id) = &kept_id
+            && let Some(obj) = doc.as_object_mut()
+        {
+            obj.insert("_id".to_string(), id.clone());
         }
     }
     Ok(())
@@ -3626,10 +3629,10 @@ pub(crate) fn try_composite_covered_group(
                 _ => return None,
             }
         }
-        if let Some(r) = &range {
-            if eqs.iter().any(|(f, _)| f == &r.field) {
-                return None; // eq and range on the same field: not covered
-            }
+        if let Some(r) = &range
+            && eqs.iter().any(|(f, _)| f == &r.field)
+        {
+            return None; // eq and range on the same field: not covered
         }
     }
 
@@ -3803,10 +3806,10 @@ pub(crate) fn try_composite_covered_group(
                 return true; // fails an equality pin: skip
             }
         }
-        if let Some(rs) = range_slot {
-            if !in_bounds(&slots[rs]) {
-                return true; // outside the $match range: skip
-            }
+        if let Some(rs) = range_slot
+            && !in_bounds(&slots[rs])
+        {
+            return true; // outside the $match range: skip
         }
         if count_post_filter {
             walked_ids += n;
@@ -4121,12 +4124,12 @@ fn try_index_group(
             }
         }
         for doc_arc in docs {
-            if let Some(id) = doc_arc.get("_id").and_then(|v| v.as_u64()) {
-                if !indexed_ids.contains(&id) {
-                    let doc = doc_arc.as_ref();
-                    for (i, (_, acc)) in accumulators.iter().enumerate() {
-                        update_accumulator_state(&mut null_states[i], acc, doc);
-                    }
+            if let Some(id) = doc_arc.get("_id").and_then(|v| v.as_u64())
+                && !indexed_ids.contains(&id)
+            {
+                let doc = doc_arc.as_ref();
+                for (i, (_, acc)) in accumulators.iter().enumerate() {
+                    update_accumulator_state(&mut null_states[i], acc, doc);
                 }
             }
         }
@@ -4238,28 +4241,26 @@ fn merge_accumulator_state(self_state: &mut AccumulatorState, other: Accumulator
             *count += oc;
         }
         (AccumulatorState::Count(c), AccumulatorState::Count(o)) => *c += o,
-        (AccumulatorState::Min(cur), AccumulatorState::Min(other_min)) => {
-            if let Some((ov, oiv)) = other_min {
-                let replace = match cur {
-                    None => true,
-                    Some((_, civ)) => oiv < *civ,
-                };
-                if replace {
-                    *cur = Some((ov, oiv));
-                }
+        (AccumulatorState::Min(cur), AccumulatorState::Min(Some((ov, oiv)))) => {
+            let replace = match cur {
+                None => true,
+                Some((_, civ)) => oiv < *civ,
+            };
+            if replace {
+                *cur = Some((ov, oiv));
             }
         }
-        (AccumulatorState::Max(cur), AccumulatorState::Max(other_max)) => {
-            if let Some((ov, oiv)) = other_max {
-                let replace = match cur {
-                    None => true,
-                    Some((_, civ)) => oiv > *civ,
-                };
-                if replace {
-                    *cur = Some((ov, oiv));
-                }
+        (AccumulatorState::Min(_), AccumulatorState::Min(None)) => {}
+        (AccumulatorState::Max(cur), AccumulatorState::Max(Some((ov, oiv)))) => {
+            let replace = match cur {
+                None => true,
+                Some((_, civ)) => oiv > *civ,
+            };
+            if replace {
+                *cur = Some((ov, oiv));
             }
         }
+        (AccumulatorState::Max(_), AccumulatorState::Max(None)) => {}
         (AccumulatorState::First(cur), AccumulatorState::First(_)) => {
             // Keep self (earlier segment)
             let _ = cur;
@@ -4856,6 +4857,8 @@ impl Pipeline {
     /// Detect if the pipeline (from `start`) begins with a `$group` stage,
     /// and return references to its key, accumulators, and the index of the
     /// next stage after `$group`.  Used by the streaming aggregation path.
+    // A borrowed view into one accumulator group; naming it would not clarify it.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn try_streaming_group(
         &self,
         start: usize,
@@ -5734,16 +5737,15 @@ mod tests {
         let (key, accs, _) = p.try_streaming_group(0).expect("bare $group is streamable");
 
         let ci = composite_from_docs(fields, &docs);
-        let covered =
-            try_composite_covered_group(
-                key,
-                accs,
-                std::slice::from_ref(&ci),
-                docs.len(),
-                None,
-                None,
-            )
-            .expect("covered path should apply");
+        let covered = try_composite_covered_group(
+            key,
+            accs,
+            std::slice::from_ref(&ci),
+            docs.len(),
+            None,
+            None,
+        )
+        .expect("covered path should apply");
 
         let mut expected = p.execute_from(0, docs, &no_lookup).unwrap();
         let mut got = covered;
@@ -5814,23 +5816,33 @@ mod tests {
         // Composite exists but group field is not the FIRST slot.
         let ci = composite_from_docs(&["salary", "dept"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None)
+                .is_none()
         );
         // Composite's first slot matches but the value field is not covered.
         let ci = composite_from_docs(&["dept", "age"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None)
+                .is_none()
         );
         // An EMPTY leading $match is a full scan — still covered, and it
         // must agree with the no-match invocation.
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert_eq!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})), None),
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci),
+                1,
+                Some(&json!({})),
+                None
+            ),
             try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None),
         );
         // Index/storage disagreement (walked ids != total docs) must bail.
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None)
+                .is_none()
         );
     }
 
@@ -5845,7 +5857,8 @@ mod tests {
         let docs = vec![json!({"dept": "2026-01-01", "salary": 1})];
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None)
+                .is_none()
         );
 
         // Array group value: indexed as its serialization ("[1]"), which a
@@ -5853,7 +5866,8 @@ mod tests {
         let docs = vec![json!({"dept": [1], "salary": 1})];
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None)
+                .is_none()
         );
 
         // DateTime in a $min/$max slot: hash path would surface the original
@@ -5869,11 +5883,19 @@ mod tests {
                 .unwrap();
         let (key_min, accs_min, _) = p_min.try_streaming_group(0).unwrap();
         assert!(
-            try_composite_covered_group(key_min, accs_min, std::slice::from_ref(&ci), 2, None, None)
-                .is_none()
+            try_composite_covered_group(
+                key_min,
+                accs_min,
+                std::slice::from_ref(&ci),
+                2,
+                None,
+                None
+            )
+            .is_none()
         );
         let sum_only =
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None).unwrap();
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None)
+                .unwrap();
         assert_eq!(sum_only, vec![json!({"_id": "a", "s": 5})]);
     }
 
@@ -6022,15 +6044,8 @@ mod tests {
             let (lm, si) = p.take_leading_match();
             let (k, a, _) = p.try_streaming_group(si).unwrap();
             assert!(
-                try_composite_covered_group(
-                    k,
-                    a,
-                    std::slice::from_ref(&ci),
-                    2,
-                    lm,
-                    Some(&fi)
-                )
-                .is_none()
+                try_composite_covered_group(k, a, std::slice::from_ref(&ci), 2, lm, Some(&fi))
+                    .is_none()
             );
         }
         // …and declines when the group field is not the slot right after
@@ -6059,9 +6074,9 @@ mod tests {
             json!({"sym": "BTC", "ts": 150, "price": 20}),
             json!({"sym": "BTC", "ts": 999, "price": 500}), // outside window
             json!({"sym": "ETH", "ts": 120, "price": 5.5}),
-            json!({"sym": "ETH", "ts": 130}),               // no price
-            json!({"ts": 140, "price": 7}),                 // no sym → null group
-            json!({"sym": "SOL", "ts": 10, "price": 3}),    // before window
+            json!({"sym": "ETH", "ts": 130}),            // no price
+            json!({"ts": 140, "price": 7}),              // no sym → null group
+            json!({"sym": "SOL", "ts": 10, "price": 3}), // before window
         ];
         assert_match_covered_matches_hash(
             json!({"ts": {"$gte": 100, "$lt": 200}}),
@@ -6236,15 +6251,8 @@ mod tests {
         let (k, a, _) = p.try_streaming_group(si).unwrap();
         let fi_other = field_index_from_docs("other", &docs);
         assert!(
-            try_composite_covered_group(
-                k,
-                a,
-                std::slice::from_ref(&ci),
-                2,
-                lm,
-                Some(&fi_other)
-            )
-            .is_none()
+            try_composite_covered_group(k, a, std::slice::from_ref(&ci), 2, lm, Some(&fi_other))
+                .is_none()
         );
         // Ranges on two different fields.
         let p = mk(json!({"ts": {"$gte": 1}, "other": {"$lt": 10}}));

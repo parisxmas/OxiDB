@@ -20,6 +20,12 @@ pub struct Session {
     pub wire_version: u32,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
         Self {

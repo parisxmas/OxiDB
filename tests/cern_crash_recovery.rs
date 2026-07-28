@@ -18,6 +18,7 @@
 //! What this does NOT yet test:
 //!   - SIGKILL at every byte offset of a write (needs a victim subprocess)
 //!   - Power-loss / fsync-EIO injection (needs OS-level fault injection)
+//!
 //! Those are listed as follow-ups in docs/testing-roadmap.md.
 
 use serde_json::json;

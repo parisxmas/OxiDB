@@ -101,13 +101,12 @@ pub fn handle_list_objects(
                 for obj in &objects {
                     let meta = serde_json::to_value(obj).unwrap_or_default();
                     let key = meta["key"].as_str().unwrap_or("");
-                    if key.starts_with(pfx) {
-                        let rest = &key[pfx.len()..];
-                        if let Some(idx) = rest.find(delim) {
-                            let cp = format!("{}{}{}", pfx, &rest[..idx], delim);
-                            if seen.insert(cp.clone()) {
-                                common_prefixes.push(cp);
-                            }
+                    if let Some(rest) = key.strip_prefix(pfx)
+                        && let Some(idx) = rest.find(delim)
+                    {
+                        let cp = format!("{}{}{}", pfx, &rest[..idx], delim);
+                        if seen.insert(cp.clone()) {
+                            common_prefixes.push(cp);
                         }
                     }
                 }

@@ -31,6 +31,8 @@ impl Role {
         }
     }
 
+    // Parses a role name without the FromStr error type; not a trait impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "admin" => Some(Role::Admin),

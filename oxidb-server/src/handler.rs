@@ -243,12 +243,11 @@ fn handle_request_session_inner(
     // match arms — they DO carry a `collection` field but it names
     // the link being registered, not a collection to query. We skip
     // the proxy check for them.
-    if let Some(ref col) = collection {
-        if !is_link_management_cmd(&cmd) {
-            if let Some(link) = db.lookup_link(col) {
-                return handle_linked_command(&cmd, &link, request);
-            }
-        }
+    if let Some(ref col) = collection
+        && !is_link_management_cmd(&cmd)
+        && let Some(link) = db.lookup_link(col)
+    {
+        return handle_linked_command(&cmd, &link, request);
     }
 
     match cmd.as_str() {
@@ -507,8 +506,13 @@ fn handle_request_session_inner(
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
-                let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
-                let af = request.get("array_filters").or_else(|| request.get("arrayFilters"));
+                let upsert = request
+                    .get("upsert")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let af = request
+                    .get("array_filters")
+                    .or_else(|| request.get("arrayFilters"));
                 match db.update_full(col, query, update, true, upsert, af) {
                     Ok((_, count, upserted)) => match upserted {
                         Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),
@@ -538,8 +542,13 @@ fn handle_request_session_inner(
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
-                let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
-                let af = request.get("array_filters").or_else(|| request.get("arrayFilters"));
+                let upsert = request
+                    .get("upsert")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let af = request
+                    .get("array_filters")
+                    .or_else(|| request.get("arrayFilters"));
                 match db.update_full(col, query, update, false, upsert, af) {
                     Ok((_, count, upserted)) => match upserted {
                         Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),

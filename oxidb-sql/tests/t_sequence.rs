@@ -3,7 +3,6 @@
 mod common;
 
 use common::*;
-use oxidb_sql::Value;
 
 #[test]
 fn hilo_sequence_hands_out_incrementing_blocks() {
@@ -11,8 +10,14 @@ fn hilo_sequence_hands_out_incrementing_blocks() {
     db.execute("CREATE SEQUENCE catalog_hilo START WITH 1 INCREMENT BY 10 NO CYCLE")
         .unwrap();
     // Each NEXT VALUE FOR returns the current value then advances by increment.
-    assert_eq!(rows(&db, "SELECT NEXT VALUE FOR catalog_hilo"), vec![vec![i(1)]]);
-    assert_eq!(rows(&db, "SELECT NEXT VALUE FOR catalog_hilo"), vec![vec![i(11)]]);
+    assert_eq!(
+        rows(&db, "SELECT NEXT VALUE FOR catalog_hilo"),
+        vec![vec![i(1)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT NEXT VALUE FOR catalog_hilo"),
+        vec![vec![i(11)]]
+    );
     // Quoted name (EF emits "catalog_hilo").
     assert_eq!(
         rows(&db, "SELECT NEXT VALUE FOR \"catalog_hilo\""),

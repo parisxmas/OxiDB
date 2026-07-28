@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::amqp_queue::{AmqpBroker, ChannelError, PreparedPublish, QMsg, Waker, NOT_IMPLEMENTED};
+use crate::amqp_queue::{AmqpBroker, ChannelError, NOT_IMPLEMENTED, PreparedPublish, QMsg, Waker};
 use crate::amqp_wire::*;
 
 /// The read half of this connection's wake pipe (see `Waker` in
@@ -108,15 +108,15 @@ fn wait_input(stream: &TcpStream, wake_rx: &WakeRx, timeout_ms: i32) -> io::Resu
         }
         return Err(e);
     }
-    if fds[1].revents & libc::POLLIN != 0 {
-        if let Some(rx) = wake_rx {
-            // Drain: the pipe's only meaning is "now", not "n times".
-            let mut buf = [0u8; 64];
-            loop {
-                match (&*rx).read(&mut buf) {
-                    Ok(n) if n == buf.len() => continue,
-                    _ => break,
-                }
+    if fds[1].revents & libc::POLLIN != 0
+        && let Some(rx) = wake_rx
+    {
+        // Drain: the pipe's only meaning is "now", not "n times".
+        let mut buf = [0u8; 64];
+        loop {
+            match (&*rx).read(&mut buf) {
+                Ok(n) if n == buf.len() => continue,
+                _ => break,
             }
         }
     }
@@ -184,6 +184,8 @@ fn read_frame_polled(
     }))
 }
 
+// Mirrors the AMQP method's own field list.
+#[allow(clippy::too_many_arguments)]
 /// Send a channel exception and put the channel into closing state: requeue
 /// its unacked deliveries and cancel its consumers first, per spec semantics.
 fn channel_error(
@@ -302,18 +304,17 @@ pub fn handle_client(stream: TcpStream, log: bool) {
     if let (Ok(want_u), Ok(want_p)) = (
         std::env::var("OXIDB_AMQP_USER"),
         std::env::var("OXIDB_AMQP_PASSWORD"),
-    ) {
-        if user != want_u || pass != want_p {
-            let p = ArgsW::method(CLASS_CONNECTION, CONNECTION_CLOSE)
-                .u16(403)
-                .shortstr("ACCESS_REFUSED - PLAIN login refused")
-                .u16(0)
-                .u16(0)
-                .finish();
-            let _ = write_frame(&mut writer, FRAME_METHOD, 0, &p);
-            let _ = writer.flush();
-            return;
-        }
+    ) && (user != want_u || pass != want_p)
+    {
+        let p = ArgsW::method(CLASS_CONNECTION, CONNECTION_CLOSE)
+            .u16(403)
+            .shortstr("ACCESS_REFUSED - PLAIN login refused")
+            .u16(0)
+            .u16(0)
+            .finish();
+        let _ = write_frame(&mut writer, FRAME_METHOD, 0, &p);
+        let _ = writer.flush();
+        return;
     }
 
     let tune = ArgsW::method(CLASS_CONNECTION, CONNECTION_TUNE)
@@ -517,33 +518,30 @@ pub fn handle_client(stream: TcpStream, log: bool) {
                     Ok(h) => {
                         let complete = h.body_size == 0;
                         pending.header = Some(h);
-                        if complete {
-                            if let Err(e) =
+                        if complete
+                            && let Err(e) =
                                 complete_publish(broker, &mut channels, ch_id, &mut batch)
-                            {
-                                if flush_batch(
+                            && (flush_batch(
+                                &mut writer,
+                                broker,
+                                &mut channels,
+                                &mut batch,
+                                frame_max,
+                            )
+                            .is_err()
+                                || channel_error(
                                     &mut writer,
                                     broker,
+                                    conn_id,
                                     &mut channels,
-                                    &mut batch,
-                                    frame_max,
+                                    ch_id,
+                                    e,
+                                    CLASS_BASIC,
+                                    BASIC_PUBLISH,
                                 )
-                                .is_err()
-                                    || channel_error(
-                                        &mut writer,
-                                        broker,
-                                        conn_id,
-                                        &mut channels,
-                                        ch_id,
-                                        e,
-                                        CLASS_BASIC,
-                                        BASIC_PUBLISH,
-                                    )
-                                    .is_err()
-                                {
-                                    break 'conn;
-                                }
-                            }
+                                .is_err())
+                        {
+                            break 'conn;
                         }
                     }
                     Err(_) => break 'conn,
@@ -563,25 +561,23 @@ pub fn handle_client(stream: TcpStream, log: bool) {
                     .header
                     .as_ref()
                     .is_some_and(|h| pending.body.len() as u64 >= h.body_size);
-                if done {
-                    if let Err(e) = complete_publish(broker, &mut channels, ch_id, &mut batch) {
-                        if flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max)
-                            .is_err()
-                            || channel_error(
-                                &mut writer,
-                                broker,
-                                conn_id,
-                                &mut channels,
-                                ch_id,
-                                e,
-                                CLASS_BASIC,
-                                BASIC_PUBLISH,
-                            )
-                            .is_err()
-                        {
-                            break 'conn;
-                        }
-                    }
+                if done
+                    && let Err(e) = complete_publish(broker, &mut channels, ch_id, &mut batch)
+                    && (flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max)
+                        .is_err()
+                        || channel_error(
+                            &mut writer,
+                            broker,
+                            conn_id,
+                            &mut channels,
+                            ch_id,
+                            e,
+                            CLASS_BASIC,
+                            BASIC_PUBLISH,
+                        )
+                        .is_err())
+                {
+                    break 'conn;
                 }
             }
 
@@ -649,10 +645,10 @@ pub fn handle_client(stream: TcpStream, log: bool) {
         // Commit when the pipeline burst has fully landed in our buffer (or
         // the batch is big enough): everything still buffered will follow
         // immediately, so waiting would only grow the batch, not stall it.
-        if batch.len() >= 256 || (!batch.is_empty() && reader.buffer().is_empty()) {
-            if flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max).is_err() {
-                break 'conn;
-            }
+        if (batch.len() >= 256 || (!batch.is_empty() && reader.buffer().is_empty()))
+            && flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max).is_err()
+        {
+            break 'conn;
         }
     }
 
@@ -745,27 +741,26 @@ fn flush_batch(
         // A channel that died mid-batch gets no frames; its publishes are
         // committed regardless (unconfirmed = may have taken effect, per AMQP).
         let alive = channels.get(&ch_id).is_some_and(|c| !c.closing);
-        if n == 0 && alive {
-            if let Some((rprops, rbody, exchange, rkey)) = ret {
-                let m = ArgsW::method(CLASS_BASIC, BASIC_RETURN)
-                    .u16(312)
-                    .shortstr("NO_ROUTE")
-                    .shortstr(&exchange)
-                    .shortstr(&rkey)
-                    .finish();
-                write_content(writer, ch_id, &m, &rprops, &rbody, frame_max)?;
-                wrote = true;
-            }
+        if n == 0
+            && alive
+            && let Some((rprops, rbody, exchange, rkey)) = ret
+        {
+            let m = ArgsW::method(CLASS_BASIC, BASIC_RETURN)
+                .u16(312)
+                .shortstr("NO_ROUTE")
+                .shortstr(&exchange)
+                .shortstr(&rkey)
+                .finish();
+            write_content(writer, ch_id, &m, &rprops, &rbody, frame_max)?;
+            wrote = true;
         }
-        if alive {
-            if let Some(t) = tag {
-                let ack = ArgsW::method(CLASS_BASIC, BASIC_ACK)
-                    .u64(t)
-                    .u8(0) // multiple = false
-                    .finish();
-                write_frame(writer, FRAME_METHOD, ch_id, &ack)?;
-                wrote = true;
-            }
+        if alive && let Some(t) = tag {
+            let ack = ArgsW::method(CLASS_BASIC, BASIC_ACK)
+                .u64(t)
+                .u8(0) // multiple = false
+                .finish();
+            write_frame(writer, FRAME_METHOD, ch_id, &ack)?;
+            wrote = true;
         }
     }
     if wrote {

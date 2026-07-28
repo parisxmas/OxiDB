@@ -60,6 +60,8 @@ fn start_shard() -> Shard {
             let db = Arc::clone(&db);
             thread::spawn(move || {
                 let mut tx: Option<u64> = None;
+                // The explicit arms document what ends the loop.
+                #[allow(clippy::while_let_loop)]
                 loop {
                     match read_message(&mut stream) {
                         Ok(msg) => {

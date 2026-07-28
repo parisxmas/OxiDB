@@ -271,6 +271,10 @@ impl MmapPrimaryIndex {
     }
 
     /// Total number of documents (mmap + overlay - deleted).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         self.doc_count.load(Ordering::Relaxed) as usize
     }

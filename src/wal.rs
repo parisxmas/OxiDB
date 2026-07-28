@@ -45,10 +45,7 @@ pub mod fault {
 #[cfg(not(target_arch = "wasm32"))]
 fn fsync_file(file: &File) -> std::io::Result<()> {
     if fault::should_fail() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "injected fsync failure (EIO)",
-        ));
+        return Err(std::io::Error::other("injected fsync failure (EIO)"));
     }
     file.sync_data()
 }
@@ -583,6 +580,8 @@ impl Wal {
         Ok(())
     }
 
+    // One WAL record's fields, passed positionally as the format defines them.
+    #[allow(clippy::too_many_arguments)]
     /// Read all valid entries from the WAL and replay them idempotently.
     /// When field_indexes and composite_indexes are provided, WAL replay also
     /// updates those indexes so that a cached index load remains consistent.
@@ -595,7 +594,7 @@ impl Wal {
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
         field_indexes: &mut HashMap<String, PagedFieldIndex>,
-        composite_indexes: &mut Vec<CompositeIndex>,
+        composite_indexes: &mut [CompositeIndex],
         verbose: bool,
         log_callback: &Option<LogCallback>,
     ) -> Result<()> {
@@ -791,7 +790,7 @@ impl Wal {
     /// are recoverable; no acknowledged write is lost.
     fn seal_locked(&self, file: &mut File) -> Result<()> {
         // Flush any not-yet-synced writes into the segment being sealed.
-        fsync_file(&file)?;
+        fsync_file(file)?;
         let seq = self.next_seal_seq.fetch_add(1, Ordering::SeqCst);
         let sealed_path = Self::sealed_segment_path(&self.path, seq);
         fs::rename(&self.path, &sealed_path)?;
@@ -806,10 +805,10 @@ impl Wal {
         self.header_state
             .store(header_state::NEEDED, std::sync::atomic::Ordering::Release);
         // Make the rename (and the new file's dir entry) durable.
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }
@@ -847,10 +846,10 @@ impl Wal {
             for entry in rd.flatten() {
                 let fname = entry.file_name();
                 let fname = fname.to_string_lossy();
-                if let Some(suffix) = fname.strip_prefix(&prefix) {
-                    if let Ok(seq) = suffix.parse::<u64>() {
-                        out.push((seq, entry.path()));
-                    }
+                if let Some(suffix) = fname.strip_prefix(&prefix)
+                    && let Ok(seq) = suffix.parse::<u64>()
+                {
+                    out.push((seq, entry.path()));
                 }
             }
         }
@@ -945,7 +944,7 @@ impl Wal {
             payload.extend_from_slice(&m.gsn.to_le_bytes());
             payload.extend_from_slice(&m.wall_clock_micros.to_le_bytes());
         }
-        payload.extend_from_slice(&*encrypted);
+        payload.extend_from_slice(&encrypted);
         Ok(Self::frame(payload))
     }
 
@@ -995,7 +994,7 @@ impl Wal {
                     payload.extend_from_slice(&m.gsn.to_le_bytes());
                     payload.extend_from_slice(&m.wall_clock_micros.to_le_bytes());
                 }
-                payload.extend_from_slice(&*encrypted);
+                payload.extend_from_slice(&encrypted);
                 payload
             }
             WalEntry::Delete { doc_id, tx_id } => {
@@ -1512,7 +1511,7 @@ mod tests {
     fn encrypted_wal_roundtrip() {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("test.key");
-        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        std::fs::write(&key_path, [0x42u8; 32]).unwrap();
         let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
 
         let wal =
@@ -1687,7 +1686,7 @@ mod tests {
     fn v2_record_with_encryption_roundtrips() {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("v2.key");
-        std::fs::write(&key_path, &[0x17u8; 32]).unwrap();
+        std::fs::write(&key_path, [0x17u8; 32]).unwrap();
         let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
         let wal = Wal::open_with_encryption(&dir.path().join("v2_enc.wal"), Some(enc_key)).unwrap();
 

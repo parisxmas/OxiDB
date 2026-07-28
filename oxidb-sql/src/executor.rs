@@ -3878,6 +3878,9 @@ fn lateral_join_into<S: Store>(
     Ok(())
 }
 
+// A join-execution step; bundling these into a struct would only move the
+// list somewhere else.
+#[allow(clippy::too_many_arguments)]
 fn join_into<S: Store>(
     store: &S,
     join: &Join,
@@ -7332,13 +7335,13 @@ fn eval_agg<S: Store>(
             if matches!(v, Value::Null) {
                 return Ok(Value::Null);
             }
-            return Ok(if set.contains(&IndexKey(v.clone())) {
+            Ok(if set.contains(&IndexKey(v.clone())) {
                 Value::Bool(!*negated)
             } else if *has_null {
                 Value::Null
             } else {
                 Value::Bool(*negated)
-            });
+            })
         }
         Expr::In {
             expr,

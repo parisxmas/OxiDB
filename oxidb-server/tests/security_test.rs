@@ -8,7 +8,7 @@ use serde_json::json;
 fn encryption_at_rest_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
-    std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+    std::fs::write(&key_path, [0x42u8; 32]).unwrap();
 
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
@@ -37,7 +37,7 @@ fn encryption_at_rest_roundtrip() {
 fn encrypted_data_not_plain_text() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
-    std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+    std::fs::write(&key_path, [0x42u8; 32]).unwrap();
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();
@@ -82,7 +82,7 @@ fn no_encryption_is_backward_compatible() {
 fn encrypted_blob_store() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
-    std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+    std::fs::write(&key_path, [0x42u8; 32]).unwrap();
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key.clone())).unwrap();
@@ -109,7 +109,7 @@ fn encrypted_blob_store() {
 fn encrypted_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
-    std::fs::write(&key_path, &[0xABu8; 32]).unwrap();
+    std::fs::write(&key_path, [0xABu8; 32]).unwrap();
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();
@@ -230,7 +230,7 @@ fn audit_log_writes_entries() {
 fn encrypted_transactions() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
-    std::fs::write(&key_path, &[0x77u8; 32]).unwrap();
+    std::fs::write(&key_path, [0x77u8; 32]).unwrap();
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();

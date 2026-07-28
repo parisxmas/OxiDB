@@ -318,7 +318,7 @@ pub fn print_inspect(
         return Ok(());
     }
 
-    writeln!(out, "{:<14}  {:<10}  {}", "KIND", "STATUS", "PATH")?;
+    writeln!(out, "{:<14}  {:<10}  PATH", "KIND", "STATUS")?;
     for r in reports {
         let status = match &r.status {
             FormatStatus::Current(v) => format!("current v{v}"),

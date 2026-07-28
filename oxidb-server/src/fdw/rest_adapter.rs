@@ -145,10 +145,10 @@ impl RestAdapter {
         let mut id_field = DEFAULT_ID_FIELD.to_string();
         if let Some(frag) = fragment {
             for pair in frag.split('&') {
-                if let Some(v) = pair.strip_prefix("id_field=") {
-                    if !v.is_empty() {
-                        id_field = v.to_string();
-                    }
+                if let Some(v) = pair.strip_prefix("id_field=")
+                    && !v.is_empty()
+                {
+                    id_field = v.to_string();
                 }
             }
         }
@@ -581,6 +581,8 @@ mod tests {
     /// of one test; killed when dropped.
     struct MockHttpServer {
         port: u16,
+        // The adapter's parsed response shape, used only here.
+        #[allow(clippy::type_complexity)]
         requests: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
     }
 
@@ -604,6 +606,9 @@ mod tests {
             Self { port, requests }
         }
 
+        // `log` records (method, path, body) per request; the tuple is used only
+        // in this test adapter.
+        #[allow(clippy::type_complexity)]
         fn handle(
             mut stream: TcpStream,
             log: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,

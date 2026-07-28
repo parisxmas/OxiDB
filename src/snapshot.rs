@@ -82,6 +82,12 @@ fn max_age_from_env() -> Duration {
     Duration::from_secs(secs.max(1))
 }
 
+impl Default for SnapGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SnapGate {
     pub fn new() -> Self {
         SnapGate {

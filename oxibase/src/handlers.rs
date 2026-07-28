@@ -173,10 +173,10 @@ pub fn auth_google(req: &HttpRequest, state: &State) -> HttpResponse {
             json!({ "message": "signup rate limit exceeded; slow down" }),
         );
     }
-    if let Some(code) = signup_code() {
-        if str_field(&body, "code").as_deref() != Some(code.as_str()) {
-            return resp(403, json!({ "message": "a valid invite code is required" }));
-        }
+    if let Some(code) = signup_code()
+        && str_field(&body, "code").as_deref() != Some(code.as_str())
+    {
+        return resp(403, json!({ "message": "a valid invite code is required" }));
     }
     if state.upstream.count("accounts", &json!({})).unwrap_or(0) >= max_accounts() {
         return resp(403, json!({ "message": "signups are closed" }));
@@ -377,7 +377,7 @@ pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
 // and `auth.role == "authenticated"`.
 // ---------------------------------------------------------------------------
 
-/// `POST /platform/v1/projects/{ref}/auth/signup` — create an end-user.
+// `POST /platform/v1/projects/{ref}/auth/signup` — create an end-user.
 
 /// Find one of a project's users by address, case-insensitively.
 ///
@@ -482,7 +482,8 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
             json!({ "message": "user limit reached for this project" }),
         );
     }
-    match find_user_by_email(state, project_ref, &email).map(|u| u.into_iter().collect::<Vec<_>>()) {
+    match find_user_by_email(state, project_ref, &email).map(|u| u.into_iter().collect::<Vec<_>>())
+    {
         Ok(u) if !u.is_empty() => {
             return resp(409, json!({ "message": "email already registered" }));
         }
@@ -1177,45 +1178,6 @@ fn login_record_failure(email: &str) {
 }
 fn login_clear(email: &str) {
     login_limiter().lock().unwrap().remove(email);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{normalize_email, regex_escape, slugify};
-
-    #[test]
-    fn email_is_one_address_however_it_is_typed() {
-        // The bug this guards: a phone keyboard capitalises the first letter, an
-        // account signed up from a browser stored it lowercase, and the login
-        // lookup matched the string exactly — so the row was never found and the
-        // answer was "invalid credentials" through any number of password resets.
-        assert_eq!(normalize_email("Kaan@Example.COM"), "kaan@example.com");
-        assert_eq!(normalize_email("  spaced@example.com "), "spaced@example.com");
-        assert_eq!(normalize_email("already@lower.com"), "already@lower.com");
-    }
-
-    #[test]
-    fn address_metacharacters_do_not_become_regex_syntax() {
-        // The fallback lookup builds `^…$` out of the address, so a dot must
-        // match a dot and `a+b@x.com` must not match `ab@x.com`.
-        assert_eq!(regex_escape("a.b@x.com"), r"a\.b@x\.com");
-        assert_eq!(regex_escape("a+b@x.com"), r"a\+b@x\.com");
-        assert_eq!(regex_escape("plain@x"), "plain@x");
-    }
-
-    #[test]
-    fn slugify_basics() {
-        assert_eq!(slugify("My Cool App").as_deref(), Some("my-cool-app"));
-        assert_eq!(
-            slugify("  Hello,  World!  ").as_deref(),
-            Some("hello-world")
-        );
-        assert_eq!(slugify("Aa_Bb-Cc.99").as_deref(), Some("aa-bb-cc-99"));
-        assert_eq!(slugify("test123").as_deref(), Some("test123"));
-        assert_eq!(slugify("---"), None);
-        assert_eq!(slugify(""), None);
-        assert_eq!(slugify("日本語"), None); // no ascii alphanumerics → nothing usable
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,9 +2466,14 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
     // copy; both are read and merged so a deployment does not appear to lose its
     // history the moment it upgrades.
     let page = |db: &str, query: Value| {
-        state
-            .upstream
-            .find_sorted_in(db, "_msgpack_logs", &query, &json!({ "_ts": -1 }), limit + offset, 0)
+        state.upstream.find_sorted_in(
+            db,
+            "_msgpack_logs",
+            &query,
+            &json!({ "_ts": -1 }),
+            limit + offset,
+            0,
+        )
     };
     let own = match page(project_ref, json!({})) {
         Ok(r) => r,
@@ -2518,7 +2485,9 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
     rows.extend(legacy);
     rows.sort_by(|a, b| {
         let ts = |v: &Value| v.get("_ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
-        ts(b).partial_cmp(&ts(a)).unwrap_or(std::cmp::Ordering::Equal)
+        ts(b)
+            .partial_cmp(&ts(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let rows: Vec<Value> = rows
         .into_iter()
@@ -2595,5 +2564,47 @@ pub fn project_types(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
             content_length_override: None,
         },
         Err(e) => resp(502, json!({ "message": format!("type generation: {e}") })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_email, regex_escape, slugify};
+
+    #[test]
+    fn email_is_one_address_however_it_is_typed() {
+        // The bug this guards: a phone keyboard capitalises the first letter, an
+        // account signed up from a browser stored it lowercase, and the login
+        // lookup matched the string exactly — so the row was never found and the
+        // answer was "invalid credentials" through any number of password resets.
+        assert_eq!(normalize_email("Kaan@Example.COM"), "kaan@example.com");
+        assert_eq!(
+            normalize_email("  spaced@example.com "),
+            "spaced@example.com"
+        );
+        assert_eq!(normalize_email("already@lower.com"), "already@lower.com");
+    }
+
+    #[test]
+    fn address_metacharacters_do_not_become_regex_syntax() {
+        // The fallback lookup builds `^…$` out of the address, so a dot must
+        // match a dot and `a+b@x.com` must not match `ab@x.com`.
+        assert_eq!(regex_escape("a.b@x.com"), r"a\.b@x\.com");
+        assert_eq!(regex_escape("a+b@x.com"), r"a\+b@x\.com");
+        assert_eq!(regex_escape("plain@x"), "plain@x");
+    }
+
+    #[test]
+    fn slugify_basics() {
+        assert_eq!(slugify("My Cool App").as_deref(), Some("my-cool-app"));
+        assert_eq!(
+            slugify("  Hello,  World!  ").as_deref(),
+            Some("hello-world")
+        );
+        assert_eq!(slugify("Aa_Bb-Cc.99").as_deref(), Some("aa-bb-cc-99"));
+        assert_eq!(slugify("test123").as_deref(), Some("test123"));
+        assert_eq!(slugify("---"), None);
+        assert_eq!(slugify(""), None);
+        assert_eq!(slugify("日本語"), None); // no ascii alphanumerics → nothing usable
     }
 }

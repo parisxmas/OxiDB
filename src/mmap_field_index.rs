@@ -590,14 +590,14 @@ impl MmapFieldIndex {
     /// tombstone must not double-decrement).
     fn remove_pair(&mut self, id: DocumentId, key: IndexValue) {
         // Try overlay first
-        if let Some(set) = self.overlay.get_mut(&key) {
-            if set.remove(&id) {
-                if set.is_empty() {
-                    self.overlay.remove(&key);
-                }
-                self.total_ids = self.total_ids.saturating_sub(1);
-                return;
+        if let Some(set) = self.overlay.get_mut(&key)
+            && set.remove(&id)
+        {
+            if set.is_empty() {
+                self.overlay.remove(&key);
             }
+            self.total_ids = self.total_ids.saturating_sub(1);
+            return;
         }
         // Record tombstone for mmap layer (once per (id, value) pair)
         let already = self
@@ -650,16 +650,16 @@ impl MmapFieldIndex {
     /// O(log n) in mmap layer + O(log n) in overlay.
     pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
         // Check overlay first (recent writes)
-        if let Some(ids) = self.overlay.get(value) {
-            if ids.contains(&doc_id) {
-                return true;
-            }
+        if let Some(ids) = self.overlay.get(value)
+            && ids.contains(&doc_id)
+        {
+            return true;
         }
         // Check tombstones
-        if let Some(removed_vals) = self.removed.get(&doc_id) {
-            if removed_vals.iter().any(|v| v == value) {
-                return false;
-            }
+        if let Some(removed_vals) = self.removed.get(&doc_id)
+            && removed_vals.iter().any(|v| v == value)
+        {
+            return false;
         }
         // Check mmap via binary search — O(log n), no allocation
         if let Some(idx) = self.mmap_find_entry(value) {
@@ -681,12 +681,12 @@ impl MmapFieldIndex {
         // Mmap entries
         if let Some(layout) = &self.layout {
             for i in 0..layout.entry_count as usize {
-                if let Some(val) = self.mmap_entry_value(i) {
-                    if &val != value {
-                        let mut ids = self.mmap_entry_docids(i);
-                        self.apply_tombstones(&val, &mut ids);
-                        result.extend(&ids);
-                    }
+                if let Some(val) = self.mmap_entry_value(i)
+                    && &val != value
+                {
+                    let mut ids = self.mmap_entry_docids(i);
+                    self.apply_tombstones(&val, &mut ids);
+                    result.extend(&ids);
                 }
             }
         }
@@ -840,14 +840,14 @@ impl MmapFieldIndex {
         // Mmap
         if let Some(layout) = &self.layout {
             for i in 0..layout.entry_count as usize {
-                if let Some(val) = self.mmap_entry_value(i) {
-                    if &val != value {
-                        let mut ids = self.mmap_entry_docids(i);
-                        self.apply_tombstones(&val, &mut ids);
-                        for &id in &ids {
-                            if !f(id) {
-                                return;
-                            }
+                if let Some(val) = self.mmap_entry_value(i)
+                    && &val != value
+                {
+                    let mut ids = self.mmap_entry_docids(i);
+                    self.apply_tombstones(&val, &mut ids);
+                    for &id in &ids {
+                        if !f(id) {
+                            return;
                         }
                     }
                 }
@@ -1208,10 +1208,10 @@ fn write_fidx_v2(
     fs::rename(&tmp_path, path)?;
     // Make the rename itself durable — without the parent-dir fsync a power
     // loss can leave the directory entry pointing at a short/absent file.
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = fs::File::open(parent) {
-            let _ = dirf.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dirf) = fs::File::open(parent)
+    {
+        let _ = dirf.sync_all();
     }
 
     Ok(())
@@ -1309,8 +1309,11 @@ impl<'a> MmapFieldIndexIter<'a> {
     fn new(index: &'a MmapFieldIndex) -> Self {
         let mmap_count = index.layout.as_ref().map_or(0, |l| l.entry_count as usize);
         // Overlay is typically small (recent writes only) — safe to clone.
-        let overlay: Vec<(IndexValue, DocIdSet)> =
-            index.overlay.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let overlay: Vec<(IndexValue, DocIdSet)> = index
+            .overlay
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         Self {
             index,
             mmap_pos: 0,
@@ -1393,8 +1396,11 @@ impl<'a> MmapFieldIndexIterDesc<'a> {
     fn new(index: &'a MmapFieldIndex) -> Self {
         let mmap_count = index.layout.as_ref().map_or(0, |l| l.entry_count as usize);
         // Overlay is typically small (recent writes only) — safe to clone.
-        let overlay: Vec<(IndexValue, DocIdSet)> =
-            index.overlay.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let overlay: Vec<(IndexValue, DocIdSet)> = index
+            .overlay
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let overlay_pos = overlay.len();
         Self {
             index,
@@ -1421,7 +1427,10 @@ impl<'a> Iterator for MmapFieldIndexIterDesc<'a> {
                 }
             };
 
-            let side = match (&mm_val, self.overlay_pos.checked_sub(1).map(|i| &self.overlay[i])) {
+            let side = match (
+                &mm_val,
+                self.overlay_pos.checked_sub(1).map(|i| &self.overlay[i]),
+            ) {
                 (None, None) => return None,
                 (Some(_), None) => MergeSide::Mmap,
                 (None, Some(_)) => MergeSide::Overlay,
@@ -1734,7 +1743,10 @@ mod tests {
         assert_eq!(ten.1, BTreeSet::from([1, 2, 6]));
         // 30 is fully tombstoned — absent; 20 lost doc 3.
         assert!(!asc.iter().any(|(v, _)| v == &IndexValue::Integer(30)));
-        assert!(!asc.iter().any(|(_, ids)| ids.contains(&3) || ids.contains(&4)));
+        assert!(
+            !asc.iter()
+                .any(|(_, ids)| ids.contains(&3) || ids.contains(&4))
+        );
     }
 
     #[test]
@@ -1747,7 +1759,7 @@ mod tests {
         idx.insert_raw(1, IndexValue::Null);
         idx.insert_raw(2, IndexValue::Boolean(true));
         idx.insert_raw(3, IndexValue::Integer(42));
-        idx.insert_raw(4, IndexValue::Float(3.14));
+        idx.insert_raw(4, IndexValue::Float(2.75));
         idx.insert_raw(5, IndexValue::DateTime(1_700_000_000_000));
         idx.insert_raw(6, IndexValue::String("hello".into()));
         idx.persist().unwrap();

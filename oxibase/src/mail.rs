@@ -134,6 +134,9 @@ impl Mailer {
 }
 
 impl Smtp {
+    // Builds the message's From: header from this address — `from` is the header,
+    // not a conversion.
+    #[allow(clippy::wrong_self_convention)]
     /// The bare address inside `From:` (display names stripped).
     fn from_addr(&self) -> &str {
         match (self.from.find('<'), self.from.find('>')) {
@@ -171,7 +174,7 @@ impl Smtp {
         let mut reader = BufReader::new(&mut stream);
         // One SMTP reply (all continuation lines); returns the status code.
         fn reply<R: BufRead>(r: &mut R) -> Result<u16, String> {
-            let mut code = 0u16;
+            let mut code;
             loop {
                 let mut line = String::new();
                 r.read_line(&mut line).map_err(|e| e.to_string())?;

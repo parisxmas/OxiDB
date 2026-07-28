@@ -270,56 +270,56 @@ fn dispatch_request(
     // Read-role sessions may use the SQL engine but only for SELECTs; the
     // flag is decided here (session layer) and enforced by the SQL bridge.
     let mut sql_readonly = false;
-    if state.auth_enabled {
-        if let Some(role) = session.role() {
-            let is_user_cmd = matches!(
+    if state.auth_enabled
+        && let Some(role) = session.role()
+    {
+        let is_user_cmd = matches!(
+            cmd.as_str(),
+            "create_user"
+                | "drop_user"
+                | "update_user"
+                | "list_users"
+                | "grant_db_role"
+                | "revoke_db_role"
+        );
+
+        // Resolve the effective role for the target database.
+        // For user management and database-level commands, use the global role.
+        // For all other commands, use the per-database effective role.
+        let effective_role = if is_user_cmd
+            || matches!(
                 cmd.as_str(),
-                "create_user"
-                    | "drop_user"
-                    | "update_user"
-                    | "list_users"
-                    | "grant_db_role"
-                    | "revoke_db_role"
-            );
+                "create_database" | "drop_database" | "list_databases" | "use_db"
+            ) {
+            role
+        } else if let Some(ref user_store) = state.user_store {
+            let target_db = request
+                .get("db")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&session.current_database);
+            let store = user_store.lock().unwrap();
+            store
+                .effective_role(session.username_str(), target_db)
+                .unwrap_or(role)
+        } else {
+            role
+        };
 
-            // Resolve the effective role for the target database.
-            // For user management and database-level commands, use the global role.
-            // For all other commands, use the per-database effective role.
-            let effective_role = if is_user_cmd
-                || matches!(
-                    cmd.as_str(),
-                    "create_database" | "drop_database" | "list_databases" | "use_db"
-                ) {
-                role
-            } else if let Some(ref user_store) = state.user_store {
-                let target_db = request
-                    .get("db")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&session.current_database);
-                let store = user_store.lock().unwrap();
-                store
-                    .effective_role(session.username_str(), target_db)
-                    .unwrap_or(role)
-            } else {
-                role
-            };
+        let permitted = if is_user_cmd {
+            role == oxidb_server::auth::Role::Admin
+        } else {
+            rbac::is_permitted(effective_role, &cmd)
+        };
 
-            let permitted = if is_user_cmd {
-                role == oxidb_server::auth::Role::Admin
-            } else {
-                rbac::is_permitted(effective_role, &cmd)
-            };
-
-            if !permitted {
-                log_audit(state, session, &cmd, collection.as_deref(), "denied", "");
-                return handler::err_bytes(&format!(
-                    "permission denied: role '{}' cannot execute '{}'",
-                    role.as_str(),
-                    cmd
-                ));
-            }
-            sql_readonly = cmd == "sql" && effective_role == oxidb_server::auth::Role::Read;
+        if !permitted {
+            log_audit(state, session, &cmd, collection.as_deref(), "denied", "");
+            return handler::err_bytes(&format!(
+                "permission denied: role '{}' cannot execute '{}'",
+                role.as_str(),
+                cmd
+            ));
         }
+        sql_readonly = cmd == "sql" && effective_role == oxidb_server::auth::Role::Read;
     }
 
     // ---------------------------------------------------------------
@@ -355,11 +355,11 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // Handle user management commands
     // ---------------------------------------------------------------
-    if let Some(user_store) = &state.user_store {
-        if let Some(resp_bytes) = handler::handle_user_command(&cmd, request, user_store) {
-            log_audit(state, session, &cmd, None, "ok", "");
-            return resp_bytes;
-        }
+    if let Some(user_store) = &state.user_store
+        && let Some(resp_bytes) = handler::handle_user_command(&cmd, request, user_store)
+    {
+        log_audit(state, session, &cmd, None, "ok", "");
+        return resp_bytes;
     }
 
     // ---------------------------------------------------------------
@@ -897,26 +897,24 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
         };
 
         // Check for SUBSCRIBE before normal dispatch
-        if let resp::RespValue::Array(ref items) = value {
-            if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
-                if cmd.eq_ignore_ascii_case("SUBSCRIBE") || cmd.eq_ignore_ascii_case("PSUBSCRIBE") {
-                    let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
-                    if log {
-                        let channels: Vec<&str> =
-                            items[1..].iter().filter_map(|a| a.as_str()).collect();
-                        eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
-                    }
-                    handle_oximem_subscribe(
-                        &stream,
-                        store,
-                        &mut reader,
-                        &mut writer,
-                        &items[1..],
-                        is_pattern,
-                    );
-                    return;
-                }
+        if let resp::RespValue::Array(ref items) = value
+            && let Some(cmd) = items.first().and_then(|a| a.as_str())
+            && (cmd.eq_ignore_ascii_case("SUBSCRIBE") || cmd.eq_ignore_ascii_case("PSUBSCRIBE"))
+        {
+            let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
+            if log {
+                let channels: Vec<&str> = items[1..].iter().filter_map(|a| a.as_str()).collect();
+                eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
             }
+            handle_oximem_subscribe(
+                &stream,
+                store,
+                &mut reader,
+                &mut writer,
+                &items[1..],
+                is_pattern,
+            );
+            return;
         }
 
         // Fast path: no pipeline data buffered — execute directly, no Vec
@@ -1004,6 +1002,8 @@ fn handle_oximem_subscribe(
 ) {
     use oxidb_server::resp;
 
+    // A one-off listener tuple, named nowhere else.
+    #[allow(clippy::type_complexity)]
     let mut receivers: Vec<(String, bool, std::sync::mpsc::Receiver<(String, String)>)> =
         Vec::new();
 
@@ -1062,101 +1062,96 @@ fn handle_oximem_subscribe(
                 wrote = true;
             }
         }
-        if wrote {
-            if writer.flush().is_err() {
-                return;
-            }
+        if wrote && writer.flush().is_err() {
+            return;
         }
 
         // Try to read a command (non-blocking due to timeout)
         match resp::read_value(reader) {
             Ok(value) => {
-                if let resp::RespValue::Array(ref items) = value {
-                    if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
-                        if cmd.eq_ignore_ascii_case("SUBSCRIBE")
-                            || cmd.eq_ignore_ascii_case("PSUBSCRIBE")
-                        {
-                            let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
+                if let resp::RespValue::Array(ref items) = value
+                    && let Some(cmd) = items.first().and_then(|a| a.as_str())
+                {
+                    if cmd.eq_ignore_ascii_case("SUBSCRIBE")
+                        || cmd.eq_ignore_ascii_case("PSUBSCRIBE")
+                    {
+                        let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
+                        for arg in &items[1..] {
+                            if let Some(ch) = arg.as_str() {
+                                let rx = if is_pattern {
+                                    match store.psubscribe(ch) {
+                                        Some(rx) => rx,
+                                        None => continue,
+                                    }
+                                } else {
+                                    store.subscribe(ch)
+                                };
+                                receivers.push((ch.to_string(), is_pattern, rx));
+                                let kind = if is_pattern {
+                                    "psubscribe"
+                                } else {
+                                    "subscribe"
+                                };
+                                let msg = resp::array(vec![
+                                    resp::bulk_string(kind),
+                                    resp::bulk_string(ch),
+                                    resp::integer(receivers.len() as i64),
+                                ]);
+                                let _ = resp::write_value(writer, &msg);
+                            }
+                        }
+                        let _ = writer.flush();
+                    } else if cmd.eq_ignore_ascii_case("PUNSUBSCRIBE") {
+                        for arg in &items[1..] {
+                            if let Some(pat) = arg.as_str() {
+                                receivers.retain(|(name, is_pat, _)| !(*is_pat && name == pat));
+                                store.punsubscribe(pat);
+                                let msg = resp::array(vec![
+                                    resp::bulk_string("punsubscribe"),
+                                    resp::bulk_string(pat),
+                                    resp::integer(receivers.len() as i64),
+                                ]);
+                                let _ = resp::write_value(writer, &msg);
+                            }
+                        }
+                        let _ = writer.flush();
+                    } else if cmd.eq_ignore_ascii_case("UNSUBSCRIBE") {
+                        if items.len() > 1 {
                             for arg in &items[1..] {
                                 if let Some(ch) = arg.as_str() {
-                                    let rx = if is_pattern {
-                                        match store.psubscribe(ch) {
-                                            Some(rx) => rx,
-                                            None => continue,
-                                        }
-                                    } else {
-                                        store.subscribe(ch)
-                                    };
-                                    receivers.push((ch.to_string(), is_pattern, rx));
-                                    let kind = if is_pattern {
-                                        "psubscribe"
-                                    } else {
-                                        "subscribe"
-                                    };
+                                    receivers.retain(|(name, _, _)| name != ch);
+                                    store.unsubscribe(ch);
                                     let msg = resp::array(vec![
-                                        resp::bulk_string(kind),
+                                        resp::bulk_string("unsubscribe"),
                                         resp::bulk_string(ch),
                                         resp::integer(receivers.len() as i64),
                                     ]);
                                     let _ = resp::write_value(writer, &msg);
                                 }
                             }
-                            let _ = writer.flush();
-                        } else if cmd.eq_ignore_ascii_case("PUNSUBSCRIBE") {
-                            for arg in &items[1..] {
-                                if let Some(pat) = arg.as_str() {
-                                    receivers.retain(|(name, is_pat, _)| !(*is_pat && name == pat));
-                                    store.punsubscribe(pat);
-                                    let msg = resp::array(vec![
-                                        resp::bulk_string("punsubscribe"),
-                                        resp::bulk_string(pat),
-                                        resp::integer(receivers.len() as i64),
-                                    ]);
-                                    let _ = resp::write_value(writer, &msg);
-                                }
+                        } else {
+                            // Unsubscribe from all
+                            for (name, _, _) in &receivers {
+                                store.unsubscribe(name);
                             }
-                            let _ = writer.flush();
-                        } else if cmd.eq_ignore_ascii_case("UNSUBSCRIBE") {
-                            if items.len() > 1 {
-                                for arg in &items[1..] {
-                                    if let Some(ch) = arg.as_str() {
-                                        receivers.retain(|(name, _, _)| name != ch);
-                                        store.unsubscribe(ch);
-                                        let msg = resp::array(vec![
-                                            resp::bulk_string("unsubscribe"),
-                                            resp::bulk_string(ch),
-                                            resp::integer(receivers.len() as i64),
-                                        ]);
-                                        let _ = resp::write_value(writer, &msg);
-                                    }
-                                }
-                            } else {
-                                // Unsubscribe from all
-                                for (name, _, _) in &receivers {
-                                    store.unsubscribe(name);
-                                }
-                                receivers.clear();
-                                let msg = resp::array(vec![
-                                    resp::bulk_string("unsubscribe"),
-                                    resp::null(),
-                                    resp::integer(0),
-                                ]);
-                                let _ = resp::write_value(writer, &msg);
-                            }
-                            let _ = writer.flush();
-                            if receivers.is_empty() {
-                                return; // Exit subscription mode
-                            }
-                        } else if cmd.eq_ignore_ascii_case("PING") {
-                            let _ = resp::write_value(
-                                writer,
-                                &resp::array(vec![
-                                    resp::bulk_string("pong"),
-                                    resp::bulk_string(""),
-                                ]),
-                            );
-                            let _ = writer.flush();
+                            receivers.clear();
+                            let msg = resp::array(vec![
+                                resp::bulk_string("unsubscribe"),
+                                resp::null(),
+                                resp::integer(0),
+                            ]);
+                            let _ = resp::write_value(writer, &msg);
                         }
+                        let _ = writer.flush();
+                        if receivers.is_empty() {
+                            return; // Exit subscription mode
+                        }
+                    } else if cmd.eq_ignore_ascii_case("PING") {
+                        let _ = resp::write_value(
+                            writer,
+                            &resp::array(vec![resp::bulk_string("pong"), resp::bulk_string("")]),
+                        );
+                        let _ = writer.flush();
                     }
                 }
             }
@@ -2020,7 +2015,10 @@ fn main() {
     }
 
     // GELF UDP ingestion listener (optional, enabled via OXIDB_GELF_PORT)
-    let gelf_port: u16 = env::var("OXIDB_GELF_PORT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0".to_string())
+    let gelf_port: u16 = env::var("OXIDB_GELF_PORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("OXIDB_GELF_PORT must be a valid u16");
 
@@ -2043,7 +2041,10 @@ fn main() {
 
     // MessagePack UDP ingestion listener (optional, via OXIDB_MSGPACK_PORT) — a
     // cheaper log sink (compact binary, no per-field auto-indexing).
-    let msgpack_port: u16 = env::var("OXIDB_MSGPACK_PORT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0".to_string())
+    let msgpack_port: u16 = env::var("OXIDB_MSGPACK_PORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("OXIDB_MSGPACK_PORT must be a valid u16");
     if msgpack_port > 0 {
@@ -2064,7 +2065,10 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(604_800);
         if mpack_ttl > 0 {
-            if let Err(e) = state.db.create_ttl_index(&mpack_collection, "_ts", mpack_ttl) {
+            if let Err(e) = state
+                .db
+                .create_ttl_index(&mpack_collection, "_ts", mpack_ttl)
+            {
                 eprintln!("[oxidb] could not set retention on '{mpack_collection}': {e}");
             }
         } else if let Err(e) = state.db.create_index(&mpack_collection, "_ts") {
@@ -2143,20 +2147,21 @@ fn run_cluster_mode() {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-    let gelf: Option<Arc<GelfLogger>> = match env::var("OXIDB_GELF_ADDR").ok().filter(|s| !s.is_empty()) {
-        Some(gelf_addr) => {
-            let logger = GelfLogger::new(&gelf_addr).expect("failed to create GELF logger");
-            eprintln!("GELF logging: enabled ({gelf_addr})");
-            let logger = Arc::new(logger);
-            logger.send(
-                GelfLevel::Informational,
-                &format!("GELF logging: enabled ({gelf_addr})"),
-                &[],
-            );
-            Some(logger)
-        }
-        None => None,
-    };
+    let gelf: Option<Arc<GelfLogger>> =
+        match env::var("OXIDB_GELF_ADDR").ok().filter(|s| !s.is_empty()) {
+            Some(gelf_addr) => {
+                let logger = GelfLogger::new(&gelf_addr).expect("failed to create GELF logger");
+                eprintln!("GELF logging: enabled ({gelf_addr})");
+                let logger = Arc::new(logger);
+                logger.send(
+                    GelfLevel::Informational,
+                    &format!("GELF logging: enabled ({gelf_addr})"),
+                    &[],
+                );
+                Some(logger)
+            }
+            None => None,
+        };
 
     if verbose {
         eprintln!("verbose: enabled");

@@ -23,6 +23,12 @@ struct Sample {
     cpu_total_ticks: u64,
 }
 
+impl Default for ProcStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcStats {
     pub fn new() -> Self {
         Self {

@@ -9,7 +9,6 @@
 mod common;
 
 use common::*;
-use oxidb_sql::Value;
 
 fn seed() -> (tempfile::TempDir, oxidb_sql::SqlEngine) {
     let (dir, db) = open();

@@ -167,11 +167,7 @@ impl Decimal {
         let r = num % den;
         // half-up: if 2*|rem| >= |den|, round away from zero.
         let q = if r.abs().saturating_mul(2) >= den.abs() {
-            if (num < 0) != (den < 0) {
-                q - 1
-            } else {
-                q + 1
-            }
+            if (num < 0) != (den < 0) { q - 1 } else { q + 1 }
         } else {
             q
         };
@@ -244,11 +240,7 @@ impl Decimal {
             let cut = digits.len() - scale;
             format!("{}.{}", &digits[..cut], &digits[cut..])
         };
-        if neg {
-            format!("-{out}")
-        } else {
-            out
-        }
+        if neg { format!("-{out}") } else { out }
     }
 }
 

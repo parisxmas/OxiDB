@@ -239,7 +239,7 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 1)
         .filter(|w| !is_stop_word(w))
-        .map(|w| stem(w))
+        .map(stem)
         .collect()
 }
 
@@ -456,12 +456,11 @@ impl FtsIndex {
 
                 for posting in postings {
                     // Optionally filter by bucket
-                    if let Some(b) = bucket {
-                        if let Some(doc_info) = self.data.docs.get(&posting.doc_id) {
-                            if doc_info.bucket != b {
-                                continue;
-                            }
-                        }
+                    if let Some(b) = bucket
+                        && let Some(doc_info) = self.data.docs.get(&posting.doc_id)
+                        && doc_info.bucket != b
+                    {
+                        continue;
                     }
 
                     if let Some(doc_info) = self.data.docs.get(&posting.doc_id) {
@@ -906,6 +905,9 @@ fn resolve_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serd
 pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     let ct = content_type.to_lowercase();
 
+    // HTML and XML are different content types that happen to share a handler;
+    // merging the arms would hide that they are separately recognised.
+    #[allow(clippy::if_same_then_else)]
     if ct.starts_with("text/html") {
         let text = String::from_utf8_lossy(data);
         Some(strip_html_tags(&text))
@@ -1094,12 +1096,12 @@ fn extract_xlsx(data: &[u8]) -> Option<String> {
     let mut parts = Vec::new();
     for segment in xml.split("<t") {
         // handle both <t> and <t ...attributes>
-        if let Some(rest) = segment.split_once('>') {
-            if let Some((text, _)) = rest.1.split_once("</t>") {
-                let t = text.trim();
-                if !t.is_empty() {
-                    parts.push(t.to_string());
-                }
+        if let Some(rest) = segment.split_once('>')
+            && let Some((text, _)) = rest.1.split_once("</t>")
+        {
+            let t = text.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
             }
         }
     }

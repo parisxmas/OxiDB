@@ -12,8 +12,9 @@
 //! - `OXIBASE_UPSTREAM`         — data-plane wire endpoint, `host:port` (default `127.0.0.1:4444`)
 //! - `OXIBASE_UPSTREAM_USER`/`_PASSWORD` — optional SCRAM credentials for the wire
 //! - `OXIDB_PLATFORM_SECRET`    — signs developer sessions (required)
-//! - `OXIDB_SEAL_KEY`           — seals per-project secrets (falls back to the
-//!                                platform secret); the data plane unseals with the same
+//! - `OXIDB_SEAL_KEY` — seals per-project secrets (falls back to the platform
+//!   secret); the data plane unseals with the same
+//!
 //! plus the reused guard knobs `OXIDB_PLATFORM_SIGNUP_RATE/_CODE/MAX_ACCOUNTS/MAX_PROJECTS`.
 
 mod crypto;
@@ -107,7 +108,11 @@ fn main() {
         let resp = route(req, &state);
         if access_log {
             let who = req.client_meta();
-            let actor = if resp.status < 400 { bearer_subject(req) } else { None };
+            let actor = if resp.status < 400 {
+                bearer_subject(req)
+            } else {
+                None
+            };
             let ms = start.elapsed().map(|d| d.as_millis()).unwrap_or(0);
             let mut where_from = String::new();
             if !who.country.is_empty() {
@@ -149,7 +154,11 @@ fn main() {
                 _ => gelf::Level::Info,
             };
             let who = req.client_meta();
-            let actor = if resp.status < 400 { bearer_subject(req) } else { None };
+            let actor = if resp.status < 400 {
+                bearer_subject(req)
+            } else {
+                None
+            };
             let mut fields = vec![
                 ("app", "oxibase"),
                 ("method", req.method.as_str()),

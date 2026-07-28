@@ -60,7 +60,10 @@ fn to_engine(v: &Value) -> Value {
 fn to_engine_pipeline(update: &Value) -> Option<Value> {
     // Field-path escape-hatch expressions our evaluator doesn't implement.
     let txt = update.to_string();
-    if ["$setField", "$getField", "$literal", "$$ROOT"].iter().any(|t| txt.contains(t)) {
+    if ["$setField", "$getField", "$literal", "$$ROOT"]
+        .iter()
+        .any(|t| txt.contains(t))
+    {
         return None;
     }
     let stages: Vec<Value> = update
@@ -71,12 +74,12 @@ fn to_engine_pipeline(update: &Value) -> Option<Value> {
                     let st = to_engine(st);
                     // MongoDB keeps _id through $project unless _id: 0; the
                     // shimmed client id must survive the same way.
-                    if let Some(proj) = st.get("$project").and_then(|p| p.as_object()) {
-                        if !proj.contains_key(MID) {
-                            let mut proj = proj.clone();
-                            proj.insert(MID.to_string(), json!(1));
-                            return json!({ "$project": proj });
-                        }
+                    if let Some(proj) = st.get("$project").and_then(|p| p.as_object())
+                        && !proj.contains_key(MID)
+                    {
+                        let mut proj = proj.clone();
+                        proj.insert(MID.to_string(), json!(1));
+                        return json!({ "$project": proj });
                     }
                     st
                 })
@@ -99,12 +102,11 @@ fn from_engine(v: &Value) -> Value {
     // A pipeline update ($replaceRoot) may have dropped the shimmed client
     // id; surface the engine id so the document still HAS an _id, like a
     // real MongoDB document always does.
-    if let Some(obj) = out.as_object_mut() {
-        if !obj.contains_key("_id") {
-            if let Some(id) = engine_id {
-                obj.insert("_id".to_string(), id);
-            }
-        }
+    if let Some(obj) = out.as_object_mut()
+        && !obj.contains_key("_id")
+        && let Some(id) = engine_id
+    {
+        obj.insert("_id".to_string(), id);
     }
     out
 }
@@ -134,9 +136,7 @@ fn matches_root(expected: &Value, actual: Option<&Value>) -> bool {
         (Value::Array(e), Some(Value::Array(a))) => {
             e.len() == a.len() && e.iter().zip(a).all(|(ev, av)| matches_root(ev, Some(av)))
         }
-        (Value::Object(e), Some(Value::Object(a)))
-            if !e.keys().any(|k| k.starts_with("$$")) =>
-        {
+        (Value::Object(e), Some(Value::Object(a))) if !e.keys().any(|k| k.starts_with("$$")) => {
             e.iter().all(|(k, ev)| matches(ev, a.get(k)))
         }
         _ => matches(expected, actual),
@@ -144,20 +144,20 @@ fn matches_root(expected: &Value, actual: Option<&Value>) -> bool {
 }
 
 fn matches(expected: &Value, actual: Option<&Value>) -> bool {
-    if let Some(obj) = expected.as_object() {
-        if obj.len() == 1 {
-            if let Some(inner) = obj.get("$$unsetOrMatches") {
-                return match actual {
-                    None => true,
-                    Some(a) => matches(inner, Some(a)),
-                };
-            }
-            if let Some(e) = obj.get("$$exists") {
-                return e.as_bool() == Some(actual.is_some());
-            }
-            if obj.contains_key("$$type") {
-                return actual.is_some(); // loose: presence check only
-            }
+    if let Some(obj) = expected.as_object()
+        && obj.len() == 1
+    {
+        if let Some(inner) = obj.get("$$unsetOrMatches") {
+            return match actual {
+                None => true,
+                Some(a) => matches(inner, Some(a)),
+            };
+        }
+        if let Some(e) = obj.get("$$exists") {
+            return e.as_bool() == Some(actual.is_some());
+        }
+        if obj.contains_key("$$type") {
+            return actual.is_some(); // loose: presence check only
         }
     }
     let Some(actual) = actual else { return false };
@@ -240,10 +240,10 @@ impl Runner {
             }
             opts.sort = Some(fields);
         }
-        if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
-            if l > 0 {
-                opts.limit = Some(l);
-            }
+        if let Some(l) = args.get("limit").and_then(|v| v.as_u64())
+            && l > 0
+        {
+            opts.limit = Some(l);
         }
         if let Some(s) = args.get("skip").and_then(|v| v.as_u64()) {
             opts.skip = Some(s);
@@ -254,11 +254,22 @@ impl Runner {
     /// Arguments we understand or can safely ignore, per operation.
     fn check_args(op: &str, args: &Map<String, Value>) -> Option<String> {
         let allowed: &[&str] = match op {
-            "find" => &["filter", "sort", "limit", "skip", "batchSize", "comment", "hint", "projection"],
+            "find" => &[
+                "filter",
+                "sort",
+                "limit",
+                "skip",
+                "batchSize",
+                "comment",
+                "hint",
+                "projection",
+            ],
             "findOne" => &["filter", "sort", "comment", "hint", "projection"],
             "insertOne" => &["document", "comment"],
             "insertMany" => &["documents", "ordered", "comment"],
-            "updateOne" | "updateMany" => &["filter", "update", "comment", "upsert", "arrayFilters"],
+            "updateOne" | "updateMany" => {
+                &["filter", "update", "comment", "upsert", "arrayFilters"]
+            }
             "deleteOne" | "deleteMany" => &["filter", "comment"],
             "countDocuments" => &["filter", "comment", "skip", "limit"],
             "estimatedDocumentCount" => &["comment", "maxTimeMS"],
@@ -267,8 +278,25 @@ impl Runner {
             "bulkWrite" => &["requests", "ordered", "comment"],
             "distinct" => &["fieldName", "filter", "comment"],
             "replaceOne" => &["filter", "replacement", "comment"],
-            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection", "upsert", "arrayFilters"],
-            "findOneAndReplace" => &["filter", "replacement", "returnDocument", "sort", "comment", "projection", "upsert"],
+            "findOneAndUpdate" => &[
+                "filter",
+                "update",
+                "returnDocument",
+                "sort",
+                "comment",
+                "projection",
+                "upsert",
+                "arrayFilters",
+            ],
+            "findOneAndReplace" => &[
+                "filter",
+                "replacement",
+                "returnDocument",
+                "sort",
+                "comment",
+                "projection",
+                "upsert",
+            ],
             "findOneAndDelete" => &["filter", "sort", "comment", "projection"],
             _ => return Some(format!("op:{op}")),
         };
@@ -293,7 +321,13 @@ impl Runner {
             opts.limit = Some(1);
             self.db
                 .find_with_options(coll, filter, &opts)
-                .map(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+                .map(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
                 .map_err(|e| e.to_string())
         } else {
             self.db.find_one(coll, filter).map_err(|e| e.to_string())
@@ -481,10 +515,16 @@ impl Runner {
                 } else {
                     to_engine(update)
                 };
-                let upsert = args.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
+                let upsert = args
+                    .get("upsert")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let multi = name == "updateMany";
                 let af = args.get("arrayFilters").map(to_engine);
-                match self.db.update_full(&coll, &filter(), &update, multi, upsert, af.as_ref()) {
+                match self
+                    .db
+                    .update_full(&coll, &filter(), &update, multi, upsert, af.as_ref())
+                {
                     Ok((matched, modified, None)) => OpOutcome::Ok(Some(json!({
                         "matchedCount": matched, "modifiedCount": modified, "upsertedCount": 0
                     }))),
@@ -539,8 +579,17 @@ impl Runner {
                     return OpOutcome::Skip("missing pipeline".into());
                 };
                 const STAGES: &[&str] = &[
-                    "$match", "$group", "$sort", "$skip", "$limit", "$project", "$count",
-                    "$unwind", "$addFields", "$lookup", "$facet",
+                    "$match",
+                    "$group",
+                    "$sort",
+                    "$skip",
+                    "$limit",
+                    "$project",
+                    "$count",
+                    "$unwind",
+                    "$addFields",
+                    "$lookup",
+                    "$facet",
                 ];
                 for st in pipeline {
                     let Some(key) = st.as_object().and_then(|o| o.keys().next()) else {
@@ -552,9 +601,9 @@ impl Runner {
                 }
                 let p = to_engine(&Value::Array(pipeline.clone()));
                 match self.db.aggregate(&coll, &p) {
-                    Ok(docs) => OpOutcome::Ok(Some(Value::Array(
-                        docs.iter().map(from_engine).collect(),
-                    ))),
+                    Ok(docs) => {
+                        OpOutcome::Ok(Some(Value::Array(docs.iter().map(from_engine).collect())))
+                    }
                     Err(e) => OpOutcome::Err(e.to_string()),
                 }
             }
@@ -637,14 +686,13 @@ impl Runner {
                         // MongoDB inserts the replacement; a filter-equality
                         // _id fills in when the replacement lacks one.
                         let mut doc = to_engine(replacement);
-                        if doc.get(MID).is_none() {
-                            if let Some(fid) = args.get("filter").and_then(|f| f.get("_id")) {
-                                if !fid.is_object() || fid.get("$eq").is_some() {
-                                    let v = fid.get("$eq").unwrap_or(fid).clone();
-                                    if let Some(obj) = doc.as_object_mut() {
-                                        obj.insert(MID.to_string(), v);
-                                    }
-                                }
+                        if doc.get(MID).is_none()
+                            && let Some(fid) = args.get("filter").and_then(|f| f.get("_id"))
+                            && (!fid.is_object() || fid.get("$eq").is_some())
+                        {
+                            let v = fid.get("$eq").unwrap_or(fid).clone();
+                            if let Some(obj) = doc.as_object_mut() {
+                                obj.insert(MID.to_string(), v);
                             }
                         }
                         return match self.db.insert(&coll, doc) {
@@ -706,8 +754,7 @@ impl Runner {
                 };
                 let engine_id = pre.get("_id").cloned().unwrap_or(Value::Null);
                 let id_query = json!({ "_id": engine_id });
-                let after = args.get("returnDocument").and_then(|v| v.as_str())
-                    == Some("After");
+                let after = args.get("returnDocument").and_then(|v| v.as_str()) == Some("After");
                 let applied: Result<(), String> = match name {
                     "findOneAndUpdate" => {
                         let Some(update) = args.get("update") else {
@@ -772,8 +819,7 @@ impl Runner {
                 // A standalone bulkWrite IS the sequential application of
                 // its sub-operations; decompose and reuse the single-op
                 // paths, accumulating the unified result counters.
-                let (mut ins, mut mat, mut modc, mut del, mut ups) =
-                    (0u64, 0u64, 0u64, 0u64, 0u64);
+                let (mut ins, mut mat, mut modc, mut del, mut ups) = (0u64, 0u64, 0u64, 0u64, 0u64);
                 let mut inserted_ids = Map::new();
                 let mut upserted_ids = Map::new();
                 for (i, req) in requests.iter().enumerate() {
@@ -859,9 +905,14 @@ fn run_file(path: &PathBuf, report: &mut Report) {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let db = oxidb::OxiDb::open(dir.path()).unwrap();
+    let _db = oxidb::OxiDb::open(dir.path()).unwrap();
 
-    for (ti, test) in spec["tests"].as_array().unwrap_or(&Vec::new()).iter().enumerate() {
+    for (ti, test) in spec["tests"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .enumerate()
+    {
         let desc = test["description"].as_str().unwrap_or("?").to_string();
         let label = format!("{file_name} :: {desc}");
         let legacy_only = |reqs: &Value| -> bool {
@@ -870,7 +921,10 @@ fn run_file(path: &PathBuf, report: &mut Report) {
             })
         };
         if legacy_only(&spec["runOnRequirements"]) || legacy_only(&test["runOnRequirements"]) {
-            *report.skipped.entry("runOn: legacy-server behavior".into()).or_default() += 1;
+            *report
+                .skipped
+                .entry("runOn: legacy-server behavior".into())
+                .or_default() += 1;
             continue;
         }
         if let Some(r) = test.get("skipReason").and_then(|v| v.as_str()) {
@@ -890,7 +944,11 @@ fn run_file(path: &PathBuf, report: &mut Report) {
         };
         // Seed initialData (per-test copies).
         for seed in spec["initialData"].as_array().unwrap_or(&Vec::new()) {
-            let cname = format!("{}{}", seed["collectionName"].as_str().unwrap_or(""), suffix);
+            let cname = format!(
+                "{}{}",
+                seed["collectionName"].as_str().unwrap_or(""),
+                suffix
+            );
             let _ = runner.db.drop_collection(&cname);
             for d in seed["documents"].as_array().unwrap_or(&Vec::new()) {
                 runner.db.insert(&cname, to_engine(d)).unwrap();
@@ -931,7 +989,10 @@ fn run_file(path: &PathBuf, report: &mut Report) {
                         // order — retry as a multiset.
                         let ok = ordered_ok
                             || (!has_order
-                                && match (expected.as_array(), actual.as_ref().and_then(|a| a.as_array())) {
+                                && match (
+                                    expected.as_array(),
+                                    actual.as_ref().and_then(|a| a.as_array()),
+                                ) {
                                     (Some(e), Some(a)) if e.len() == a.len() => {
                                         let mut used = vec![false; a.len()];
                                         e.iter().all(|ev| {
@@ -963,8 +1024,11 @@ fn run_file(path: &PathBuf, report: &mut Report) {
         // Final collection contents.
         if failure.is_none() && skip.is_none() {
             for out in test["outcome"].as_array().unwrap_or(&Vec::new()) {
-                let cname =
-                    format!("{}{}", out["collectionName"].as_str().unwrap_or(""), runner.suffix);
+                let cname = format!(
+                    "{}{}",
+                    out["collectionName"].as_str().unwrap_or(""),
+                    runner.suffix
+                );
                 let docs = runner
                     .db
                     .find(&cname, &json!({}))
@@ -1024,7 +1088,10 @@ fn mongo_crud_spec_suite() {
     println!("files:   {}", files.len());
     println!("passed:  {}", report.passed.len());
     println!("failed:  {} (unexpected)", report.failed.len());
-    println!("known:   {} (documented divergences)", report.known_failed.len());
+    println!(
+        "known:   {} (documented divergences)",
+        report.known_failed.len()
+    );
     println!("skipped: {skipped_total} (unsupported features)");
     println!("\n-- skip reasons --");
     let mut reasons: Vec<_> = report.skipped.iter().collect();

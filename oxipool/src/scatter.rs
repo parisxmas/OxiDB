@@ -682,10 +682,10 @@ fn merge_first_match(results: Vec<Result<Value, String>>) -> Vec<u8> {
         match r {
             Ok(v) => {
                 if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
-                    if let Some(data) = v.get("data") {
-                        if !data.is_null() {
-                            return serde_json::to_vec(v).unwrap();
-                        }
+                    if let Some(data) = v.get("data")
+                        && !data.is_null()
+                    {
+                        return serde_json::to_vec(v).unwrap();
                     }
                 } else if first_error.is_none() {
                     first_error = Some(

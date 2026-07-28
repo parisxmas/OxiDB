@@ -673,27 +673,22 @@ impl OxiDb {
         std::thread::Builder::new()
             .name("oxidb-ttl".into())
             .spawn(move || {
-                loop {
-                    match rx.recv_timeout(interval) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Time to check for expired documents. The
-                            // shared commit lock puts TTL deletes inside the
-                            // MVCC-lite snapshot boundary like any writer: a
-                            // snapshot either wholly sees a doc TTL kept, or
-                            // resolves the recorded prior of one it evicted.
-                            let _occ_guard = db.commit_lock.read();
-                            let cols = db.collections.read();
-                            for col_arc in cols.values() {
-                                col_arc.evict_expired();
-                                col_arc.evict_ttl_indexed();
-                            }
-                            drop(cols);
-                            drop(_occ_guard);
-                            #[cfg(not(target_arch = "wasm32"))]
-                            db.snap_gate.expire_tick();
-                        }
-                        _ => break, // Shutdown signal or channel closed
+                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(interval) {
+                    // Time to check for expired documents. The
+                    // shared commit lock puts TTL deletes inside the
+                    // MVCC-lite snapshot boundary like any writer: a
+                    // snapshot either wholly sees a doc TTL kept, or
+                    // resolves the recorded prior of one it evicted.
+                    let _occ_guard = db.commit_lock.read();
+                    let cols = db.collections.read();
+                    for col_arc in cols.values() {
+                        col_arc.evict_expired();
+                        col_arc.evict_ttl_indexed();
                     }
+                    drop(cols);
+                    drop(_occ_guard);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    db.snap_gate.expire_tick();
                 }
             })
             .expect("failed to spawn TTL thread");
@@ -1107,11 +1102,11 @@ impl OxiDb {
             cols.keys().cloned().collect()
         };
         #[cfg(not(target_arch = "wasm32"))]
-        if !self.in_memory {
-            if let Ok(disk_names) = Self::discover_collection_names_on_disk(&self.data_dir) {
-                for name in disk_names {
-                    names.insert(name);
-                }
+        if !self.in_memory
+            && let Ok(disk_names) = Self::discover_collection_names_on_disk(&self.data_dir)
+        {
+            for name in disk_names {
+                names.insert(name);
             }
         }
         let mut result: Vec<String> = names.into_iter().collect();
@@ -1272,60 +1267,55 @@ impl OxiDb {
             .name("oxidb-sync".into())
             .spawn(move || {
                 let mut flush_counter = 0u64;
-                loop {
-                    match rx.recv_timeout(interval) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // A prior fsync failure poisoned durability:
-                            // never persist the untrusted in-memory state
-                            // (it holds a rejected transaction). Let
-                            // recovery rebuild from the durable snapshot +
-                            // marked-WAL replay instead.
-                            if db.durability_poisoned.load(Ordering::SeqCst) {
-                                continue;
-                            }
-                            // Snapshot the commit log BEFORE persisting.
-                            // Under the commit lock no transaction sits
-                            // between its commit point and apply, so every
-                            // id in the snapshot is fully applied in memory;
-                            // the persist pass below then makes that data
-                            // durable, after which the ids (and their WAL
-                            // entries) are redundant and can be pruned. Ids
-                            // marked after the snapshot stay — their data may
-                            // post-date this persist.
-                            let prune: Vec<u64> = {
-                                let _commit_guard = db.commit_lock.write();
-                                // Group commit applies writes before their
-                                // marks are durable; wait for every applied
-                                // tx to clear the mark turnstile so the
-                                // persist below never snapshots data whose
-                                // commit record could still be lost.
-                                db.wait_marks_settled();
-                                db.tx_log
-                                    .read_committed()
-                                    .map(|s| s.into_iter().collect())
-                                    .unwrap_or_default()
-                            };
-                            let mut all_persisted = true;
-                            let cols = db.collections.read();
-                            for col_arc in cols.values() {
-                                if col_arc.sync_writes().is_err() {
-                                    all_persisted = false;
-                                }
-                            }
-                            drop(cols);
-                            if all_persisted && !prune.is_empty() {
-                                let _ = db.tx_log.remove_committed_many(&prune);
-                            }
-                            flush_counter += 1;
-                            // Persist field indexes roughly every 10s
-                            // regardless of cadence — they're small and
-                            // their write is independent of btree pages.
-                            let ticks_per_10s = (10_000 / interval.as_millis().max(1)) as u64;
-                            if flush_counter % ticks_per_10s.max(1) == 0 {
-                                db.flush_indexes();
-                            }
+                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(interval) {
+                    // A prior fsync failure poisoned durability:
+                    // never persist the untrusted in-memory state
+                    // (it holds a rejected transaction). Let
+                    // recovery rebuild from the durable snapshot +
+                    // marked-WAL replay instead.
+                    if db.durability_poisoned.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    // Snapshot the commit log BEFORE persisting.
+                    // Under the commit lock no transaction sits
+                    // between its commit point and apply, so every
+                    // id in the snapshot is fully applied in memory;
+                    // the persist pass below then makes that data
+                    // durable, after which the ids (and their WAL
+                    // entries) are redundant and can be pruned. Ids
+                    // marked after the snapshot stay — their data may
+                    // post-date this persist.
+                    let prune: Vec<u64> = {
+                        let _commit_guard = db.commit_lock.write();
+                        // Group commit applies writes before their
+                        // marks are durable; wait for every applied
+                        // tx to clear the mark turnstile so the
+                        // persist below never snapshots data whose
+                        // commit record could still be lost.
+                        db.wait_marks_settled();
+                        db.tx_log
+                            .read_committed()
+                            .map(|s| s.into_iter().collect())
+                            .unwrap_or_default()
+                    };
+                    let mut all_persisted = true;
+                    let cols = db.collections.read();
+                    for col_arc in cols.values() {
+                        if col_arc.sync_writes().is_err() {
+                            all_persisted = false;
                         }
-                        _ => break,
+                    }
+                    drop(cols);
+                    if all_persisted && !prune.is_empty() {
+                        let _ = db.tx_log.remove_committed_many(&prune);
+                    }
+                    flush_counter += 1;
+                    // Persist field indexes roughly every 10s
+                    // regardless of cadence — they're small and
+                    // their write is independent of btree pages.
+                    let ticks_per_10s = (10_000 / interval.as_millis().max(1)) as u64;
+                    if flush_counter % ticks_per_10s.max(1) == 0 {
+                        db.flush_indexes();
                     }
                 }
                 let cols = db.collections.read();
@@ -1393,21 +1383,18 @@ impl OxiDb {
                     ) {
                         eprintln!("[archiver] {label} archive pass failed: {e}");
                     }
-                    if retention_hours > 0 {
-                        if let Err(e) = crate::archive::prune_archive(
+                    if retention_hours > 0
+                        && let Err(e) = crate::archive::prune_archive(
                             &archive_dir,
                             Some(&db.data_dir),
                             retention_hours,
-                        ) {
-                            eprintln!("[archiver] {label} prune failed: {e}");
-                        }
+                        )
+                    {
+                        eprintln!("[archiver] {label} prune failed: {e}");
                     }
                 };
-                loop {
-                    match rx.recv_timeout(interval) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => pass("periodic"),
-                        _ => break,
-                    }
+                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(interval) {
+                    pass("periodic");
                 }
                 // Final pass on shutdown so the last sealed segments land.
                 pass("final");
@@ -1482,7 +1469,7 @@ impl OxiDb {
         self.list_collections()
             .iter()
             .filter(|c| !c.starts_with('_'))
-            .map(|c| self.count(c, &json!({})).unwrap_or(0) as usize)
+            .map(|c| self.count(c, &json!({})).unwrap_or(0))
             .sum()
     }
 
@@ -1996,17 +1983,17 @@ impl OxiDb {
                 });
             }
         }
-        if let Some(id) = upserted {
-            if self.change_broker.has_subscribers() {
-                self.change_broker.emit(ChangeEvent {
-                    token: 0,
-                    operation: OperationType::Insert,
-                    collection: collection.to_string(),
-                    doc_id: id,
-                    document: None,
-                    tx_id: None,
-                });
-            }
+        if let Some(id) = upserted
+            && self.change_broker.has_subscribers()
+        {
+            self.change_broker.emit(ChangeEvent {
+                token: 0,
+                operation: OperationType::Insert,
+                collection: collection.to_string(),
+                doc_id: id,
+                document: None,
+                tx_id: None,
+            });
         }
         Ok((matched, ids.len() as u64, upserted))
     }
@@ -2067,18 +2054,18 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let _occ_guard = self.commit_lock.read(); // see update()
         let result = col.find_and_modify(query, update)?;
-        if let Some(ref doc) = result {
-            if self.change_broker.has_subscribers() {
-                let doc_id = doc.get("_id").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.change_broker.emit(ChangeEvent {
-                    token: 0,
-                    operation: OperationType::Update,
-                    collection: collection.to_string(),
-                    doc_id,
-                    document: None,
-                    tx_id: None,
-                });
-            }
+        if let Some(ref doc) = result
+            && self.change_broker.has_subscribers()
+        {
+            let doc_id = doc.get("_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            self.change_broker.emit(ChangeEvent {
+                token: 0,
+                operation: OperationType::Update,
+                collection: collection.to_string(),
+                doc_id,
+                document: None,
+                tx_id: None,
+            });
         }
         Ok(result)
     }
@@ -2414,10 +2401,10 @@ impl OxiDb {
                 }
                 crate::snapshot::Resolved::Prior(None) => None, // born after s
             };
-            if let Some(v) = resolved {
-                if crate::query::matches_value(&parsed, &v) {
-                    out.push(v);
-                }
+            if let Some(v) = resolved
+                && crate::query::matches_value(&parsed, &v)
+            {
+                out.push(v);
             }
             Ok(())
         };
@@ -2983,8 +2970,10 @@ impl OxiDb {
             // point: records written pending, records it displaced. Settled in
             // phase 2 once the mark is durable — see `apply_prepared_pending`.
             #[cfg(not(target_arch = "wasm32"))]
-            let mut deferred: Vec<(Arc<BTreeCollection>, crate::btree_storage::PendingOps)> =
-                Vec::with_capacity(all_mutations.len());
+            let mut deferred: Vec<(
+                Arc<BTreeCollection>,
+                crate::btree_storage::PendingOps,
+            )> = Vec::with_capacity(all_mutations.len());
             'apply: for (col_name, mut mutations) in all_mutations {
                 let col = col_map.get(&col_name).unwrap();
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2998,7 +2987,7 @@ impl OxiDb {
                 // it commits, which is the in-RAM mode's version of the same
                 // problem.
                 #[cfg(not(target_arch = "wasm32"))]
-                deferred.push((Arc::clone(&col), ops));
+                deferred.push((Arc::clone(col), ops));
                 if let Err(e) = applied {
                     apply_result = Err(e);
                     break 'apply;
@@ -3381,20 +3370,19 @@ impl OxiDb {
                 "key": r.key,
                 "score": r.score,
             });
-            if max_snippets > 0 && snippet_chars > 0 {
-                if let Ok((data, meta)) = self.blob_store.get_object(&r.bucket, &r.key) {
-                    if let Some(text) = crate::fts::extract_text(&data, &meta.content_type) {
-                        let snippets =
-                            crate::fts::highlight(&text, query, snippet_chars, max_snippets);
-                        if !snippets.is_empty() {
-                            let arr: Vec<Value> = snippets
-                                .into_iter()
-                                .map(|s| Value::String(s.text))
-                                .collect();
-                            if let Some(obj) = entry.as_object_mut() {
-                                obj.insert("highlights".to_string(), Value::Array(arr));
-                            }
-                        }
+            if max_snippets > 0
+                && snippet_chars > 0
+                && let Ok((data, meta)) = self.blob_store.get_object(&r.bucket, &r.key)
+                && let Some(text) = crate::fts::extract_text(&data, &meta.content_type)
+            {
+                let snippets = crate::fts::highlight(&text, query, snippet_chars, max_snippets);
+                if !snippets.is_empty() {
+                    let arr: Vec<Value> = snippets
+                        .into_iter()
+                        .map(|s| Value::String(s.text))
+                        .collect();
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("highlights".to_string(), Value::Array(arr));
                     }
                 }
             }
@@ -3807,10 +3795,10 @@ impl OxiDb {
         }
 
         // Ensure parent directory exists
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         // 2. Discover any collections on disk that haven't been loaded yet
@@ -4026,10 +4014,9 @@ would silently shadow the old data with empty collections. Migrate or delete the
             if matches!(
                 ext,
                 Some("btree") | Some("bdat") | Some("wal") | Some("dat")
-            ) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.insert(stem.to_string());
-                }
+            ) && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                names.insert(stem.to_string());
             }
         }
         Ok(names.into_iter().collect())
@@ -4116,7 +4103,9 @@ mod tests {
         assert!(matches!(e, Error::DocumentLimitExceeded(3)));
         // insert_many respects the remaining headroom too.
         db.set_max_documents(5);
-        let e2 = db.insert_many("c", vec![json!({}), json!({}), json!({})]).unwrap_err();
+        let e2 = db
+            .insert_many("c", vec![json!({}), json!({}), json!({})])
+            .unwrap_err();
         assert!(matches!(e2, Error::DocumentLimitExceeded(5))); // 3 existing + 3 > 5
         db.insert_many("c", vec![json!({}), json!({})]).unwrap(); // 3 + 2 = 5 ok
         // System collections don't count against the quota.

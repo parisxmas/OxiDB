@@ -2,11 +2,11 @@
 //! protocol, the embedded FFI): bind parameters from a JSON array, execute,
 //! and shape results as JSON — one entry per statement.
 
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 use crate::ast::QueryResult;
 use crate::types::Value;
-use crate::{is_read_only, SqlEngine};
+use crate::{SqlEngine, is_read_only};
 
 /// Execute a SQL string with optional JSON `params` against `engine` and
 /// return the results as a JSON array (one entry per statement). With

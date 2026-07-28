@@ -410,12 +410,12 @@ impl Storage {
         // Fast path: read from mmap (no syscall)
         {
             let guard = self.read_mmap.read();
-            if let Some(ref mmap) = *guard {
-                if data_end_u64 <= mmap.len() as u64 {
-                    let data_start = data_start_u64 as usize;
-                    let data_end = data_end_u64 as usize;
-                    return self.decode_payload(&mmap[data_start..data_end]);
-                }
+            if let Some(ref mmap) = *guard
+                && data_end_u64 <= mmap.len() as u64
+            {
+                let data_start = data_start_u64 as usize;
+                let data_end = data_end_u64 as usize;
+                return self.decode_payload(&mmap[data_start..data_end]);
             }
         }
 
@@ -473,22 +473,22 @@ impl Storage {
                 .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
             // Fast path: data is within the mmap.
-            if let Some(m) = mmap {
-                if data_end <= mmap_len {
-                    let raw = &m[data_start as usize..data_end as usize];
-                    if !encrypted && !payload_is_compressed(raw) {
-                        // Zero-copy: hand the mmap slice straight to the caller.
-                        if !f(i, raw)? {
-                            return Ok(());
-                        }
-                    } else {
-                        let decoded = self.decode_payload(raw)?;
-                        if !f(i, &decoded)? {
-                            return Ok(());
-                        }
+            if let Some(m) = mmap
+                && data_end <= mmap_len
+            {
+                let raw = &m[data_start as usize..data_end as usize];
+                if !encrypted && !payload_is_compressed(raw) {
+                    // Zero-copy: hand the mmap slice straight to the caller.
+                    if !f(i, raw)? {
+                        return Ok(());
                     }
-                    continue;
+                } else {
+                    let decoded = self.decode_payload(raw)?;
+                    if !f(i, &decoded)? {
+                        return Ok(());
+                    }
                 }
+                continue;
             }
 
             // Slow path: recent append beyond the mmap — pread into scratch.
@@ -538,7 +538,7 @@ impl Storage {
                 .checked_add(loc.length() as u64)
                 .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
-            let decoded = if let Some(ref mmap) = mmap_ref {
+            let decoded = if let Some(mmap) = mmap_ref {
                 if data_end_u64 <= mmap_len as u64 {
                     // Zero-syscall mmap read
                     self.decode_payload(&mmap[data_start_u64 as usize..data_end_u64 as usize])?
@@ -673,7 +673,7 @@ impl Storage {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let chunk_size = (n + cpus - 1) / cpus;
+        let chunk_size = n.div_ceil(cpus);
 
         let results: Vec<Result<Vec<Vec<u8>>>> = std::thread::scope(|s| {
             let handles: Vec<_> = items
@@ -788,13 +788,14 @@ impl Storage {
     /// Re-create mmap if the file has grown beyond the current mmap range.
     fn remap_if_grown(&self, current_size: u64) {
         let old_len = self.mmap_len.load(std::sync::atomic::Ordering::Relaxed);
-        if current_size > old_len && current_size > 0 {
-            if let Ok(new_mmap) = unsafe { memmap2::Mmap::map(&self.read_file) } {
-                let new_len = new_mmap.len() as u64;
-                *self.read_mmap.write() = Some(new_mmap);
-                self.mmap_len
-                    .store(new_len, std::sync::atomic::Ordering::Relaxed);
-            }
+        if current_size > old_len
+            && current_size > 0
+            && let Ok(new_mmap) = unsafe { memmap2::Mmap::map(&self.read_file) }
+        {
+            let new_len = new_mmap.len() as u64;
+            *self.read_mmap.write() = Some(new_mmap);
+            self.mmap_len
+                .store(new_len, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1253,7 +1254,7 @@ mod tests {
     fn encrypted_storage_roundtrip() {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("test.key");
-        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        std::fs::write(&key_path, [0x42u8; 32]).unwrap();
         let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
 
         let storage =
@@ -1270,7 +1271,7 @@ mod tests {
     fn encrypted_data_not_plaintext() {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("test.key");
-        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        std::fs::write(&key_path, [0x42u8; 32]).unwrap();
         let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
 
         let data_path = dir.path().join("encrypted.dat");
@@ -1288,7 +1289,7 @@ mod tests {
     fn encrypted_iter_active() {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("test.key");
-        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        std::fs::write(&key_path, [0x42u8; 32]).unwrap();
         let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
 
         let storage =

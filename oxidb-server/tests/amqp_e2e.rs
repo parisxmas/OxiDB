@@ -78,6 +78,8 @@ impl Drop for BrokerGuard {
 fn start(port: u16, data: &Path, log: &str) -> BrokerGuard {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_AMQP_PORT", port.to_string())
         .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
@@ -101,6 +103,8 @@ fn start(port: u16, data: &Path, log: &str) -> BrokerGuard {
 fn start_with_mqtt(port: u16, mqtt_port: u16, data: &Path, log: &str) -> BrokerGuard {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_AMQP_PORT", port.to_string())
         .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))

@@ -125,10 +125,9 @@ impl TxCommitLog {
             .name("oxidb-tx-commit".into())
             .spawn(move || committer_loop(rx, file, committed, path_for_thread))
             .map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("spawn tx_log committer: {e}"),
-                ))
+                Error::Io(std::io::Error::other(format!(
+                    "spawn tx_log committer: {e}"
+                )))
             })?;
 
         Ok(Self {
@@ -255,10 +254,7 @@ impl Drop for TxCommitLog {
 }
 
 fn committer_gone() -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "tx_log committer thread is gone",
-    ))
+    Error::Io(std::io::Error::other("tx_log committer thread is gone"))
 }
 
 fn parse_log(file: &mut File) -> std::io::Result<HashSet<TransactionId>> {
@@ -345,10 +341,10 @@ fn persist(path: &Path, set: &HashSet<TransactionId>) -> std::io::Result<()> {
         f.sync_data()?;
     }
     fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+    if let Some(dir) = path.parent()
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
     }
     Ok(())
 }

@@ -185,6 +185,41 @@ fn check_window(
     None
 }
 
+/// Per-project storage cap in **bytes** for `db_ref` (the blob-store quota).
+/// Read off the project row like [`project_limits`]; falls back to
+/// `OXIDB_PROJECT_DEFAULT_MAX_STORAGE_BYTES` (default 100 MiB). `0` =
+/// unlimited. `None` when the platform is off or `db_ref` is not a project.
+pub fn project_storage_limit(mgr: &DatabaseManager, db_ref: &str) -> Option<u64> {
+    if !enabled() || db_ref == META_DB {
+        return None;
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
+    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
+    Some(
+        doc.get("max_storage_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                default_limit("OXIDB_PROJECT_DEFAULT_MAX_STORAGE_BYTES", 104_857_600) as u64
+            }),
+    )
+}
+
+/// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for
+/// `db_ref`, if it names an OxiBase project. Read in the clear — no seal key,
+/// no secret — so a data-plane node verifies project tokens without holding any
+/// signing material. `None` for the metadata db or an unknown ref.
+pub fn project_pubkey(mgr: &DatabaseManager, db_ref: &str) -> Option<Vec<u8>> {
+    if db_ref == META_DB {
+        return None;
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
+    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
+    let pub_b64 = doc.get("pubkey")?.as_str()?;
+    base64::engine::general_purpose::STANDARD
+        .decode(pub_b64)
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,39 +266,4 @@ mod tests {
             assert!(rate_limit_hit("unlimited-project", 0).is_none());
         }
     }
-}
-
-/// Per-project storage cap in **bytes** for `db_ref` (the blob-store quota).
-/// Read off the project row like [`project_limits`]; falls back to
-/// `OXIDB_PROJECT_DEFAULT_MAX_STORAGE_BYTES` (default 100 MiB). `0` =
-/// unlimited. `None` when the platform is off or `db_ref` is not a project.
-pub fn project_storage_limit(mgr: &DatabaseManager, db_ref: &str) -> Option<u64> {
-    if !enabled() || db_ref == META_DB {
-        return None;
-    }
-    let pdb = mgr.get_database(META_DB).ok()?;
-    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
-    Some(
-        doc.get("max_storage_bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| {
-                default_limit("OXIDB_PROJECT_DEFAULT_MAX_STORAGE_BYTES", 104_857_600) as u64
-            }),
-    )
-}
-
-/// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for
-/// `db_ref`, if it names an OxiBase project. Read in the clear — no seal key,
-/// no secret — so a data-plane node verifies project tokens without holding any
-/// signing material. `None` for the metadata db or an unknown ref.
-pub fn project_pubkey(mgr: &DatabaseManager, db_ref: &str) -> Option<Vec<u8>> {
-    if db_ref == META_DB {
-        return None;
-    }
-    let pdb = mgr.get_database(META_DB).ok()?;
-    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
-    let pub_b64 = doc.get("pubkey")?.as_str()?;
-    base64::engine::general_purpose::STANDARD
-        .decode(pub_b64)
-        .ok()
 }

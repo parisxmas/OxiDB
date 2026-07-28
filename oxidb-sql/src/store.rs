@@ -106,6 +106,8 @@ pub(crate) trait Store {
     }
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()>;
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
+    // Overridden by the engine to batch into one fsync; the default is the contract.
+    #[allow(dead_code)]
     /// Delete many rows of one table as a single durable unit (one WAL fsync
     /// where the implementation supports it). Returns rows deleted. The default
     /// falls back to per-row `delete`; the engine overrides it to batch — this

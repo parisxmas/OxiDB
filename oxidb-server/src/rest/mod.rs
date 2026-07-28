@@ -324,14 +324,14 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Reserved control-plane stores (the OxiBase `oxibase` metadata database)
     // are never served over the data plane — return the same "not found" as any
     // other unreachable database, without confirming it exists.
-    if let Some(name) = &db_name {
-        if crate::tenant_auth::is_reserved_db(name) {
-            return with_rest_cors(json_response(
-                404,
-                "Not Found",
-                json!({"error": format!("database not found: {name}")}),
-            ));
-        }
+    if let Some(name) = &db_name
+        && crate::tenant_auth::is_reserved_db(name)
+    {
+        return with_rest_cors(json_response(
+            404,
+            "Not Found",
+            json!({"error": format!("database not found: {name}")}),
+        ));
     }
     let scoped_state: RestState;
     let state = match &db_name {
@@ -435,7 +435,7 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     }
 
     // ── Auth endpoints (always public) ──────────────────────────────────
-    let result = match (req.method.as_str(), segments.as_slice()) {
+    match (req.method.as_str(), segments.as_slice()) {
         ("POST", ["api", "auth", "signup"]) => {
             return with_rest_cors(handle_auth_signup(req, state));
         }
@@ -450,10 +450,7 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                 json!({"status": "ok", "data": "pong"}),
             ));
         }
-        _ => None::<Value>,
-    };
-    if let Some(_) = result {
-        // handled above via early return
+        _ => {}
     }
 
     // ── JWT enforcement + extract auth context ─────────────────────
@@ -532,19 +529,19 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
             ),
             _ => false,
         };
-    if let Some(role) = enforced_role {
-        if !rest_permitted(
+    if let Some(role) = enforced_role
+        && !rest_permitted(
             role,
             req.method.as_str(),
             segments.as_slice(),
             tsdb_profile || sql_table_target,
-        ) {
-            return with_rest_cors(json_response(
-                403,
-                "Forbidden",
-                json!({"error": "insufficient privileges for this operation"}),
-            ));
-        }
+        )
+    {
+        return with_rest_cors(json_response(
+            403,
+            "Forbidden",
+            json!({"error": "insufficient privileges for this operation"}),
+        ));
     }
 
     // ── SQL engine (ADR-0010) ─────────────────────────────────────────
@@ -642,16 +639,11 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         // A bucket is a named object like any other, so a rule on its name
         // decides who may read it — the only way to keep stored files private
         // from a key that ships in a browser.
-        if req.method == "GET" || req.method == "HEAD" {
-            if let Some(bucket) = segments.get(2) {
-                if let Err((status, msg)) = read_allowed(state, bucket, &auth_ctx) {
-                    return with_rest_cors(json_response(
-                        status,
-                        "Forbidden",
-                        json!({ "error": msg }),
-                    ));
-                }
-            }
+        if (req.method == "GET" || req.method == "HEAD")
+            && let Some(bucket) = segments.get(2)
+            && let Err((status, msg)) = read_allowed(state, bucket, &auth_ctx)
+        {
+            return with_rest_cors(json_response(status, "Forbidden", json!({ "error": msg })));
         }
         return with_rest_cors(storage::handle(
             req,
@@ -1018,13 +1010,15 @@ fn handle_text_search(
     let highlight = body.get("highlight").and_then(|h| {
         if h.as_bool() == Some(true) {
             Some((80usize, 3usize))
-        } else if let Some(o) = h.as_object() {
-            Some((
-                o.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize,
-                o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
-            ))
         } else {
-            None
+            h.as_object().map(|o| {
+                (
+                    o.get("snippet_chars")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(80) as usize,
+                    o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
+                )
+            })
         }
     });
 
@@ -1032,7 +1026,9 @@ fn handle_text_search(
     // say so with a 400 and the remedy, instead of the generic 500 that
     // `db_err` would give an InvalidQuery.
     let searched = match highlight {
-        Some((chars, max)) => state.db.text_search_highlighted(col, query, limit, chars, max),
+        Some((chars, max)) => state
+            .db
+            .text_search_highlighted(col, query, limit, chars, max),
         None => state.db.text_search(col, query, limit),
     };
     let hits = searched.map_err(|e| match e {
@@ -1044,10 +1040,10 @@ fn handle_text_search(
     })?;
 
     let mut out = json!(hits);
-    if let rules::ReadAccess::Filter(expr) = access {
-        if let Value::Array(arr) = &mut out {
-            arr.retain(|d| rules::row_visible(&expr, auth, d));
-        }
+    if let rules::ReadAccess::Filter(expr) = access
+        && let Value::Array(arr) = &mut out
+    {
+        arr.retain(|d| rules::row_visible(&expr, auth, d));
     }
     Ok(out)
 }
@@ -1068,10 +1064,10 @@ fn handle_storage_search(
     auth: &AuthContext,
 ) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
-    let bucket = body
-        .get("bucket")
-        .and_then(|v| v.as_str())
-        .ok_or((400, "missing 'bucket' (search is per bucket, so its read rule applies)"))?;
+    let bucket = body.get("bucket").and_then(|v| v.as_str()).ok_or((
+        400,
+        "missing 'bucket' (search is per bucket, so its read rule applies)",
+    ))?;
     let query = body
         .get("query")
         .and_then(|v| v.as_str())
@@ -1091,13 +1087,15 @@ fn handle_storage_search(
     let highlight = body.get("highlight").and_then(|h| {
         if h.as_bool() == Some(true) {
             Some((80usize, 3usize))
-        } else if let Some(o) = h.as_object() {
-            Some((
-                o.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize,
-                o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
-            ))
         } else {
-            None
+            h.as_object().map(|o| {
+                (
+                    o.get("snippet_chars")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(80) as usize,
+                    o.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
+                )
+            })
         }
     });
 
@@ -1106,7 +1104,10 @@ fn handle_storage_search(
             .db
             .search_highlighted(Some(bucket), query, limit, chars, max)
             .map_err(db_err)?,
-        None => state.db.search(Some(bucket), query, limit).map_err(db_err)?,
+        None => state
+            .db
+            .search(Some(bucket), query, limit)
+            .map_err(db_err)?,
     };
     Ok(json!(hits))
 }
@@ -1343,10 +1344,10 @@ fn handle_sql_endpoint(
     // Arm the tenant's SQL engine with its OxiBase table quota before executing,
     // so a CREATE TABLE past the cap is rejected. Non-tenant databases get no
     // limit (project_limits → None).
-    if let (Some(name), Some(mgr)) = (db_name, &state.db_manager) {
-        if let Some(limits) = crate::tenant_auth::project_limits(mgr, name) {
-            crate::sql_bridge::set_table_limit(name, limits.max_tables);
-        }
+    if let (Some(name), Some(mgr)) = (db_name, &state.db_manager)
+        && let Some(limits) = crate::tenant_auth::project_limits(mgr, name)
+    {
+        crate::sql_bridge::set_table_limit(name, limits.max_tables);
     }
     match crate::sql_bridge::execute_json_in(db, sql, body.get("params"), readonly) {
         Ok(results) => json_response(200, "OK", json!({"results": results})),
@@ -1659,6 +1660,7 @@ fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)>
 ///   management (those are admin-only).
 /// - **Read** — only read-only endpoints (any `GET`, plus the read-only
 ///   `aggregate` POST).
+///
 /// `unruled_engine` marks a `/rest/v1/{x}` request bound for an engine with no
 /// per-row security rules — the time-series engine, or a SQL table.
 fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_engine: bool) -> bool {
@@ -1729,108 +1731,6 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_eng
                     | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod permission_tests {
-    use super::rest_permitted;
-    use crate::auth::Role;
-
-    #[test]
-    fn browser_keys_may_never_write_a_sql_table() {
-        // Same reasoning as the time-series case: SQL authorization is
-        // RBAC-only, so a write let through "for the rules to decide" would be
-        // decided by nothing. A published anon key could otherwise delete rows.
-        for role in [Role::Read, Role::Authenticated] {
-            assert!(rest_permitted(role, "GET", &["rest", "v1", "races"], true));
-            assert!(!rest_permitted(
-                role,
-                "POST",
-                &["rest", "v1", "races"],
-                true
-            ));
-            assert!(!rest_permitted(
-                role,
-                "DELETE",
-                &["rest", "v1", "races"],
-                true
-            ));
-            assert!(!rest_permitted(
-                role,
-                "PATCH",
-                &["rest", "v1", "races"],
-                true
-            ));
-        }
-        assert!(rest_permitted(
-            Role::ReadWrite,
-            "DELETE",
-            &["rest", "v1", "races"],
-            true
-        ));
-    }
-
-    #[test]
-    fn browser_keys_may_read_but_never_write_time_series() {
-        for role in [Role::Read, Role::Authenticated] {
-            // Reading a series is fine — that is what a dashboard does.
-            assert!(rest_permitted(role, "GET", &["rest", "v1", "cpu"], true));
-            // Writing is not: the time-series engine has no per-row rules, so
-            // nothing would adjudicate a write from a key that ships in a
-            // browser. (Regression: this used to be allowed, letting anyone
-            // holding a published anon key append points to a project.)
-            assert!(!rest_permitted(role, "POST", &["rest", "v1", "cpu"], true));
-            assert!(!rest_permitted(role, "PATCH", &["rest", "v1", "cpu"], true));
-            assert!(!rest_permitted(
-                role,
-                "DELETE",
-                &["rest", "v1", "cpu"],
-                true
-            ));
-        }
-    }
-
-    #[test]
-    fn document_writes_are_still_delegated_to_the_rules() {
-        // Without the tsdb profile the same URL is the document engine, whose
-        // per-collection rules decide — so the gate must let it through.
-        for role in [Role::Read, Role::Authenticated] {
-            assert!(rest_permitted(
-                role,
-                "POST",
-                &["rest", "v1", "notes"],
-                false
-            ));
-            assert!(rest_permitted(
-                role,
-                "PATCH",
-                &["rest", "v1", "notes"],
-                false
-            ));
-            assert!(rest_permitted(
-                role,
-                "DELETE",
-                &["rest", "v1", "notes"],
-                false
-            ));
-        }
-    }
-
-    #[test]
-    fn service_role_keys_may_write_time_series() {
-        assert!(rest_permitted(
-            Role::ReadWrite,
-            "POST",
-            &["rest", "v1", "cpu"],
-            true
-        ));
-        assert!(rest_permitted(
-            Role::Admin,
-            "POST",
-            &["rest", "v1", "cpu"],
-            true
-        ));
     }
 }
 
@@ -2047,4 +1947,106 @@ fn with_rest_cors(resp: HttpResponse) -> HttpResponse {
             "Content-Type, Authorization",
         )
         .with_header("Access-Control-Max-Age", "3600")
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::rest_permitted;
+    use crate::auth::Role;
+
+    #[test]
+    fn browser_keys_may_never_write_a_sql_table() {
+        // Same reasoning as the time-series case: SQL authorization is
+        // RBAC-only, so a write let through "for the rules to decide" would be
+        // decided by nothing. A published anon key could otherwise delete rows.
+        for role in [Role::Read, Role::Authenticated] {
+            assert!(rest_permitted(role, "GET", &["rest", "v1", "races"], true));
+            assert!(!rest_permitted(
+                role,
+                "POST",
+                &["rest", "v1", "races"],
+                true
+            ));
+            assert!(!rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "races"],
+                true
+            ));
+            assert!(!rest_permitted(
+                role,
+                "PATCH",
+                &["rest", "v1", "races"],
+                true
+            ));
+        }
+        assert!(rest_permitted(
+            Role::ReadWrite,
+            "DELETE",
+            &["rest", "v1", "races"],
+            true
+        ));
+    }
+
+    #[test]
+    fn browser_keys_may_read_but_never_write_time_series() {
+        for role in [Role::Read, Role::Authenticated] {
+            // Reading a series is fine — that is what a dashboard does.
+            assert!(rest_permitted(role, "GET", &["rest", "v1", "cpu"], true));
+            // Writing is not: the time-series engine has no per-row rules, so
+            // nothing would adjudicate a write from a key that ships in a
+            // browser. (Regression: this used to be allowed, letting anyone
+            // holding a published anon key append points to a project.)
+            assert!(!rest_permitted(role, "POST", &["rest", "v1", "cpu"], true));
+            assert!(!rest_permitted(role, "PATCH", &["rest", "v1", "cpu"], true));
+            assert!(!rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "cpu"],
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn document_writes_are_still_delegated_to_the_rules() {
+        // Without the tsdb profile the same URL is the document engine, whose
+        // per-collection rules decide — so the gate must let it through.
+        for role in [Role::Read, Role::Authenticated] {
+            assert!(rest_permitted(
+                role,
+                "POST",
+                &["rest", "v1", "notes"],
+                false
+            ));
+            assert!(rest_permitted(
+                role,
+                "PATCH",
+                &["rest", "v1", "notes"],
+                false
+            ));
+            assert!(rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "notes"],
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn service_role_keys_may_write_time_series() {
+        assert!(rest_permitted(
+            Role::ReadWrite,
+            "POST",
+            &["rest", "v1", "cpu"],
+            true
+        ));
+        assert!(rest_permitted(
+            Role::Admin,
+            "POST",
+            &["rest", "v1", "cpu"],
+            true
+        ));
+    }
 }

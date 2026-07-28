@@ -30,7 +30,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── measurement ─────────────────────────────────────────────────────────────
 
@@ -70,6 +70,8 @@ impl Stats {
 /// A client that can run one named workload, so the driver loop is identical
 /// for both wires and only the encoding differs.
 trait Wire {
+    // Part of the Wire trait's shape, used when a run prints per-wire labels.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
     /// Run `sql` and return how many rows came back. Implementations count
     /// their own bytes.
@@ -376,7 +378,10 @@ fn main() {
         let values: Vec<String> = (i..i + n)
             .map(|k| format!("({k}, 'name-{k}', {}.5, 'tag-{}')", k % 97, k % 7))
             .collect();
-        setup.sql(&format!("INSERT INTO bench VALUES {}", values.join(",")), &[]);
+        setup.sql(
+            &format!("INSERT INTO bench VALUES {}", values.join(",")),
+            &[],
+        );
         i += n;
     }
     setup.sql("DROP TABLE IF EXISTS bench_w", &[]);
@@ -526,6 +531,8 @@ fn main() {
 #[derive(Clone, Copy)]
 enum Kind {
     Oxi,
+    // Reachable via --mode seq; kept so the enum names every wire this measures.
+    #[allow(dead_code)]
     PgSimple,
     PgExtended,
 }
@@ -548,6 +555,8 @@ impl Kind {
     }
 }
 
+// One sweep cell's parameters, passed as the sweep defines them.
+#[allow(clippy::too_many_arguments)]
 /// Run `sql` from `threads` connections at once for `duration`, and report the
 /// aggregate.
 ///
@@ -607,8 +616,10 @@ fn sweep(
         }
     });
     let elapsed = start.elapsed();
-    let mut stats = Stats::default();
-    stats.latencies = all;
+    let stats = Stats {
+        latencies: all,
+        ..Stats::default()
+    };
     let throughput = stats.latencies.len() as f64 / elapsed.as_secs_f64();
     (throughput, stats.percentile(0.50), stats.percentile(0.99))
 }
@@ -655,8 +666,8 @@ fn run_concurrency(oxi_addr: &str, pg_addr: &str, levels: &[usize], secs: u64) {
     for (name, build, params, reset) in &cases {
         println!("\n{name} — throughput by concurrent connections");
         println!(
-            "  {:<14} {:>12} {:>10} {:>10}   {}",
-            "wire", "ops/sec", "p50", "p99", "scaling vs 1 conn"
+            "  {:<14} {:>12} {:>10} {:>10}   scaling vs 1 conn",
+            "wire", "ops/sec", "p50", "p99"
         );
         for kind in [Kind::Oxi, Kind::PgExtended] {
             let mut base = 0.0;

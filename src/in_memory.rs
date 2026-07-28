@@ -57,6 +57,12 @@ pub struct InMemStorage {
     path: PathBuf, // empty; exists only for API compat with `path()`
 }
 
+impl Default for InMemStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemStorage {
     pub fn new() -> Self {
         Self {
@@ -260,10 +266,8 @@ impl InMemStorage {
                 break;
             }
 
-            if status == RECORD_ACTIVE {
-                if !f(&snapshot[pos + 5..pos + 5 + length])? {
-                    break;
-                }
+            if status == RECORD_ACTIVE && !f(&snapshot[pos + 5..pos + 5 + length])? {
+                break;
             }
 
             pos += 5 + length;
@@ -298,10 +302,8 @@ impl InMemStorage {
                 break;
             }
 
-            if status == RECORD_ACTIVE {
-                if !f(&snapshot[pos + 5..pos + 5 + length])? {
-                    break;
-                }
+            if status == RECORD_ACTIVE && !f(&snapshot[pos + 5..pos + 5 + length])? {
+                break;
             }
 
             pos += 5 + length;
@@ -632,6 +634,8 @@ impl WalBackend {
         }
     }
 
+    // Recovery state, passed as the fields it actually is.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn recover(
         &self,
@@ -642,7 +646,7 @@ impl WalBackend {
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
         field_indexes: &mut HashMap<String, PagedFieldIndex>,
-        composite_indexes: &mut Vec<CompositeIndex>,
+        composite_indexes: &mut [CompositeIndex],
         verbose: bool,
         log_callback: &Option<LogCallback>,
     ) -> Result<()> {

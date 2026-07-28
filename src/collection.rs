@@ -1153,10 +1153,10 @@ impl Collection {
             let doc: Value = crate::codec::decode_doc(bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
                 let arc = Arc::new(doc);
-                if let Err(e) = idx.insert(id, &arc) {
-                    if verbose {
-                        eprintln!("[verbose] {}: vector index skip doc {}: {}", name, id, e);
-                    }
+                if let Err(e) = idx.insert(id, &arc)
+                    && verbose
+                {
+                    eprintln!("[verbose] {}: vector index skip doc {}: {}", name, id, e);
                 }
                 count += 1;
                 if verbose && count % 500_000 == 0 {
@@ -1206,7 +1206,7 @@ impl Collection {
 
         let search_results = idx
             .search(query_vector, limit, ef_search)
-            .map_err(|e| Error::InvalidQuery(e))?;
+            .map_err(Error::InvalidQuery)?;
 
         let mut docs = Vec::with_capacity(search_results.len());
         for result in search_results {
@@ -1545,67 +1545,67 @@ impl Collection {
         }
 
         // Fast path: index-backed sort with early termination.
-        if let Some(sort_fields) = &opts.sort {
-            if sort_fields.len() == 1 {
-                let (sort_field, sort_order) = &sort_fields[0];
-                if let Some(field_idx) = self.field_indexes.get(sort_field) {
-                    // saturating_add: skip set + no limit must not wrap.
-                    let need = (opts.skip.unwrap_or(0) as usize)
-                        .saturating_add(opts.limit.map(|l| l as usize).unwrap_or(usize::MAX));
-                    let mut results = Vec::new();
-                    // In index-backed sort we iterate the SORT field's index,
-                    // NOT the query fields' indexes — so we can only skip filtering
-                    // when there is no query filter at all.
-                    let skip_filter = matches!(query, Query::All);
+        if let Some(sort_fields) = &opts.sort
+            && sort_fields.len() == 1
+        {
+            let (sort_field, sort_order) = &sort_fields[0];
+            if let Some(field_idx) = self.field_indexes.get(sort_field) {
+                // saturating_add: skip set + no limit must not wrap.
+                let need = (opts.skip.unwrap_or(0) as usize)
+                    .saturating_add(opts.limit.map(|l| l as usize).unwrap_or(usize::MAX));
+                let mut results = Vec::new();
+                // In index-backed sort we iterate the SORT field's index,
+                // NOT the query fields' indexes — so we can only skip filtering
+                // when there is no query filter at all.
+                let skip_filter = matches!(query, Query::All);
 
-                    match sort_order {
-                        SortOrder::Asc => {
-                            'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
-                                for &id in doc_ids {
-                                    if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || query::matches_value(&query, &arc) {
-                                            results.push(arc);
-                                            if results.len() >= need {
-                                                break 'outer_asc;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        SortOrder::Desc => {
-                            'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
-                                for &id in doc_ids.iter().rev() {
-                                    if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || query::matches_value(&query, &arc) {
-                                            results.push(arc);
-                                            if results.len() >= need {
-                                                break 'outer_desc;
-                                            }
-                                        }
+                match sort_order {
+                    SortOrder::Asc => {
+                        'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
+                            for &id in doc_ids {
+                                if let Some(arc) = self.read_doc_arc(id)
+                                    && (skip_filter || query::matches_value(&query, &arc))
+                                {
+                                    results.push(arc);
+                                    if results.len() >= need {
+                                        break 'outer_asc;
                                     }
                                 }
                             }
                         }
                     }
-
-                    // Apply skip
-                    if let Some(skip) = opts.skip {
-                        let skip = skip as usize;
-                        if skip >= results.len() {
-                            results.clear();
-                        } else {
-                            results = results.into_iter().skip(skip).collect();
+                    SortOrder::Desc => {
+                        'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
+                            for &id in doc_ids.iter().rev() {
+                                if let Some(arc) = self.read_doc_arc(id)
+                                    && (skip_filter || query::matches_value(&query, &arc))
+                                {
+                                    results.push(arc);
+                                    if results.len() >= need {
+                                        break 'outer_desc;
+                                    }
+                                }
+                            }
                         }
                     }
-
-                    // Apply limit
-                    if let Some(limit) = opts.limit {
-                        results.truncate(limit as usize);
-                    }
-
-                    return Ok(results);
                 }
+
+                // Apply skip
+                if let Some(skip) = opts.skip {
+                    let skip = skip as usize;
+                    if skip >= results.len() {
+                        results.clear();
+                    } else {
+                        results = results.into_iter().skip(skip).collect();
+                    }
+                }
+
+                // Apply limit
+                if let Some(limit) = opts.limit {
+                    results.truncate(limit as usize);
+                }
+
+                return Ok(results);
             }
         }
 
@@ -1615,68 +1615,67 @@ impl Collection {
         // Supports post-filtering on additional query conditions beyond the
         // composite prefix (e.g., query on formId + data.x, sort by createdAt,
         // composite index on (formId, createdAt)).
-        if let Some(sort_fields) = &opts.sort {
-            if sort_fields.len() == 1 {
-                let (sort_field, sort_order) = &sort_fields[0];
-                if let Some(eq_conds) = query::extract_eq_conditions(&query) {
-                    for comp_idx in &self.composite_indexes {
-                        let fields = &comp_idx.fields;
-                        let n = fields.len();
-                        if n >= 2
-                            && fields[n - 1] == *sort_field
-                            && fields[..n - 1]
-                                .iter()
-                                .all(|f| eq_conds.contains_key(f.as_str()))
-                        {
-                            // Build prefix from equality condition values
-                            let prefix: Vec<IndexValue> = fields[..n - 1]
-                                .iter()
-                                .map(|f| eq_conds[f.as_str()].clone())
-                                .collect();
+        if let Some(sort_fields) = &opts.sort
+            && sort_fields.len() == 1
+        {
+            let (sort_field, sort_order) = &sort_fields[0];
+            if let Some(eq_conds) = query::extract_eq_conditions(&query) {
+                for comp_idx in &self.composite_indexes {
+                    let fields = &comp_idx.fields;
+                    let n = fields.len();
+                    if n >= 2
+                        && fields[n - 1] == *sort_field
+                        && fields[..n - 1]
+                            .iter()
+                            .all(|f| eq_conds.contains_key(f.as_str()))
+                    {
+                        // Build prefix from equality condition values
+                        let prefix: Vec<IndexValue> = fields[..n - 1]
+                            .iter()
+                            .map(|f| eq_conds[f.as_str()].clone())
+                            .collect();
 
-                            let need = (opts.skip.unwrap_or(0) as usize).saturating_add(
-                                opts.limit.map(|l| l as usize).unwrap_or(usize::MAX),
-                            );
+                        let need = (opts.skip.unwrap_or(0) as usize)
+                            .saturating_add(opts.limit.map(|l| l as usize).unwrap_or(usize::MAX));
 
-                            // Read + filter docs inline during composite index iteration.
-                            let mut results: Vec<Arc<Value>> = Vec::new();
+                        // Read + filter docs inline during composite index iteration.
+                        let mut results: Vec<Arc<Value>> = Vec::new();
 
-                            let mut handler = |id: DocumentId| -> bool {
-                                if let Some(arc) = self.load_doc_arc(id) {
-                                    if query::matches_value(&query, &arc) {
-                                        results.push(arc);
-                                        return results.len() < need;
-                                    }
-                                }
-                                true
-                            };
-
-                            match sort_order {
-                                SortOrder::Asc => {
-                                    comp_idx.for_each_prefix_asc(&prefix, &mut handler);
-                                }
-                                SortOrder::Desc => {
-                                    comp_idx.for_each_prefix_desc(&prefix, &mut handler);
-                                }
+                        let mut handler = |id: DocumentId| -> bool {
+                            if let Some(arc) = self.load_doc_arc(id)
+                                && query::matches_value(&query, &arc)
+                            {
+                                results.push(arc);
+                                return results.len() < need;
                             }
+                            true
+                        };
 
-                            // Apply skip
-                            if let Some(skip) = opts.skip {
-                                let skip = skip as usize;
-                                if skip >= results.len() {
-                                    results.clear();
-                                } else {
-                                    results = results.into_iter().skip(skip).collect();
-                                }
+                        match sort_order {
+                            SortOrder::Asc => {
+                                comp_idx.for_each_prefix_asc(&prefix, &mut handler);
                             }
-
-                            // Apply limit
-                            if let Some(limit) = opts.limit {
-                                results.truncate(limit as usize);
+                            SortOrder::Desc => {
+                                comp_idx.for_each_prefix_desc(&prefix, &mut handler);
                             }
-
-                            return Ok(results);
                         }
+
+                        // Apply skip
+                        if let Some(skip) = opts.skip {
+                            let skip = skip as usize;
+                            if skip >= results.len() {
+                                results.clear();
+                            } else {
+                                results = results.into_iter().skip(skip).collect();
+                            }
+                        }
+
+                        // Apply limit
+                        if let Some(limit) = opts.limit {
+                            results.truncate(limit as usize);
+                        }
+
+                        return Ok(results);
                     }
                 }
             }
@@ -1698,12 +1697,12 @@ impl Collection {
         // Avoids materializing full BTreeSet of IDs.
         if let Some(limit) = early_limit {
             let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
-                if let Some(arc) = self.load_doc_arc(id) {
-                    if skip_post_filter || query::matches_value(&query, &arc) {
-                        results.push(arc);
-                        if results.len() >= limit {
-                            return false;
-                        }
+                if let Some(arc) = self.load_doc_arc(id)
+                    && (skip_post_filter || query::matches_value(&query, &arc))
+                {
+                    results.push(arc);
+                    if results.len() >= limit {
+                        return false;
                     }
                 }
                 true
@@ -1730,10 +1729,10 @@ impl Collection {
                 // Phase 2: collect cache misses with storage locations
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
                 for (i, opt) in all_docs.iter().enumerate() {
-                    if opt.is_none() {
-                        if let Some(&loc) = self.primary_index.get(&ids[i]) {
-                            miss_locs.push((i, loc));
-                        }
+                    if opt.is_none()
+                        && let Some(&loc) = self.primary_index.get(&ids[i])
+                    {
+                        miss_locs.push((i, loc));
                     }
                 }
 
@@ -1754,23 +1753,23 @@ impl Collection {
 
                 // Phase 5: build results
                 for opt in all_docs {
-                    if let Some(arc) = opt {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            results.push(arc);
-                        }
+                    if let Some(arc) = opt
+                        && (skip_post_filter || query::matches_value(&query, &arc))
+                    {
+                        results.push(arc);
                     }
                 }
             } else {
                 // Per-doc path: good for small result sets or queries with limit
                 for &id in indexed_ids {
-                    if let Some(arc) = self.read_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            results.push(arc);
-                            if let Some(limit) = early_limit {
-                                if results.len() >= limit {
-                                    break;
-                                }
-                            }
+                    if let Some(arc) = self.read_doc_arc(id)
+                        && (skip_post_filter || query::matches_value(&query, &arc))
+                    {
+                        results.push(arc);
+                        if let Some(limit) = early_limit
+                            && results.len() >= limit
+                        {
+                            break;
                         }
                     }
                 }
@@ -1789,7 +1788,7 @@ impl Collection {
             // Phase 1: parallel query matching on cached documents
             let mut miss_indices: Vec<usize> = Vec::new();
             if cached.len() >= 10_000 && num_threads > 1 && early_limit.is_none() {
-                let chunk_size = (cached.len() + num_threads - 1) / num_threads;
+                let chunk_size = cached.len().div_ceil(num_threads);
                 let (par_results, par_misses) = std::thread::scope(|s| {
                     let handles: Vec<_> = (0..num_threads)
                         .map(|t| {
@@ -1830,10 +1829,10 @@ impl Collection {
                     if let Some(arc) = opt {
                         if query::matches_value(&query, &arc) {
                             results.push(arc);
-                            if let Some(limit) = early_limit {
-                                if results.len() >= limit {
-                                    break;
-                                }
+                            if let Some(limit) = early_limit
+                                && results.len() >= limit
+                            {
+                                break;
                             }
                         }
                     } else {
@@ -1843,7 +1842,7 @@ impl Collection {
             }
 
             // Phase 2: batch-read cache misses from disk (if any and not already at limit)
-            let at_limit = early_limit.map_or(false, |l| results.len() >= l);
+            let at_limit = early_limit.is_some_and(|l| results.len() >= l);
             if !miss_indices.is_empty() && !at_limit {
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
                     .iter()
@@ -1861,10 +1860,10 @@ impl Collection {
                         cache_entries.push((ids[i], Arc::clone(&arc)));
                         if query::matches_value(&query, &arc) {
                             results.push(arc);
-                            if let Some(limit) = early_limit {
-                                if results.len() >= limit {
-                                    break;
-                                }
+                            if let Some(limit) = early_limit
+                                && results.len() >= limit
+                            {
+                                break;
                             }
                         }
                     }
@@ -1920,11 +1919,11 @@ impl Collection {
         if !matches!(query, Query::All) {
             let mut found: Option<Value> = None;
             let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
-                if let Some(arc) = self.load_doc_arc(id) {
-                    if skip_post_filter || query::matches_value(&query, &arc) {
-                        found = Some((*arc).clone());
-                        return false;
-                    }
+                if let Some(arc) = self.load_doc_arc(id)
+                    && (skip_post_filter || query::matches_value(&query, &arc))
+                {
+                    found = Some((*arc).clone());
+                    return false;
                 }
                 true
             });
@@ -1942,12 +1941,11 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if self.primary_index.contains_key(&id) {
-                    if let Some(data) = self.read_doc(id)? {
-                        if skip_post_filter || query::matches_value(&query, &data) {
-                            return Ok(Some(data));
-                        }
-                    }
+                if self.primary_index.contains_key(&id)
+                    && let Some(data) = self.read_doc(id)?
+                    && (skip_post_filter || query::matches_value(&query, &data))
+                {
+                    return Ok(Some(data));
                 }
             }
         } else {
@@ -2039,17 +2037,17 @@ impl Collection {
             if let Some(ref query) = match_query {
                 let candidate_ids =
                     query::execute_indexed(query, &self.field_indexes, &self.composite_indexes);
-                if let Some(ref ids) = candidate_ids {
-                    if ids.len() <= doc_count / 2 {
-                        // Small candidate set — indexed random-read is faster
-                        return self.aggregate_streaming_indexed(
-                            query,
-                            ids,
-                            group_key,
-                            accumulators,
-                            use_raw,
-                        );
-                    }
+                if let Some(ref ids) = candidate_ids
+                    && ids.len() <= doc_count / 2
+                {
+                    // Small candidate set — indexed random-read is faster
+                    return self.aggregate_streaming_indexed(
+                        query,
+                        ids,
+                        group_key,
+                        accumulators,
+                        use_raw,
+                    );
                 }
             }
 
@@ -2156,10 +2154,10 @@ impl Collection {
                         // Phase 2: collect cache misses with storage locations
                         let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
                         for (i, opt) in cached.iter().enumerate() {
-                            if opt.is_none() {
-                                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
-                                    miss_locs.push((i, loc));
-                                }
+                            if opt.is_none()
+                                && let Some(&loc) = self.primary_index.get(&id_vec[i])
+                            {
+                                miss_locs.push((i, loc));
                             }
                         }
 
@@ -2172,10 +2170,10 @@ impl Collection {
 
                         // Phase 4: feed cache hits
                         for opt in cached.iter() {
-                            if let Some(arc) = opt {
-                                if skip_post_filter || query::matches_value(&query, arc) {
-                                    group.feed(arc);
-                                }
+                            if let Some(arc) = opt
+                                && (skip_post_filter || query::matches_value(&query, arc))
+                            {
+                                group.feed(arc);
                             }
                         }
 
@@ -2244,10 +2242,10 @@ impl Collection {
 
         let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
         for (i, opt) in cached.iter().enumerate() {
-            if opt.is_none() {
-                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
-                    miss_locs.push((i, loc));
-                }
+            if opt.is_none()
+                && let Some(&loc) = self.primary_index.get(&id_vec[i])
+            {
+                miss_locs.push((i, loc));
             }
         }
 
@@ -2258,10 +2256,10 @@ impl Collection {
         };
 
         for opt in cached.iter() {
-            if let Some(arc) = opt {
-                if skip_post_filter || query::matches_value(query, arc) {
-                    group.feed(arc);
-                }
+            if let Some(arc) = opt
+                && (skip_post_filter || query::matches_value(query, arc))
+            {
+                group.feed(arc);
             }
         }
 
@@ -2320,19 +2318,17 @@ impl Collection {
 
         // Try lazy index path first for limited updates
         let mut lazy_handled = false;
-        if limit.is_some() {
+        if let Some(lim) = limit {
             let primary_index = &self.primary_index;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
-            let lim = limit.unwrap();
             let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
-                if let Some(arc) = self.load_doc_arc(id) {
-                    if skip_post_filter || query::matches_value(&query, &arc) {
-                        if let Some(&old_loc) = primary_index.get(&id) {
-                            matches.push((id, (*arc).clone(), old_loc));
-                            if matches.len() >= lim {
-                                return false;
-                            }
-                        }
+                if let Some(arc) = self.load_doc_arc(id)
+                    && (skip_post_filter || query::matches_value(&query, &arc))
+                    && let Some(&old_loc) = primary_index.get(&id)
+                {
+                    matches.push((id, (*arc).clone(), old_loc));
+                    if matches.len() >= lim {
+                        return false;
                     }
                 }
                 true
@@ -2348,26 +2344,25 @@ impl Collection {
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
-                    if let Some(&old_loc) = self.primary_index.get(&id) {
-                        if let Some(data) = self.read_doc(id)? {
-                            if query::matches_value(&query, &data) {
-                                matches.push((id, data, old_loc));
-                                if limit.is_some_and(|l| matches.len() >= l) {
-                                    break;
-                                }
-                            }
+                    if let Some(&old_loc) = self.primary_index.get(&id)
+                        && let Some(data) = self.read_doc(id)?
+                        && query::matches_value(&query, &data)
+                    {
+                        matches.push((id, data, old_loc));
+                        if limit.is_some_and(|l| matches.len() >= l) {
+                            break;
                         }
                     }
                 }
             } else {
                 // No index — iterate doc store (zero-copy: clone only matches)
                 self.for_each_doc_arc_while(|id, arc| {
-                    if query::matches_value(&query, arc) {
-                        if let Some(&old_loc) = self.primary_index.get(&id) {
-                            matches.push((id, (**arc).clone(), old_loc));
-                            if limit.is_some_and(|l| matches.len() >= l) {
-                                return Ok(false);
-                            }
+                    if query::matches_value(&query, arc)
+                        && let Some(&old_loc) = self.primary_index.get(&id)
+                    {
+                        matches.push((id, (**arc).clone(), old_loc));
+                        if limit.is_some_and(|l| matches.len() >= l) {
+                            return Ok(false);
                         }
                     }
                     Ok(true)
@@ -2488,23 +2483,21 @@ impl Collection {
 
         // Try lazy index path first for limited deletes
         let mut lazy_handled = false;
-        if limit.is_some() {
+        if let Some(lim) = limit {
             let primary_index = &self.primary_index;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
-            let lim = limit.unwrap();
             let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
-                if let Some(arc) = self.load_doc_arc(id) {
-                    if skip_post_filter || query::matches_value(&query, &arc) {
-                        if let Some(&loc) = primary_index.get(&id) {
-                            ops.push(DeleteOp {
-                                id,
-                                loc,
-                                data: (*arc).clone(),
-                            });
-                            if ops.len() >= lim {
-                                return false;
-                            }
-                        }
+                if let Some(arc) = self.load_doc_arc(id)
+                    && (skip_post_filter || query::matches_value(&query, &arc))
+                    && let Some(&loc) = primary_index.get(&id)
+                {
+                    ops.push(DeleteOp {
+                        id,
+                        loc,
+                        data: (*arc).clone(),
+                    });
+                    if ops.len() >= lim {
+                        return false;
                     }
                 }
                 true
@@ -2520,30 +2513,29 @@ impl Collection {
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
-                    if let Some(&loc) = self.primary_index.get(&id) {
-                        if let Some(data) = self.read_doc(id)? {
-                            if query::matches_value(&query, &data) {
-                                ops.push(DeleteOp { id, loc, data });
-                                if limit.is_some_and(|l| ops.len() >= l) {
-                                    break;
-                                }
-                            }
+                    if let Some(&loc) = self.primary_index.get(&id)
+                        && let Some(data) = self.read_doc(id)?
+                        && query::matches_value(&query, &data)
+                    {
+                        ops.push(DeleteOp { id, loc, data });
+                        if limit.is_some_and(|l| ops.len() >= l) {
+                            break;
                         }
                     }
                 }
             } else {
                 // No index — iterate doc store (zero-copy: clone only matches)
                 self.for_each_doc_arc_while(|id, arc| {
-                    if query::matches_value(&query, arc) {
-                        if let Some(&loc) = self.primary_index.get(&id) {
-                            ops.push(DeleteOp {
-                                id,
-                                loc,
-                                data: (**arc).clone(),
-                            });
-                            if limit.is_some_and(|l| ops.len() >= l) {
-                                return Ok(false);
-                            }
+                    if query::matches_value(&query, arc)
+                        && let Some(&loc) = self.primary_index.get(&id)
+                    {
+                        ops.push(DeleteOp {
+                            id,
+                            loc,
+                            data: (**arc).clone(),
+                        });
+                        if limit.is_some_and(|l| ops.len() >= l) {
+                            return Ok(false);
                         }
                     }
                     Ok(true)
@@ -2628,10 +2620,10 @@ impl Collection {
             }
             // Small candidate set — random access via LRU cache + storage fallback
             for &id in indexed_ids {
-                if let Some(arc) = self.load_doc_arc(id) {
-                    if query::matches_value(&query, &arc) {
-                        count += 1;
-                    }
+                if let Some(arc) = self.load_doc_arc(id)
+                    && query::matches_value(&query, &arc)
+                {
+                    count += 1;
                 }
             }
         } else {
@@ -2856,10 +2848,7 @@ impl Collection {
                 .unwrap_or_default()
                 .as_millis() as u64;
             let expires_at = now_ms + secs * 1000;
-            self.ttl_index
-                .entry(expires_at)
-                .or_insert_with(Vec::new)
-                .push(doc_id);
+            self.ttl_index.entry(expires_at).or_default().push(doc_id);
         }
     }
 
@@ -2905,14 +2894,14 @@ impl Collection {
                 let _ = self.storage.mark_deleted_no_sync(loc);
 
                 // Remove from indexes
-                if let Ok(bytes) = self.storage.read(loc) {
-                    if let Ok(doc) = crate::codec::decode_doc(&bytes) {
-                        for idx in self.field_indexes.values_mut() {
-                            idx.remove_value(*doc_id, &doc);
-                        }
-                        for idx in &mut self.composite_indexes {
-                            idx.remove_value(*doc_id, &doc);
-                        }
+                if let Ok(bytes) = self.storage.read(loc)
+                    && let Ok(doc) = crate::codec::decode_doc(&bytes)
+                {
+                    for idx in self.field_indexes.values_mut() {
+                        idx.remove_value(*doc_id, &doc);
+                    }
+                    for idx in &mut self.composite_indexes {
+                        idx.remove_value(*doc_id, &doc);
                     }
                 }
             }
@@ -3062,10 +3051,10 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if let Some(&old_loc) = self.primary_index.get(&id) {
-                    if let Some(data) = self.read_doc(id)? {
-                        process_candidate(id, &data, old_loc)?;
-                    }
+                if let Some(&old_loc) = self.primary_index.get(&id)
+                    && let Some(data) = self.read_doc(id)?
+                {
+                    process_candidate(id, &data, old_loc)?;
                 }
             }
         } else {
@@ -3117,10 +3106,10 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if let Some(&loc) = self.primary_index.get(&id) {
-                    if let Some(data) = self.read_doc(id)? {
-                        process_candidate(id, &data, loc)?;
-                    }
+                if let Some(&loc) = self.primary_index.get(&id)
+                    && let Some(data) = self.read_doc(id)?
+                {
+                    process_candidate(id, &data, loc)?;
                 }
             }
         } else {
@@ -3142,7 +3131,7 @@ impl Collection {
 
     /// Apply a batch of prepared mutations to storage and update indexes.
     /// WAL should already have been logged by the caller.
-    pub fn apply_prepared(&mut self, mutations: &mut Vec<PreparedMutation>) -> Result<()> {
+    pub fn apply_prepared(&mut self, mutations: &mut [PreparedMutation]) -> Result<()> {
         // Apply to storage
         for m in mutations.iter() {
             if m.is_delete {
@@ -3693,7 +3682,7 @@ mod tests {
         assert_eq!(results.len(), 3);
         for doc in &results {
             let n = doc["n"].as_i64().unwrap();
-            assert!(n >= 7 && n < 10);
+            assert!((7..10).contains(&n));
         }
     }
 

@@ -79,7 +79,9 @@ impl Upstream {
 
     /// One raw wire request (any command), returning its `data` payload.
     pub fn raw_call(&self, request: &Value) -> Result<Value, String> {
-        self.pool.with(|c| c.call(request)).map_err(|e| e.to_string())
+        self.pool
+            .with(|c| c.call(request))
+            .map_err(|e| e.to_string())
     }
 
     /// Collection names of an arbitrary database.

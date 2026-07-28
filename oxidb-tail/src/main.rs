@@ -16,8 +16,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table,
+    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
 };
 use serde_json::{Value, json};
 
@@ -196,7 +195,7 @@ impl LogEntry {
 
     fn level_color(&self) -> Color {
         match self.level {
-            0 | 1 | 2 | 3 => Color::Red,
+            0..=3 => Color::Red,
             4 => Color::Yellow,
             5 => Color::Cyan,
             6 => Color::Green,
@@ -259,10 +258,10 @@ impl App {
         self.logs
             .iter()
             .filter(|log| {
-                if let Some(max_level) = self.level_filter {
-                    if log.level > max_level {
-                        return false;
-                    }
+                if let Some(max_level) = self.level_filter
+                    && log.level > max_level
+                {
+                    return false;
                 }
                 if !self.filter_text.is_empty() {
                     let ft = self.filter_text.to_lowercase();
@@ -856,97 +855,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         render(&mut terminal, &app, &cli.collection, &cli.host, cli.port);
 
         // Handle input (non-blocking, 50ms timeout)
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if app.filter_active {
-                    // Filter input mode
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter => {
-                            app.filter_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            app.filter_text.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.filter_text.push(c);
-                        }
-                        _ => {}
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            if app.filter_active {
+                // Filter input mode
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => {
+                        app.filter_active = false;
                     }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break;
-                        }
-                        KeyCode::Char('/') => {
-                            app.filter_active = true;
-                        }
-                        KeyCode::Char('l') => {
-                            // Cycle level filter: ALL → ERR → WRN → INF → DBG → ALL
-                            app.level_filter = match app.level_filter {
-                                None => Some(3),
-                                Some(3) => Some(4),
-                                Some(4) => Some(6),
-                                Some(6) => Some(7),
-                                _ => None,
-                            };
-                        }
-                        KeyCode::Char('f') | KeyCode::Char('F') => {
-                            app.auto_scroll = true;
-                            app.show_detail = false;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.auto_scroll = false;
-                            if app.selected > 0 {
-                                app.selected -= 1;
-                            }
-                            app.scroll_offset = app.selected.saturating_sub(5);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.auto_scroll = false;
-                            let filtered_len = app.filtered_logs().len();
-                            if app.selected + 1 < filtered_len {
-                                app.selected += 1;
-                            }
-                            app.scroll_offset = app.selected.saturating_sub(5);
-                        }
-                        KeyCode::PageUp => {
-                            app.auto_scroll = false;
-                            app.selected = app.selected.saturating_sub(20);
-                            app.scroll_offset = app.selected.saturating_sub(5);
-                        }
-                        KeyCode::PageDown => {
-                            app.auto_scroll = false;
-                            let filtered_len = app.filtered_logs().len();
-                            app.selected = (app.selected + 20).min(filtered_len.saturating_sub(1));
-                            app.scroll_offset = app.selected.saturating_sub(5);
-                        }
-                        KeyCode::Home => {
-                            app.auto_scroll = false;
-                            app.selected = 0;
-                            app.scroll_offset = 0;
-                        }
-                        KeyCode::Enter => {
-                            if !app.auto_scroll {
-                                app.show_detail = !app.show_detail;
-                            }
-                        }
-                        KeyCode::Tab => {
-                            app.show_stats = !app.show_stats;
-                        }
-                        KeyCode::End => {
-                            app.auto_scroll = true;
-                            app.show_detail = false;
-                        }
-                        KeyCode::Esc => {
-                            if !app.filter_text.is_empty() {
-                                app.filter_text.clear();
-                            } else {
-                                app.auto_scroll = true;
-                            }
-                        }
-                        _ => {}
+                    KeyCode::Backspace => {
+                        app.filter_text.pop();
                     }
+                    KeyCode::Char(c) => {
+                        app.filter_text.push(c);
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
+                    }
+                    KeyCode::Char('/') => {
+                        app.filter_active = true;
+                    }
+                    KeyCode::Char('l') => {
+                        // Cycle level filter: ALL → ERR → WRN → INF → DBG → ALL
+                        app.level_filter = match app.level_filter {
+                            None => Some(3),
+                            Some(3) => Some(4),
+                            Some(4) => Some(6),
+                            Some(6) => Some(7),
+                            _ => None,
+                        };
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                        app.auto_scroll = true;
+                        app.show_detail = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.auto_scroll = false;
+                        if app.selected > 0 {
+                            app.selected -= 1;
+                        }
+                        app.scroll_offset = app.selected.saturating_sub(5);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.auto_scroll = false;
+                        let filtered_len = app.filtered_logs().len();
+                        if app.selected + 1 < filtered_len {
+                            app.selected += 1;
+                        }
+                        app.scroll_offset = app.selected.saturating_sub(5);
+                    }
+                    KeyCode::PageUp => {
+                        app.auto_scroll = false;
+                        app.selected = app.selected.saturating_sub(20);
+                        app.scroll_offset = app.selected.saturating_sub(5);
+                    }
+                    KeyCode::PageDown => {
+                        app.auto_scroll = false;
+                        let filtered_len = app.filtered_logs().len();
+                        app.selected = (app.selected + 20).min(filtered_len.saturating_sub(1));
+                        app.scroll_offset = app.selected.saturating_sub(5);
+                    }
+                    KeyCode::Home => {
+                        app.auto_scroll = false;
+                        app.selected = 0;
+                        app.scroll_offset = 0;
+                    }
+                    KeyCode::Enter => {
+                        if !app.auto_scroll {
+                            app.show_detail = !app.show_detail;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        app.show_stats = !app.show_stats;
+                    }
+                    KeyCode::End => {
+                        app.auto_scroll = true;
+                        app.show_detail = false;
+                    }
+                    KeyCode::Esc => {
+                        if !app.filter_text.is_empty() {
+                            app.filter_text.clear();
+                        } else {
+                            app.auto_scroll = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

@@ -436,12 +436,12 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
         match read_frame(&mut stream) {
             Some((0x01, payload)) => {
                 // Text frame — parse JSON command
-                if let Ok(text) = std::str::from_utf8(&payload) {
-                    if let Ok(cmd) = serde_json::from_str::<Value>(text) {
-                        let resp = handle_command(&cmd, state, &mut subscriptions, &mut conn);
-                        if !send_json(&mut stream, &resp) {
-                            break;
-                        }
+                if let Ok(text) = std::str::from_utf8(&payload)
+                    && let Ok(cmd) = serde_json::from_str::<Value>(text)
+                {
+                    let resp = handle_command(&cmd, state, &mut subscriptions, &mut conn);
+                    if !send_json(&mut stream, &resp) {
+                        break;
                     }
                 }
             }
@@ -487,14 +487,14 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
                     }
                 }
                 // If subscription has a query filter, check if the doc matches
-                if let Some(ref query) = sub.query {
-                    if !query.as_object().map_or(true, |q| q.is_empty()) {
-                        // Only filter insert events that have a document
-                        if let Some(ref doc) = event.document {
-                            if !doc_matches_query(doc, query) {
-                                continue;
-                            }
-                        }
+                if let Some(ref query) = sub.query
+                    && !query.as_object().is_none_or(|q| q.is_empty())
+                {
+                    // Only filter insert events that have a document
+                    if let Some(ref doc) = event.document
+                        && !doc_matches_query(doc, query)
+                    {
+                        continue;
                     }
                 }
 

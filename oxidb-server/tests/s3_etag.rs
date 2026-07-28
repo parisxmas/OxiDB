@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
-    Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Md5::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 struct Server {
@@ -43,10 +46,10 @@ fn start() -> Server {
     // They passed — while sharing one server and asserting on each other's
     // objects. A test that passes by accident proves nothing.
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let port = 15000
-        + (std::process::id() % 400) as u16 * 10
-        + NEXT.fetch_add(1, Ordering::SeqCst);
+    let port = 15000 + (std::process::id() % 400) as u16 * 10 + NEXT.fetch_add(1, Ordering::SeqCst);
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1000))
         .env("OXIDB_S3_PORT", port.to_string())
@@ -136,7 +139,8 @@ fn an_etag_is_thirty_two_hex_characters() {
 
     assert_eq!(etag.len(), 32, "got {etag:?}");
     assert!(
-        etag.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        etag.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "lowercase hex only, got {etag:?}"
     );
 }
@@ -178,10 +182,9 @@ fn multipart_etag_is_the_md5_of_the_part_md5s_with_a_part_count() {
         });
     }
 
-    let complete = format!(
-        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part>\
+    let complete = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part>\
          <Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>"
-    );
+        .to_string();
     let (st, h, body) = request(
         srv.port,
         "POST",

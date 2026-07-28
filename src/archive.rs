@@ -387,15 +387,16 @@ pub fn replay_into(
             .map(|r| r.meta.gsn)
             .filter(|&g| g != 0)
             .min();
-        if let Some(min_gsn) = min_stamped {
-            if min_gsn > base_gsn + 1 && target_gsn >= min_gsn {
-                eprintln!(
-                    "[pitr] WARNING: base backup watermark is GSN {base_gsn} but the \
+        if let Some(min_gsn) = min_stamped
+            && min_gsn > base_gsn + 1
+            && target_gsn >= min_gsn
+        {
+            eprintln!(
+                "[pitr] WARNING: base backup watermark is GSN {base_gsn} but the \
                      earliest replayable record is GSN {min_gsn} — history in between \
                      (if any) is not in the archive (pruned or missing segments); the \
                      restored state may silently skip it"
-                );
-            }
+            );
         }
     }
 
@@ -613,10 +614,10 @@ fn rebuild_manifest(archive_dir: &Path, segments_dir: &Path) -> Result<()> {
     if let Ok(rd) = fs::read_dir(segments_dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("seg") {
-                if let Some(e) = read_segment_entry(&p)? {
-                    segments.push(e);
-                }
+            if p.extension().and_then(|e| e.to_str()) == Some("seg")
+                && let Some(e) = read_segment_entry(&p)?
+            {
+                segments.push(e);
             }
         }
     }

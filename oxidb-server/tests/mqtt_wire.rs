@@ -8,7 +8,11 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct Guard {
@@ -37,7 +41,11 @@ fn spawn_with(envs: &[(&str, &str)]) -> Guard {
         cmd.env(k, v);
     }
     let child = cmd.spawn().unwrap();
-    let g = Guard { child, _dir: dir, port: mqtt };
+    let g = Guard {
+        child,
+        _dir: dir,
+        port: mqtt,
+    };
     let deadline = Instant::now() + Duration::from_secs(15);
     while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
         assert!(Instant::now() < deadline, "mqtt port never opened");
@@ -150,10 +158,10 @@ fn subscribe(c: &mut Mqtt, filter: &str, qos: u8) -> u8 {
     c.send(&packet(8, 0x02, &p));
     // SUBACK may be preceded by retained PUBLISHes — scan for it.
     for _ in 0..8 {
-        if let Some((t, _, pl)) = c.read_packet() {
-            if t == 9 {
-                return pl[2];
-            }
+        if let Some((t, _, pl)) = c.read_packet()
+            && t == 9
+        {
+            return pl[2];
         }
     }
     panic!("no SUBACK");
@@ -171,16 +179,16 @@ fn publish(c: &mut Mqtt, topic: &str, msg: &str, qos: u8, retain: bool) {
 /// Wait for a PUBLISH; returns (topic, payload).
 fn expect_publish(c: &mut Mqtt) -> (String, String) {
     for _ in 0..8 {
-        if let Some((t, flags, pl)) = c.read_packet() {
-            if t == 3 {
-                let tl = u16::from_be_bytes([pl[0], pl[1]]) as usize;
-                let topic = String::from_utf8_lossy(&pl[2..2 + tl]).to_string();
-                let mut off = 2 + tl;
-                if (flags >> 1) & 0x03 > 0 {
-                    off += 2; // skip pkt id
-                }
-                return (topic, String::from_utf8_lossy(&pl[off..]).to_string());
+        if let Some((t, flags, pl)) = c.read_packet()
+            && t == 3
+        {
+            let tl = u16::from_be_bytes([pl[0], pl[1]]) as usize;
+            let topic = String::from_utf8_lossy(&pl[2..2 + tl]).to_string();
+            let mut off = 2 + tl;
+            if (flags >> 1) & 0x03 > 0 {
+                off += 2; // skip pkt id
             }
+            return (topic, String::from_utf8_lossy(&pl[off..]).to_string());
         }
     }
     panic!("no PUBLISH received");
@@ -232,14 +240,14 @@ fn retained_message_delivered_on_subscribe() {
     sub.send(&packet(8, 0x02, &p));
     let mut got_retained = false;
     for _ in 0..6 {
-        if let Some((t, flags, pl)) = sub.read_packet() {
-            if t == 3 {
-                assert_eq!(flags & 0x01, 0x01, "retain flag must be set");
-                let tl = u16::from_be_bytes([pl[0], pl[1]]) as usize;
-                assert_eq!(&pl[2..2 + tl], b"status/device1");
-                got_retained = true;
-                break;
-            }
+        if let Some((t, flags, pl)) = sub.read_packet()
+            && t == 3
+        {
+            assert_eq!(flags & 0x01, 0x01, "retain flag must be set");
+            let tl = u16::from_be_bytes([pl[0], pl[1]]) as usize;
+            assert_eq!(&pl[2..2 + tl], b"status/device1");
+            got_retained = true;
+            break;
         }
     }
     assert!(got_retained, "retained message not delivered");
@@ -263,7 +271,10 @@ fn qos1_puback_and_qos2_handshake() {
 
 #[test]
 fn auth_rejects_wrong_credentials() {
-    let g = spawn_with(&[("OXIDB_MQTT_USER", "iot"), ("OXIDB_MQTT_PASSWORD", "s3cret")]);
+    let g = spawn_with(&[
+        ("OXIDB_MQTT_USER", "iot"),
+        ("OXIDB_MQTT_PASSWORD", "s3cret"),
+    ]);
     let (_c, rc) = connect_opts(g.port, "bad", 0, None, Some(("iot", "wrong")));
     assert_eq!(rc, 0x04, "bad credentials must be refused");
     let (_c, rc) = connect_opts(g.port, "anon", 0, None, None);
@@ -289,5 +300,8 @@ fn last_will_fires_on_abnormal_disconnect() {
         drop(dying); // socket dies WITHOUT DISCONNECT → will must fire
     }
     let (t, m) = expect_publish(&mut watcher);
-    assert_eq!((t.as_str(), m.as_str()), ("clients/dev42/status", "offline"));
+    assert_eq!(
+        (t.as_str(), m.as_str()),
+        ("clients/dev42/status", "offline")
+    );
 }

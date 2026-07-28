@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use oxidb::database_manager::DatabaseManager;
 use oxidb::OxiDb;
+use oxidb::database_manager::DatabaseManager;
 
 /// Maximum datagram size (log records are small; one record per packet).
 const MAX_MSG_SIZE: usize = 65535;
@@ -83,10 +83,10 @@ pub fn start_msgpack_listener_routed(
                 loop {
                     match socket.recv_from(&mut buf) {
                         Ok((len, _)) if len > 0 => {
-                            if let Ok(doc) = rmp_serde::from_slice::<Value>(&buf[..len]) {
-                                if doc.is_object() {
-                                    let _ = tx.try_send(doc);
-                                }
+                            if let Ok(doc) = rmp_serde::from_slice::<Value>(&buf[..len])
+                                && doc.is_object()
+                            {
+                                let _ = tx.try_send(doc);
                             }
                         }
                         _ => {}
@@ -218,7 +218,6 @@ fn bind_reuseport(addr: &str) -> UdpSocket {
 
     UdpSocket::from(socket)
 }
-
 
 /// Retention and the index the dashboard's newest-first paging walks, created
 /// once per database per process.

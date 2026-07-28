@@ -368,43 +368,20 @@ impl BlobStore {
         for entry in std::fs::read_dir(bucket_path)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(id_str) = name.strip_suffix(".meta") {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    let raw_meta = std::fs::read(entry.path())?;
-                    // A single torn/undecryptable .meta (crash mid-write in
-                    // non-sync mode, bit rot) must not brick the whole
-                    // database open. Quarantine it and keep going — only
-                    // that one object becomes unavailable.
-                    let meta_bytes = match encryption {
-                        Some(key) => match key.decrypt(&raw_meta) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!(
-                                    "[blob] {}: undecryptable meta ({e}); quarantining",
-                                    entry.path().display()
-                                );
-                                let _ = std::fs::rename(
-                                    entry.path(),
-                                    entry.path().with_extension("meta.corrupt"),
-                                );
-                                // Keep the .data file out of the orphan sweep —
-                                // the payload may still be recoverable — and
-                                // keep the id allocated so a future put can't
-                                // reuse it and overwrite the payload.
-                                valid_ids.insert(id);
-                                if id >= max_id {
-                                    max_id = id + 1;
-                                }
-                                continue;
-                            }
-                        },
-                        None => raw_meta,
-                    };
-                    let mut meta: ObjectMeta = match serde_json::from_slice(&meta_bytes) {
-                        Ok(m) => m,
+            if let Some(id_str) = name.strip_suffix(".meta")
+                && let Ok(id) = id_str.parse::<u64>()
+            {
+                let raw_meta = std::fs::read(entry.path())?;
+                // A single torn/undecryptable .meta (crash mid-write in
+                // non-sync mode, bit rot) must not brick the whole
+                // database open. Quarantine it and keep going — only
+                // that one object becomes unavailable.
+                let meta_bytes = match encryption {
+                    Some(key) => match key.decrypt(&raw_meta) {
+                        Ok(b) => b,
                         Err(e) => {
                             eprintln!(
-                                "[blob] {}: corrupt meta ({e}); quarantining",
+                                "[blob] {}: undecryptable meta ({e}); quarantining",
                                 entry.path().display()
                             );
                             let _ = std::fs::rename(
@@ -412,48 +389,71 @@ impl BlobStore {
                                 entry.path().with_extension("meta.corrupt"),
                             );
                             // Keep the .data file out of the orphan sweep —
-                            // the payload may still be recoverable — and keep
-                            // the id allocated so a future put can't reuse it
-                            // and overwrite the quarantined payload.
+                            // the payload may still be recoverable — and
+                            // keep the id allocated so a future put can't
+                            // reuse it and overwrite the payload.
                             valid_ids.insert(id);
                             if id >= max_id {
                                 max_id = id + 1;
                             }
                             continue;
                         }
-                    };
-                    // Forward-compat tripwire: refuse meta files
-                    // written by a future engine with a schema
-                    // version we don't recognise. `serde(default)`
-                    // backfills v1 for legacy metas missing the
-                    // field, so this only fires on metas that
-                    // explicitly declare a higher version.
-                    if meta.format_version > CURRENT_BLOB_META_VERSION {
-                        return Err(Error::IncompatibleFormat(format!(
-                            "blob meta for id {id} has format_version={} which \
+                    },
+                    None => raw_meta,
+                };
+                let mut meta: ObjectMeta = match serde_json::from_slice(&meta_bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!(
+                            "[blob] {}: corrupt meta ({e}); quarantining",
+                            entry.path().display()
+                        );
+                        let _ = std::fs::rename(
+                            entry.path(),
+                            entry.path().with_extension("meta.corrupt"),
+                        );
+                        // Keep the .data file out of the orphan sweep —
+                        // the payload may still be recoverable — and keep
+                        // the id allocated so a future put can't reuse it
+                        // and overwrite the quarantined payload.
+                        valid_ids.insert(id);
+                        if id >= max_id {
+                            max_id = id + 1;
+                        }
+                        continue;
+                    }
+                };
+                // Forward-compat tripwire: refuse meta files
+                // written by a future engine with a schema
+                // version we don't recognise. `serde(default)`
+                // backfills v1 for legacy metas missing the
+                // field, so this only fires on metas that
+                // explicitly declare a higher version.
+                if meta.format_version > CURRENT_BLOB_META_VERSION {
+                    return Err(Error::IncompatibleFormat(format!(
+                        "blob meta for id {id} has format_version={} which \
                              is newer than this engine supports (max {}). \
                              Refusing to open to prevent silent corruption.",
-                            meta.format_version, CURRENT_BLOB_META_VERSION
-                        )));
+                        meta.format_version, CURRENT_BLOB_META_VERSION
+                    )));
+                }
+                // Backfill `stored_size` for blobs written before
+                // the field existed. We stat the matching .data
+                // file rather than rewriting the on-disk meta.
+                // The cached value is enough for head_object /
+                // API consumers; persistence catches up the next
+                // time the blob is rewritten.
+                if meta.stored_size.is_none() {
+                    let data_path = bucket_path.join(format!("{id}.data"));
+                    if let Ok(md) = std::fs::metadata(&data_path) {
+                        meta.stored_size = Some(md.len());
                     }
-                    // Backfill `stored_size` for blobs written before
-                    // the field existed. We stat the matching .data
-                    // file rather than rewriting the on-disk meta.
-                    // The cached value is enough for head_object /
-                    // API consumers; persistence catches up the next
-                    // time the blob is rewritten.
-                    if meta.stored_size.is_none() {
-                        let data_path = bucket_path.join(format!("{id}.data"));
-                        if let Ok(md) = std::fs::metadata(&data_path) {
-                            meta.stored_size = Some(md.len());
-                        }
-                    }
-                    keys.insert(meta.key.clone(), id);
-                    metas.insert(id, meta);
-                    valid_ids.insert(id);
-                    if id >= max_id {
-                        max_id = id + 1;
-                    }
+                }
+                keys.insert(meta.key.clone(), id);
+                metas.insert(id, meta);
+                valid_ids.insert(id);
+                if id >= max_id {
+                    max_id = id + 1;
                 }
             }
         }
@@ -469,13 +469,12 @@ impl BlobStore {
                 orphans += 1;
             }
             // Clean orphan .data files (no matching .meta)
-            else if let Some(id_str) = name.strip_suffix(".data") {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    if !valid_ids.contains(&id) {
-                        let _ = std::fs::remove_file(entry.path());
-                        orphans += 1;
-                    }
-                }
+            else if let Some(id_str) = name.strip_suffix(".data")
+                && let Ok(id) = id_str.parse::<u64>()
+                && !valid_ids.contains(&id)
+            {
+                let _ = std::fs::remove_file(entry.path());
+                orphans += 1;
             }
         }
         if orphans > 0 {

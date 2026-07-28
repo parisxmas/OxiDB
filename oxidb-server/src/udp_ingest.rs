@@ -47,15 +47,12 @@ pub fn start_udp_listener(
                 let mut buf = [0u8; 65535];
 
                 loop {
-                    match socket.recv_from(&mut buf) {
-                        Ok((len, _)) => {
-                            if len == 0 {
-                                continue;
-                            }
-                            let doc = parse_log_message(&buf[..len]);
-                            let _ = db.insert(&collection, doc);
+                    if let Ok((len, _)) = socket.recv_from(&mut buf) {
+                        if len == 0 {
+                            continue;
                         }
-                        Err(_) => {}
+                        let doc = parse_log_message(&buf[..len]);
+                        let _ = db.insert(&collection, doc);
                     }
                 }
             })
@@ -108,7 +105,7 @@ fn bind_reuseport(addr: &str) -> UdpSocket {
 
     socket
         .bind(&sock_addr.into())
-        .expect(&format!("failed to bind UDP on {addr}"));
+        .unwrap_or_else(|_| panic!("failed to bind UDP on {addr}"));
 
     UdpSocket::from(socket)
 }
@@ -118,10 +115,10 @@ fn parse_log_message(data: &[u8]) -> Value {
     let now = chrono::Utc::now().to_rfc3339();
 
     if let Ok(mut val) = serde_json::from_slice::<Value>(data) {
-        if let Some(obj) = val.as_object_mut() {
-            if !obj.contains_key("_ts") {
-                obj.insert("_ts".to_string(), Value::String(now));
-            }
+        if let Some(obj) = val.as_object_mut()
+            && !obj.contains_key("_ts")
+        {
+            obj.insert("_ts".to_string(), Value::String(now));
         }
         return val;
     }

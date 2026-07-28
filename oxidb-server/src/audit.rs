@@ -442,13 +442,13 @@ impl AuditLog {
         // permission denied on the .gz target), leave the
         // uncompressed file in place — better than losing audit
         // data. Log to stderr so an operator can investigate.
-        if self.policy.compress {
-            if let Err(e) = gzip_in_place(&rotated_path) {
-                eprintln!(
-                    "audit: gzip of {} failed ({e}); leaving uncompressed",
-                    rotated_path.display()
-                );
-            }
+        if self.policy.compress
+            && let Err(e) = gzip_in_place(&rotated_path)
+        {
+            eprintln!(
+                "audit: gzip of {} failed ({e}); leaving uncompressed",
+                rotated_path.display()
+            );
         }
 
         Ok(())

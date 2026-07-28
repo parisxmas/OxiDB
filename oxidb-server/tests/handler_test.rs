@@ -90,6 +90,8 @@ impl TestServer {
 fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
     let mut active_tx: Option<u64> = None;
 
+    // The explicit arms document what ends the loop.
+    #[allow(clippy::while_let_loop)]
     loop {
         let msg = match read_message(&mut stream) {
             Ok(m) => m,
@@ -1279,8 +1281,8 @@ fn test_linked_collection_write_proxy_full_crud() {
 }
 
 /// Write proxy reuses the same pool as the read proxy — interleaved
-/// reads + writes against one link don't accumulate idle conns above
-/// 1. This is the v2c invariant the v2a pool gave us; this test
+/// reads + writes against one link don't accumulate more than one idle
+/// connection. This is the v2c invariant the v2a pool gave us; this test
 /// pins it so a future refactor that accidentally side-pools writes
 /// trips immediately.
 #[test]
@@ -1996,14 +1998,12 @@ impl AuthTestServer {
         let addr = listener.local_addr().unwrap();
 
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let db = Arc::clone(&db);
-                    let user_store = Arc::clone(&user_store);
-                    std::thread::spawn(move || {
-                        Self::serve(stream, db, user_store);
-                    });
-                }
+            for stream in listener.incoming().flatten() {
+                let db = Arc::clone(&db);
+                let user_store = Arc::clone(&user_store);
+                std::thread::spawn(move || {
+                    Self::serve(stream, db, user_store);
+                });
             }
         });
 
@@ -2025,6 +2025,8 @@ impl AuthTestServer {
         let mut scram_state: Option<ScramState> = None;
         let mut active_tx: Option<u64> = None;
 
+        // The explicit arms document what ends the loop.
+        #[allow(clippy::while_let_loop)]
         loop {
             let msg = match read_message(&mut stream) {
                 Ok(m) => m,

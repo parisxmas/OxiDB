@@ -172,7 +172,11 @@ impl MmapCompositeIndex {
         let entry_size = slot_count * SLOT_SIZE + 12;
         let entry_table_offset = off;
         let entries_end = entry_table_offset
-            .checked_add((entry_count as usize).checked_mul(entry_size).ok_or_else(|| bad("entry count overflow"))?)
+            .checked_add(
+                (entry_count as usize)
+                    .checked_mul(entry_size)
+                    .ok_or_else(|| bad("entry count overflow"))?,
+            )
             .filter(|&e| e <= buf.len())
             .ok_or_else(|| bad("truncated entry table"))?;
 
@@ -191,7 +195,8 @@ impl MmapCompositeIndex {
                     string_table_end = string_table_end.max(end);
                 }
             }
-            total_ids = total_ids.saturating_add(read_u32(buf, eoff + slot_count * SLOT_SIZE + 8) as usize);
+            total_ids =
+                total_ids.saturating_add(read_u32(buf, eoff + slot_count * SLOT_SIZE + 8) as usize);
         }
         let string_table_offset = entries_end;
         let docid_section_offset = string_table_offset
@@ -307,7 +312,11 @@ impl MmapCompositeIndex {
                 break;
             };
             let probe = &key.0[..target.len().min(key.0.len())];
-            if probe < target { lo = mid + 1 } else { hi = mid }
+            if probe < target {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
         }
         lo
     }
@@ -346,14 +355,14 @@ impl MmapCompositeIndex {
     /// layer (once per pair; `total_ids` drops only when the pair really
     /// exists somewhere).
     pub fn remove_key(&mut self, id: DocumentId, key: CompositeKey) {
-        if let Some(set) = self.overlay.get_mut(&key) {
-            if set.remove(&id) {
-                if set.is_empty() {
-                    self.overlay.remove(&key);
-                }
-                self.total_ids = self.total_ids.saturating_sub(1);
-                return;
+        if let Some(set) = self.overlay.get_mut(&key)
+            && set.remove(&id)
+        {
+            if set.is_empty() {
+                self.overlay.remove(&key);
             }
+            self.total_ids = self.total_ids.saturating_sub(1);
+            return;
         }
         let already = self
             .removed
@@ -388,11 +397,12 @@ impl MmapCompositeIndex {
         mut f: F,
     ) {
         let mmap_count = self.layout.as_ref().map_or(0, |l| l.entry_count as usize);
-        let mut mpos = if prefix.is_empty() { 0 } else { self.mmap_lower_bound(prefix) };
-        let mut opos = self
-            .overlay
-            .range(CompositeKey(prefix.to_vec())..)
-            .map(|(k, v)| (k, v));
+        let mut mpos = if prefix.is_empty() {
+            0
+        } else {
+            self.mmap_lower_bound(prefix)
+        };
+        let mut opos = self.overlay.range(CompositeKey(prefix.to_vec())..);
         let mut onext: Option<(&CompositeKey, &DocIdSet)> = opos.next();
         let in_prefix =
             |k: &CompositeKey| k.0.len() >= prefix.len() && k.0[..prefix.len()] == *prefix;
@@ -423,13 +433,13 @@ impl MmapCompositeIndex {
                         let mut ids = self.mmap_entry_docids(mpos);
                         self.apply_tombstones(mk, &mut ids);
                         mpos += 1;
-                        if let Some((ok, ov)) = o {
-                            if ok.0 == mk.0 {
-                                for &id in ov.iter() {
-                                    ids.insert(id);
-                                }
-                                onext = opos.next();
+                        if let Some((ok, ov)) = o
+                            && ok.0 == mk.0
+                        {
+                            for &id in ov.iter() {
+                                ids.insert(id);
                             }
+                            onext = opos.next();
                         }
                         (mk.clone(), ids)
                     }
@@ -567,7 +577,11 @@ mod tests {
     fn matches_in_ram_composite_through_persist_reopen_and_mutation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("c.mcidx");
-        let fields = vec!["region".to_string(), "dept".to_string(), "salary".to_string()];
+        let fields = vec![
+            "region".to_string(),
+            "dept".to_string(),
+            "salary".to_string(),
+        ];
 
         let mut disk = MmapCompositeIndex::new(fields.clone());
         disk.set_path(path.clone());
@@ -602,8 +616,8 @@ mod tests {
         // mmap entry), a brand-new key, a tombstone, a dup remove, and a
         // remove of an overlay-resident pair.
         let extra = [
-            (6, doc("EU", "eng", 100)),  // collides with mmap key
-            (7, doc("AP", "hr", 5)),     // new key, sorts first
+            (6, doc("EU", "eng", 100)), // collides with mmap key
+            (7, doc("AP", "hr", 5)),    // new key, sorts first
         ];
         for (id, d) in &extra {
             disk.insert_value(*id, d);
@@ -620,7 +634,10 @@ mod tests {
         // Prefix walks agree (both the pinned-region shape and a full one).
         let eu = [IndexValue::String("EU".into())];
         assert_eq!(dump(&disk, &eu), dump_ram(&ram, &eu));
-        let eu_eng = [IndexValue::String("EU".into()), IndexValue::String("eng".into())];
+        let eu_eng = [
+            IndexValue::String("EU".into()),
+            IndexValue::String("eng".into()),
+        ];
         assert_eq!(dump(&disk, &eu_eng), dump_ram(&ram, &eu_eng));
 
         // Persist folds tombstones + overlay; reopen and re-check.

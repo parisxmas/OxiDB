@@ -73,14 +73,11 @@ pub fn proxy_command(remote: &ParsedRemote, command: &Value) -> Result<Value, St
 
     // First attempt — pooled conn if any.
     if let Some(stream) = pool().take(&remote.host, remote.port, user_key) {
-        match round_trip(&stream, &payload) {
-            Ok(resp) => {
-                pool().give_back(&remote.host, remote.port, user_key, stream);
-                return Ok(resp);
-            }
-            // Pooled conn went bad. Don't surface the error — fall
-            // through to a fresh dial below.
-            Err(_) => {}
+        // A pooled conn that went bad is not an error to surface — fall
+        // through to a fresh dial below.
+        if let Ok(resp) = round_trip(&stream, &payload) {
+            pool().give_back(&remote.host, remote.port, user_key, stream);
+            return Ok(resp);
         }
     }
 

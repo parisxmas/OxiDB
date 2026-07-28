@@ -2589,19 +2589,17 @@ impl SqlEngine {
                     && toks
                         .get(i + 1)
                         .is_some_and(|s| s.eq_ignore_ascii_case("WITH"))
+                    && let Some(v) = toks.get(i + 2)
                 {
-                    if let Some(v) = toks.get(i + 2) {
-                        start = num(v);
-                    }
+                    start = num(v);
                 }
                 if w == "INCREMENT"
                     && toks
                         .get(i + 1)
                         .is_some_and(|s| s.eq_ignore_ascii_case("BY"))
+                    && let Some(v) = toks.get(i + 2)
                 {
-                    if let Some(v) = toks.get(i + 2) {
-                        inc = num(v);
-                    }
+                    inc = num(v);
                 }
             }
             let mut inner = self.inner.lock().unwrap();

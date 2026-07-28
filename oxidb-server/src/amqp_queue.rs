@@ -18,10 +18,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use oxidb::OxiDb;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::oximem::OxiMemStore;
 
@@ -502,19 +502,19 @@ impl AmqpBroker {
             ));
         };
         let mut st = self.inner.lock().unwrap();
-        if let Some(ex) = st.exchanges.get(name) {
-            if ex.kind != parsed {
-                // Accepting a redeclare with a different type silently would
-                // leave one of the two declarers routing wrong — RabbitMQ
-                // answers 406, so do we.
-                return Err((
-                    PRECONDITION_FAILED,
-                    format!(
-                        "exchange '{name}' exists as type '{}', redeclared as '{kind}'",
-                        ex.kind.as_str()
-                    ),
-                ));
-            }
+        if let Some(ex) = st.exchanges.get(name)
+            && ex.kind != parsed
+        {
+            // Accepting a redeclare with a different type silently would
+            // leave one of the two declarers routing wrong — RabbitMQ
+            // answers 406, so do we.
+            return Err((
+                PRECONDITION_FAILED,
+                format!(
+                    "exchange '{name}' exists as type '{}', redeclared as '{kind}'",
+                    ex.kind.as_str()
+                ),
+            ));
         }
         st.exchanges.entry(name.to_string()).or_insert(Exchange {
             durable,
@@ -522,17 +522,15 @@ impl AmqpBroker {
             bindings: Vec::new(),
         });
         drop(st);
-        if durable {
-            if let Some(db) = self.db() {
-                let _ = db.delete(
-                    AMQP_COLLECTION,
-                    &json!({ "_kind": "exchange", "name": name }),
-                );
-                let _ = db.insert(
-                    AMQP_COLLECTION,
-                    json!({ "_kind": "exchange", "name": name, "kind": kind }),
-                );
-            }
+        if durable && let Some(db) = self.db() {
+            let _ = db.delete(
+                AMQP_COLLECTION,
+                &json!({ "_kind": "exchange", "name": name }),
+            );
+            let _ = db.insert(
+                AMQP_COLLECTION,
+                json!({ "_kind": "exchange", "name": name, "kind": kind }),
+            );
         }
         Ok(())
     }
@@ -563,11 +561,9 @@ impl AmqpBroker {
         let counts = (q.ready.len() as u32, q.consumers.len() as u32);
         let persist = q.durable && !passive;
         drop(st);
-        if persist {
-            if let Some(db) = self.db() {
-                let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "queue", "name": name }));
-                let _ = db.insert(AMQP_COLLECTION, json!({ "_kind": "queue", "name": name }));
-            }
+        if persist && let Some(db) = self.db() {
+            let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "queue", "name": name }));
+            let _ = db.insert(AMQP_COLLECTION, json!({ "_kind": "queue", "name": name }));
         }
         Ok((name, counts.0, counts.1))
     }
@@ -587,17 +583,15 @@ impl AmqpBroker {
             ex.bindings.push(pair);
         }
         drop(st);
-        if durable_bind {
-            if let Some(db) = self.db() {
-                let _ = db.delete(
-                    AMQP_COLLECTION,
-                    &json!({ "_kind": "bind", "exchange": exchange, "queue": queue, "key": key }),
-                );
-                let _ = db.insert(
-                    AMQP_COLLECTION,
-                    json!({ "_kind": "bind", "exchange": exchange, "queue": queue, "key": key }),
-                );
-            }
+        if durable_bind && let Some(db) = self.db() {
+            let _ = db.delete(
+                AMQP_COLLECTION,
+                &json!({ "_kind": "bind", "exchange": exchange, "queue": queue, "key": key }),
+            );
+            let _ = db.insert(
+                AMQP_COLLECTION,
+                json!({ "_kind": "bind", "exchange": exchange, "queue": queue, "key": key }),
+            );
         }
         Ok(())
     }
@@ -731,16 +725,16 @@ impl AmqpBroker {
                 }
             }
         }
-        if !docs.is_empty() {
-            if let Some(db) = self.db() {
-                // Through the group committer: bursts arriving from OTHER
-                // connections while a commit is on the disk share the next
-                // round's insert_many — cross-connection fsync grouping. A
-                // lone publisher leads its own round immediately.
-                self.group.submit(docs, |round| {
-                    let _ = db.insert_many(AMQP_COLLECTION, round);
-                });
-            }
+        if !docs.is_empty()
+            && let Some(db) = self.db()
+        {
+            // Through the group committer: bursts arriving from OTHER
+            // connections while a commit is on the disk share the next
+            // round's insert_many — cross-connection fsync grouping. A
+            // lone publisher leads its own round immediately.
+            self.group.submit(docs, |round| {
+                let _ = db.insert_many(AMQP_COLLECTION, round);
+            });
         }
 
         let mqtt = self.mqtt.read().unwrap().clone();
@@ -777,10 +771,10 @@ impl AmqpBroker {
                     // Drop-oldest, counted, and the durable record goes with
                     // it — the bound must bind the disk too or a restart
                     // resurrects what the bound discarded (the MQTT lesson).
-                    if let Some(old) = q.ready.pop_front() {
-                        if let Some(s) = old.seq {
-                            dead_docs.push(s);
-                        }
+                    if let Some(old) = q.ready.pop_front()
+                        && let Some(s) = old.seq
+                    {
+                        dead_docs.push(s);
                     }
                     q.dropped += 1;
                 }
@@ -800,11 +794,11 @@ impl AmqpBroker {
         // forwards below — so their delivery pass overlaps with our tail work.
         self.wake_conns(&wake_ids);
 
-        if !dead_docs.is_empty() {
-            if let Some(db) = self.db() {
-                for seq in dead_docs {
-                    let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": seq }));
-                }
+        if !dead_docs.is_empty()
+            && let Some(db) = self.db()
+        {
+            for seq in dead_docs {
+                let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": seq }));
             }
         }
         if let Some(store) = mqtt {
@@ -932,11 +926,11 @@ impl AmqpBroker {
             }
         }
         drop(guard);
-        if !acked_docs.is_empty() {
-            if let Some(db) = self.db() {
-                for s in acked_docs {
-                    let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": s }));
-                }
+        if !acked_docs.is_empty()
+            && let Some(db) = self.db()
+        {
+            for s in acked_docs {
+                let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": s }));
             }
         }
         out
@@ -954,10 +948,10 @@ impl AmqpBroker {
         let remaining = q.ready.len() as u32;
         let doc = if no_ack { msg.seq } else { None };
         drop(st);
-        if let Some(s) = doc {
-            if let Some(db) = self.db() {
-                let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": s }));
-            }
+        if let Some(s) = doc
+            && let Some(db) = self.db()
+        {
+            let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": s }));
         }
         Ok(Some((msg, remaining)))
     }

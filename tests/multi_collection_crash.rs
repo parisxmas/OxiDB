@@ -185,7 +185,7 @@ fn run_victim() -> ! {
             }
         }));
     }
-    for h in handles {
+    if let Some(h) = handles.into_iter().next() {
         h.join().unwrap();
     }
     unreachable!()

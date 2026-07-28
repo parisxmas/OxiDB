@@ -67,37 +67,6 @@ pub(crate) fn decode_aws_chunked(input: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
-mod chunked_tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn decodes_simple_chunk() {
-        let body = b"b4\r\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n\r\n0\r\nx-amz-checksum-crc32:RENCRQ==\r\n\r\n";
-        let out = decode_aws_chunked(body);
-        let expected = b"PLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n".repeat(4);
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn detects_via_streaming_header() {
-        let mut h = HashMap::new();
-        h.insert(
-            "x-amz-content-sha256".to_string(),
-            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
-        );
-        assert!(is_aws_chunked(&h));
-    }
-
-    #[test]
-    fn detects_via_content_encoding() {
-        let mut h = HashMap::new();
-        h.insert("content-encoding".to_string(), "aws-chunked".to_string());
-        assert!(is_aws_chunked(&h));
-    }
-}
-
 use super::S3State;
 use super::encryption::{
     SseMode, add_encryption_headers, decrypt_data, encrypt_data, is_sse_c, is_sse_s3,
@@ -229,25 +198,26 @@ pub fn handle_get_object(
             };
 
             // Conditional: If-None-Match
-            if let Some(inm) = req.headers.get("if-none-match") {
-                if inm.trim_matches('"') == etag_val || inm == "*" {
-                    return HttpResponse {
-                        status: 304,
-                        status_text: "Not Modified",
-                        content_type: String::new(),
-                        headers: Vec::new(),
-                        body: Vec::new(),
-                        content_length_override: None,
-                    }
-                    .with_header("ETag", &etag_quoted);
+            if let Some(inm) = req.headers.get("if-none-match")
+                && (inm.trim_matches('"') == etag_val || inm == "*")
+            {
+                return HttpResponse {
+                    status: 304,
+                    status_text: "Not Modified",
+                    content_type: String::new(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    content_length_override: None,
                 }
+                .with_header("ETag", &etag_quoted);
             }
 
             // Conditional: If-Match
-            if let Some(im) = req.headers.get("if-match") {
-                if im != "*" && im.trim_matches('"') != etag_val {
-                    return error_response(412, "PreconditionFailed", "Precondition Failed", key);
-                }
+            if let Some(im) = req.headers.get("if-match")
+                && im != "*"
+                && im.trim_matches('"') != etag_val
+            {
+                return error_response(412, "PreconditionFailed", "Precondition Failed", key);
             }
 
             // Conditional: If-Modified-Since (compare as HTTP-date strings)
@@ -435,20 +405,20 @@ pub fn handle_copy_object(
     let src_key = source_parts[1];
 
     // Conditional copy
-    if let Some(im) = req.headers.get("x-amz-copy-source-if-match") {
-        if let Ok(meta) = state.db.head_object(src_bucket, src_key) {
-            let etag = meta["etag"].as_str().unwrap_or("");
-            if im.trim_matches('"') != etag && im != "*" {
-                return error_response(412, "PreconditionFailed", "Precondition Failed", src_key);
-            }
+    if let Some(im) = req.headers.get("x-amz-copy-source-if-match")
+        && let Ok(meta) = state.db.head_object(src_bucket, src_key)
+    {
+        let etag = meta["etag"].as_str().unwrap_or("");
+        if im.trim_matches('"') != etag && im != "*" {
+            return error_response(412, "PreconditionFailed", "Precondition Failed", src_key);
         }
     }
-    if let Some(inm) = req.headers.get("x-amz-copy-source-if-none-match") {
-        if let Ok(meta) = state.db.head_object(src_bucket, src_key) {
-            let etag = meta["etag"].as_str().unwrap_or("");
-            if inm.trim_matches('"') == etag {
-                return error_response(412, "PreconditionFailed", "Precondition Failed", src_key);
-            }
+    if let Some(inm) = req.headers.get("x-amz-copy-source-if-none-match")
+        && let Ok(meta) = state.db.head_object(src_bucket, src_key)
+    {
+        let etag = meta["etag"].as_str().unwrap_or("");
+        if inm.trim_matches('"') == etag {
+            return error_response(412, "PreconditionFailed", "Precondition Failed", src_key);
         }
     }
 
@@ -593,5 +563,36 @@ pub fn handle_copy_object(
                 src_key,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn decodes_simple_chunk() {
+        let body = b"b4\r\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n\r\n0\r\nx-amz-checksum-crc32:RENCRQ==\r\n\r\n";
+        let out = decode_aws_chunked(body);
+        let expected = b"PLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n".repeat(4);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn detects_via_streaming_header() {
+        let mut h = HashMap::new();
+        h.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+        );
+        assert!(is_aws_chunked(&h));
+    }
+
+    #[test]
+    fn detects_via_content_encoding() {
+        let mut h = HashMap::new();
+        h.insert("content-encoding".to_string(), "aws-chunked".to_string());
+        assert!(is_aws_chunked(&h));
     }
 }

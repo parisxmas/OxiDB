@@ -828,6 +828,12 @@ pub struct Compiler {
     params: Vec<String>,
 }
 
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Compiler {
     pub fn new() -> Self {
         Self {
@@ -1055,15 +1061,15 @@ impl Compiler {
         // Build params object from positional args
         // Convention: single object arg → pass as params directly
         // Multiple args or non-object → pass as positional array "_args"
-        if args.len() == 1 {
-            if let Expr::Object(_) = &args[0] {
-                let params = self.compile_expr(&args[0])?;
-                return Ok(json!({
-                    "step": "call_procedure",
-                    "name": func,
-                    "params": params
-                }));
-            }
+        if args.len() == 1
+            && let Expr::Object(_) = &args[0]
+        {
+            let params = self.compile_expr(&args[0])?;
+            return Ok(json!({
+                "step": "call_procedure",
+                "name": func,
+                "params": params
+            }));
         }
 
         // For positional args, build a params object with arg0, arg1, ...
@@ -1350,10 +1356,10 @@ mod tests {
 
     #[test]
     fn lex_numbers() {
-        let mut lexer = Lexer::new("42 3.14");
+        let mut lexer = Lexer::new("42 2.75");
         let tokens = lexer.tokenize().unwrap();
         assert_eq!(tokens[0], Token::Number(42.0));
-        assert_eq!(tokens[1], Token::Number(3.14));
+        assert_eq!(tokens[1], Token::Number(2.75));
     }
 
     #[test]

@@ -194,10 +194,8 @@ impl ShardRouter {
     /// Route a document for insertion — always has the shard key in the doc.
     /// Falls back to shard 0 for unsharded collections.
     pub async fn route_insert(&self, collection: &str, doc: &serde_json::Value) -> u32 {
-        match self.route(collection, doc).await {
-            Some(shard) => shard,
-            None => 0, // Unsharded → shard 0
-        }
+        // Unsharded → shard 0.
+        self.route(collection, doc).await.unwrap_or_default()
     }
 
     /// Check if a collection is sharded.
@@ -251,12 +249,12 @@ fn shard_key_string(v: &serde_json::Value) -> Option<String> {
         serde_json::Value::Bool(b) => Some(b.to_string()),
         serde_json::Value::Null => Some("null".to_string()),
         serde_json::Value::Object(obj) => {
-            if obj.len() == 1 {
-                if let Some(eq) = obj.get("$eq") {
-                    if !eq.is_object() && !eq.is_array() {
-                        return shard_key_string(eq);
-                    }
-                }
+            if obj.len() == 1
+                && let Some(eq) = obj.get("$eq")
+                && !eq.is_object()
+                && !eq.is_array()
+            {
+                return shard_key_string(eq);
             }
             None
         }

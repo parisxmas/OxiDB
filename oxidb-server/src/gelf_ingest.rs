@@ -85,10 +85,8 @@ impl ChunkBuffer {
             .map(|c| c.len())
             .sum();
         let mut buf = Vec::with_capacity(total_len);
-        for chunk in &self.chunks {
-            if let Some(data) = chunk {
-                buf.extend_from_slice(data);
-            }
+        for data in self.chunks.iter().flatten() {
+            buf.extend_from_slice(data);
         }
         buf
     }
@@ -169,57 +167,54 @@ pub fn start_gelf_listener(
                 let mut packet_count: u64 = 0;
 
                 loop {
-                    match socket.recv_from(&mut buf) {
-                        Ok((len, _src)) => {
-                            if len == 0 {
-                                continue;
+                    if let Ok((len, _src)) = socket.recv_from(&mut buf) {
+                        if len == 0 {
+                            continue;
+                        }
+
+                        packet_count += 1;
+
+                        // Periodic sweep of expired chunk buffers
+                        if packet_count % CHUNK_SWEEP_INTERVAL == 0 {
+                            chunk_buffers.retain(|_, cb| !cb.is_expired());
+                        }
+
+                        if len >= CHUNK_HEADER_SIZE
+                            && buf[0] == GELF_CHUNKED_MAGIC[0]
+                            && buf[1] == GELF_CHUNKED_MAGIC[1]
+                        {
+                            // Chunked GELF message
+                            let message_id = u64::from_be_bytes([
+                                buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+                            ]);
+                            let seq_num = buf[10];
+                            let seq_count = buf[11];
+
+                            if seq_count == 0 || seq_num >= seq_count {
+                                continue; // invalid
                             }
 
-                            packet_count += 1;
+                            let chunk_data = buf[CHUNK_HEADER_SIZE..len].to_vec();
 
-                            // Periodic sweep of expired chunk buffers
-                            if packet_count % CHUNK_SWEEP_INTERVAL == 0 {
-                                chunk_buffers.retain(|_, cb| !cb.is_expired());
-                            }
+                            let cb = chunk_buffers
+                                .entry(message_id)
+                                .or_insert_with(|| ChunkBuffer::new(seq_count));
 
-                            if len >= CHUNK_HEADER_SIZE
-                                && buf[0] == GELF_CHUNKED_MAGIC[0]
-                                && buf[1] == GELF_CHUNKED_MAGIC[1]
-                            {
-                                // Chunked GELF message
-                                let message_id = u64::from_be_bytes([
-                                    buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-                                ]);
-                                let seq_num = buf[10];
-                                let seq_count = buf[11];
+                            if cb.insert(seq_num, chunk_data) {
+                                // All chunks received — reassemble and parse
+                                let mut full_msg = cb.reassemble();
+                                chunk_buffers.remove(&message_id);
 
-                                if seq_count == 0 || seq_num >= seq_count {
-                                    continue; // invalid
-                                }
-
-                                let chunk_data = buf[CHUNK_HEADER_SIZE..len].to_vec();
-
-                                let cb = chunk_buffers
-                                    .entry(message_id)
-                                    .or_insert_with(|| ChunkBuffer::new(seq_count));
-
-                                if cb.insert(seq_num, chunk_data) {
-                                    // All chunks received — reassemble and parse
-                                    let mut full_msg = cb.reassemble();
-                                    chunk_buffers.remove(&message_id);
-
-                                    if let Some(doc) = parse_gelf_message_simd(&mut full_msg) {
-                                        let _ = tx.try_send(doc);
-                                    }
-                                }
-                            } else {
-                                // Regular (non-chunked) GELF message
-                                if let Some(doc) = parse_gelf_message_simd(&mut buf[..len]) {
+                                if let Some(doc) = parse_gelf_message_simd(&mut full_msg) {
                                     let _ = tx.try_send(doc);
                                 }
                             }
+                        } else {
+                            // Regular (non-chunked) GELF message
+                            if let Some(doc) = parse_gelf_message_simd(&mut buf[..len]) {
+                                let _ = tx.try_send(doc);
+                            }
                         }
-                        Err(_) => {}
                     }
                 }
             })
@@ -262,10 +257,10 @@ pub fn start_gelf_listener(
                     // Stamp the batch with a single timestamp
                     let ts = chrono::Utc::now().to_rfc3339();
                     for doc in &mut batch {
-                        if let Some(obj) = doc.as_object_mut() {
-                            if !obj.contains_key("_ts") {
-                                obj.insert("_ts".to_string(), Value::String(ts.clone()));
-                            }
+                        if let Some(obj) = doc.as_object_mut()
+                            && !obj.contains_key("_ts")
+                        {
+                            obj.insert("_ts".to_string(), Value::String(ts.clone()));
                         }
                     }
 

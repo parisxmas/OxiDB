@@ -67,7 +67,10 @@ impl Logger {
             Format::Msgpack => {
                 let mut m = serde_json::Map::with_capacity(extra.len() + 4);
                 m.insert("host".into(), Value::String(self.host.clone()));
-                m.insert("short_message".into(), Value::String(short_message.to_string()));
+                m.insert(
+                    "short_message".into(),
+                    Value::String(short_message.to_string()),
+                );
                 m.insert("level".into(), json!(level as u8));
                 m.insert("ts".into(), json!(ts));
                 for &(k, v) in extra {

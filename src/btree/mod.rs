@@ -22,9 +22,13 @@ const FORMAT_VERSION: u32 = 1;
 /// Header size: 4 (magic) + 4 (version) + 8 (entry count).
 const HEADER_SIZE: usize = 16;
 
+/// An opened tree file: the handle, the key -> `(offset, length)` map read from
+/// it, and the next free offset.
+type OpenedTree = (fs::File, BTreeMap<u64, (u64, u32)>, u64);
+
 /// Entry format: [key: u64 LE][length: u32 LE][payload]
 /// Deleted entries are simply removed from the tree and compacted out of the file.
-
+///
 /// In-memory B-tree node backed by an on-disk data file.
 ///
 /// The B-tree maps `DocumentId -> (offset, length)` for quick lookups.
@@ -65,7 +69,7 @@ impl BTreeStorage {
         })
     }
 
-    fn create_new(path: &Path) -> Result<(fs::File, BTreeMap<u64, (u64, u32)>, u64)> {
+    fn create_new(path: &Path) -> Result<OpenedTree> {
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -80,7 +84,7 @@ impl BTreeStorage {
         Ok((file, BTreeMap::new(), HEADER_SIZE as u64))
     }
 
-    fn open_existing(path: &Path) -> Result<(fs::File, BTreeMap<u64, (u64, u32)>, u64)> {
+    fn open_existing(path: &Path) -> Result<OpenedTree> {
         let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read and validate header

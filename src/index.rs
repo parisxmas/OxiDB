@@ -16,17 +16,12 @@ use crate::value::IndexValue;
 /// Single-element sets (common for high-cardinality fields like order_id
 /// or amount) are stored inline without heap allocation, saving ~80 bytes
 /// per entry compared to `BTreeSet`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum DocIdSet {
+    #[default]
     Empty,
     One(DocumentId),
     Set(BTreeSet<DocumentId>),
-}
-
-impl Default for DocIdSet {
-    fn default() -> Self {
-        DocIdSet::Empty
-    }
 }
 
 impl DocIdSet {
@@ -1375,7 +1370,7 @@ mod tests {
         idx.insert(&make_doc(1, json!({"val": null})));
         idx.insert(&make_doc(2, json!({"val": true})));
         idx.insert(&make_doc(3, json!({"val": 42})));
-        idx.insert(&make_doc(4, json!({"val": 3.14})));
+        idx.insert(&make_doc(4, json!({"val": 2.75})));
         idx.insert(&make_doc(5, json!({"val": "2024-01-01"})));
         idx.insert(&make_doc(6, json!({"val": "hello"})));
 

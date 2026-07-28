@@ -4,14 +4,13 @@
 //! composite), with a bare (index-free) table as contrast.
 //!
 //! Phases (identical SQL text and row values on both engines):
-//!   1. bulk    — `BATCHES` multi-row INSERTs of `BATCH_ROWS` rows each into
-//!                the indexed table (one WAL fsync per statement on both
-//!                engines).
-//!   2. single  — `SINGLES` autocommit single-row INSERTs (one fsync each).
-//!   3. bare    — the same bulk load into a table with no PK and no indexes
-//!                (isolates index-maintenance cost).
-//!   4. parity  — aggregate + indexed-lookup results, for cross-engine
-//!                comparison.
+//! 1. bulk — `BATCHES` multi-row INSERTs of `BATCH_ROWS` rows each into the
+//!    indexed table (one WAL fsync per statement on both engines).
+//! 2. single — `SINGLES` autocommit single-row INSERTs (one fsync each).
+//! 3. bare — the same bulk load into a table with no PK and no indexes
+//!    (isolates index-maintenance cost).
+//! 4. parity — aggregate + indexed-lookup results, for cross-engine
+//!    comparison.
 //!
 //! Run: `cargo run --release --example insert_bench -p oxidb-sql`
 //! Scale with `SCALE=5` (multiplies the bulk batch count).

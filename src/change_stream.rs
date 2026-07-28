@@ -98,6 +98,12 @@ pub struct ChangeStreamBroker {
     event_log: RwLock<VecDeque<ChangeEvent>>,
 }
 
+impl Default for ChangeStreamBroker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChangeStreamBroker {
     pub fn new() -> Self {
         Self {
@@ -138,10 +144,10 @@ impl ChangeStreamBroker {
             let log = self.event_log.read().unwrap();
             // Check if the requested token is still in the buffer
             let oldest_token = log.front().map(|e| e.token);
-            if let Some(oldest) = oldest_token {
-                if token < oldest {
-                    return Err(ResumeError::TokenTooOld);
-                }
+            if let Some(oldest) = oldest_token
+                && token < oldest
+            {
+                return Err(ResumeError::TokenTooOld);
             }
             // Even if log is empty and token > 0, that means no events have been
             // emitted since the token — valid resume with nothing to replay.

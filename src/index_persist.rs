@@ -181,7 +181,7 @@ fn write_cache_file(
     let final_body = match encryption {
         Some(key) => key
             .encrypt(body)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+            .map_err(|e| io::Error::other(e.to_string()))?,
         None => body.to_vec(),
     };
 

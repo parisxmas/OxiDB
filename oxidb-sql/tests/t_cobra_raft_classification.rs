@@ -23,15 +23,15 @@ fn create_procedure_language_cobra_is_a_write() {
         "CREATE PROCEDURE p(name TEXT, age INT) LANGUAGE COBRA AS '{}'",
         fixture_b64()
     );
-    assert_eq!(oxidb_sql::is_read_only(&sql).unwrap(), false);
+    assert!(!oxidb_sql::is_read_only(&sql).unwrap());
 }
 
 #[test]
 fn call_is_a_write() {
-    assert_eq!(oxidb_sql::is_read_only("CALL p(1, 2)").unwrap(), false);
+    assert!(!oxidb_sql::is_read_only("CALL p(1, 2)").unwrap());
 }
 
 #[test]
 fn drop_procedure_is_a_write() {
-    assert_eq!(oxidb_sql::is_read_only("DROP PROCEDURE p").unwrap(), false);
+    assert!(!oxidb_sql::is_read_only("DROP PROCEDURE p").unwrap());
 }

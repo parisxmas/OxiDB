@@ -71,13 +71,13 @@ struct MultipartUpload {
 impl MultipartUpload {
     /// Zeroize SSE-C key material from memory.
     fn zeroize_key(&mut self) {
-        if let Some(ref mut marker) = self.sse_marker {
-            if marker.starts_with("SSE-C:") {
-                let bytes = unsafe { marker.as_bytes_mut() };
-                for b in bytes.iter_mut() {
-                    unsafe {
-                        std::ptr::write_volatile(b, 0);
-                    }
+        if let Some(ref mut marker) = self.sse_marker
+            && marker.starts_with("SSE-C:")
+        {
+            let bytes = unsafe { marker.as_bytes_mut() };
+            for b in bytes.iter_mut() {
+                unsafe {
+                    std::ptr::write_volatile(b, 0);
                 }
             }
         }
@@ -278,16 +278,16 @@ fn handle_connection(mut stream: TcpStream, state: &S3State) {
         }
 
         // Authenticate
-        if let Some(auth) = &state.auth {
-            if !verify_auth(&req, auth) {
-                error_response(403, "AccessDenied", "Access Denied", &req.path)
-                    .with_cors()
-                    .write_to_keepalive(&mut stream, !wants_close);
-                if wants_close {
-                    return;
-                }
-                continue;
+        if let Some(auth) = &state.auth
+            && !verify_auth(&req, auth)
+        {
+            error_response(403, "AccessDenied", "Access Denied", &req.path)
+                .with_cors()
+                .write_to_keepalive(&mut stream, !wants_close);
+            if wants_close {
+                return;
             }
+            continue;
         }
 
         let path = url_decode(&req.path);

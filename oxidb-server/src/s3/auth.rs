@@ -21,10 +21,11 @@ impl S3Auth {
         if let Ok(multi) = std::env::var("OXIDB_S3_CREDENTIALS") {
             for pair in multi.split(',') {
                 let pair = pair.trim();
-                if let Some((ak, sk)) = pair.split_once(':') {
-                    if !ak.is_empty() && !sk.is_empty() {
-                        creds.insert(ak.to_string(), sk.to_string());
-                    }
+                if let Some((ak, sk)) = pair.split_once(':')
+                    && !ak.is_empty()
+                    && !sk.is_empty()
+                {
+                    creds.insert(ak.to_string(), sk.to_string());
                 }
             }
         }
@@ -33,10 +34,10 @@ impl S3Auth {
         if let (Ok(ak), Ok(sk)) = (
             std::env::var("OXIDB_S3_ACCESS_KEY"),
             std::env::var("OXIDB_S3_SECRET_KEY"),
-        ) {
-            if !ak.is_empty() && !sk.is_empty() {
-                creds.insert(ak, sk);
-            }
+        ) && !ak.is_empty()
+            && !sk.is_empty()
+        {
+            creds.insert(ak, sk);
         }
 
         if creds.is_empty() {
@@ -186,17 +187,15 @@ fn verify_presigned(req: &HttpRequest, auth: &S3Auth, params: &HashMap<String, S
     if let Some(expires) = params
         .get("X-Amz-Expires")
         .and_then(|v| v.parse::<u64>().ok())
+        && let Some(date_str) = params.get("X-Amz-Date")
+        && let Ok(request_time) = parse_amz_date(date_str)
     {
-        if let Some(date_str) = params.get("X-Amz-Date") {
-            if let Ok(request_time) = parse_amz_date(date_str) {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                if now > request_time + expires {
-                    return false;
-                }
-            }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now > request_time + expires {
+            return false;
         }
     }
 
@@ -215,7 +214,7 @@ fn verify_presigned(req: &HttpRequest, auth: &S3Auth, params: &HashMap<String, S
         })
         .filter(|(k, _)| *k != "X-Amz-Signature")
         .collect();
-    qpairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    qpairs.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
     let canonical_querystring = qpairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -299,7 +298,7 @@ fn canonical_query(query: &str) -> String {
             Some((k, v))
         })
         .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    pairs.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
     pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))

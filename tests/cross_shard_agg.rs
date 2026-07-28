@@ -77,12 +77,13 @@ fn canon(v: &Value) -> Value {
         }
         Value::Array(a) => Value::Array(a.iter().map(canon).collect()),
         Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if n.as_i64().is_none() && n.as_u64().is_none() {
-                    // Round floats to 6 decimals for stable comparison.
-                    let r = (f * 1_000_000.0).round() / 1_000_000.0;
-                    return json!(r);
-                }
+            if let Some(f) = n.as_f64()
+                && n.as_i64().is_none()
+                && n.as_u64().is_none()
+            {
+                // Round floats to 6 decimals for stable comparison.
+                let r = (f * 1_000_000.0).round() / 1_000_000.0;
+                return json!(r);
             }
             v.clone()
         }

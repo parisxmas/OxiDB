@@ -946,21 +946,21 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
                 on_update,
                 ..
             } => {
-                if let [col] = columns.as_slice() {
-                    if referred_columns.len() <= 1 {
-                        fks.push(crate::catalog::ForeignKey {
-                            column: col.value.clone(),
-                            parent_table: object_name_to_string(foreign_table)?,
-                            // Empty referred column => resolve to the parent's
-                            // PRIMARY KEY at enforcement time.
-                            parent_column: referred_columns
-                                .first()
-                                .map(|c| c.value.clone())
-                                .unwrap_or_default(),
-                            on_delete: fk_action(on_delete),
-                            on_update: fk_action(on_update),
-                        });
-                    }
+                if let [col] = columns.as_slice()
+                    && referred_columns.len() <= 1
+                {
+                    fks.push(crate::catalog::ForeignKey {
+                        column: col.value.clone(),
+                        parent_table: object_name_to_string(foreign_table)?,
+                        // Empty referred column => resolve to the parent's
+                        // PRIMARY KEY at enforcement time.
+                        parent_column: referred_columns
+                            .first()
+                            .map(|c| c.value.clone())
+                            .unwrap_or_default(),
+                        on_delete: fk_action(on_delete),
+                        on_update: fk_action(on_update),
+                    });
                 }
             }
             // Table-level `[CONSTRAINT name] PRIMARY KEY (col, ...)` — the form

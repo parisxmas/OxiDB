@@ -93,10 +93,12 @@ pub fn sweep(db: &Arc<OxiDb>) -> usize {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // created_at is RFC3339/ISO; parse the epoch cheaply.
-            if let Some(secs) = iso_to_epoch(created) {
-                if secs < cutoff && !key.is_empty() && db.delete_object(bucket, key).is_ok() {
-                    expired += 1;
-                }
+            if let Some(secs) = iso_to_epoch(created)
+                && secs < cutoff
+                && !key.is_empty()
+                && db.delete_object(bucket, key).is_ok()
+            {
+                expired += 1;
             }
         }
     }

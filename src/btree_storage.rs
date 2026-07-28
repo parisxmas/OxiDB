@@ -404,6 +404,8 @@ impl Cursor {
         Ok(Self { entries, pos: 0 })
     }
 
+    // A cursor step over a mapped file, not an Iterator: it borrows self and can fail.
+    #[allow(clippy::should_implement_trait)]
     /// Advance to the next entry. Returns None when exhausted.
     pub fn next(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         if self.pos >= self.entries.len() {
@@ -443,6 +445,8 @@ impl ReverseCursor {
         Ok(Self { entries, pos: 0 })
     }
 
+    // A cursor step over a mapped file, not an Iterator: it borrows self and can fail.
+    #[allow(clippy::should_implement_trait)]
     /// Advance to the previous (next lower) entry.
     pub fn next(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         if self.pos >= self.entries.len() {
@@ -558,10 +562,10 @@ impl BTreeStorage {
     #[cfg(not(target_arch = "wasm32"))]
     fn resolve_opts(name: &str, data_dir: &Path) -> StorageOptions {
         let bopts_path = data_dir.join(format!("{}.bopts", name));
-        if let Ok(bytes) = std::fs::read(&bopts_path) {
-            if let Ok(o) = serde_json::from_slice::<StorageOptions>(&bytes) {
-                return o;
-            }
+        if let Ok(bytes) = std::fs::read(&bopts_path)
+            && let Ok(o) = serde_json::from_slice::<StorageOptions>(&bytes)
+        {
+            return o;
         }
         let mut o = StorageOptions::from_env();
         if data_dir.join(format!("{}.bdat", name)).exists() {
@@ -676,10 +680,10 @@ impl BTreeStorage {
         // consistent regardless of the env. Written once (don't clobber an
         // existing file — that's the authoritative record for reopens).
         let bopts_path = data_dir.join(format!("{}.bopts", name));
-        if !bopts_path.exists() {
-            if let Ok(json) = serde_json::to_vec_pretty(&opts) {
-                let _ = std::fs::write(&bopts_path, json);
-            }
+        if !bopts_path.exists()
+            && let Ok(json) = serde_json::to_vec_pretty(&opts)
+        {
+            let _ = std::fs::write(&bopts_path, json);
         }
         // `.bdat` (BTree disk-first data), deliberately NOT `.dat` — the engine
         // treats bare `.dat` as the legacy append-only `Collection` format and
@@ -698,11 +702,11 @@ impl BTreeStorage {
         // new appended) only the live record is visited; if any duplicate live
         // record slipped through a crash, the later (higher-offset) append wins.
         data.for_each_active(|loc, bytes| {
-            if let Ok(doc) = crate::codec::decode_doc(&bytes) {
-                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    let _ = index.upsert_sync(id, loc);
-                    total += loc.length() as u64;
-                }
+            if let Ok(doc) = crate::codec::decode_doc(&bytes)
+                && let Some(id) = doc.get("_id").and_then(|v| v.as_u64())
+            {
+                let _ = index.upsert_sync(id, loc);
+                total += loc.length() as u64;
             }
             Ok(())
         })?;
@@ -839,10 +843,10 @@ impl BTreeStorage {
         // On macOS APFS this is a no-op as far as durability goes (FS
         // crash-consistency is stronger), but it costs nothing and is
         // required on ext4 / xfs / etc.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_data();
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_data();
         }
 
         Ok(())
@@ -1017,10 +1021,10 @@ impl BTreeStorage {
         }
         let old = self.tree.remove_sync(&key).map(|(_, v)| v);
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(g) = self.recording_gate() {
-            if old.is_some() {
-                g.record(&self.name, key, old.as_deref());
-            }
+        if let Some(g) = self.recording_gate()
+            && old.is_some()
+        {
+            g.record(&self.name, key, old.as_deref());
         }
         if let Some(ref val) = old {
             let len = val.len() as u64;
@@ -1327,10 +1331,10 @@ impl BTreeStorage {
             });
             items.sort_unstable_by_key(|(k, _)| *k);
             for (key, loc) in items {
-                if let Ok(value) = data.read_lockfree(loc) {
-                    if !f(key, &value)? {
-                        break;
-                    }
+                if let Ok(value) = data.read_lockfree(loc)
+                    && !f(key, &value)?
+                {
+                    break;
                 }
             }
             return Ok(());
@@ -1342,10 +1346,10 @@ impl BTreeStorage {
         });
         keys.sort_unstable();
         for key in keys {
-            if let Some(value) = self.tree.read_sync(&key, |_, v| v.clone()) {
-                if !f(key, &value)? {
-                    break;
-                }
+            if let Some(value) = self.tree.read_sync(&key, |_, v| v.clone())
+                && !f(key, &value)?
+            {
+                break;
             }
         }
         Ok(())
@@ -1367,10 +1371,10 @@ impl BTreeStorage {
             });
             items.sort_unstable_by_key(|(k, _)| *k);
             for (_key, loc) in items {
-                if let Ok(value) = data.read_lockfree(loc) {
-                    if !f(&value)? {
-                        break;
-                    }
+                if let Ok(value) = data.read_lockfree(loc)
+                    && !f(&value)?
+                {
+                    break;
                 }
             }
             return Ok(());
@@ -1382,10 +1386,10 @@ impl BTreeStorage {
         });
         keys.sort_unstable();
         for key in keys {
-            if let Some(value) = self.tree.read_sync(&key, |_, v| v.clone()) {
-                if !f(&value)? {
-                    break;
-                }
+            if let Some(value) = self.tree.read_sync(&key, |_, v| v.clone())
+                && !f(&value)?
+            {
+                break;
             }
         }
         Ok(())
@@ -1688,7 +1692,7 @@ mod tests {
 
         let raw = std::fs::read(dir.path().join("hdr.btree")).unwrap();
         assert!(
-            raw.len() >= BTREE_HEADER_SIZE + 8 + 4 + 1,
+            raw.len() > BTREE_HEADER_SIZE + 8 + 4,
             "header + 1 record minimum"
         );
         assert_eq!(&raw[0..4], BTREE_MAGIC, "OXBT magic at offset 0");

@@ -69,11 +69,17 @@ fn try_transfer(db: &OxiDb, from: &str, to: &str, amount: i64) -> Result<(), &'s
 
     let dec: Value = json!({ "$inc": { "balance": -amount } });
     let inc: Value = json!({ "$inc": { "balance":  amount } });
-    if let Err(_) = db.tx_update(tx, "accounts", &json!({"id": from}), &dec) {
+    if db
+        .tx_update(tx, "accounts", &json!({"id": from}), &dec)
+        .is_err()
+    {
         db.rollback_transaction(tx).ok();
         return Err("tx_update from");
     }
-    if let Err(_) = db.tx_update(tx, "accounts", &json!({"id": to}), &inc) {
+    if db
+        .tx_update(tx, "accounts", &json!({"id": to}), &inc)
+        .is_err()
+    {
         db.rollback_transaction(tx).ok();
         return Err("tx_update to");
     }
@@ -143,7 +149,7 @@ fn no_money_lost_under_concurrent_transfers() {
                                            MAX_RETRIES_PER_TRANSFER);
                                 }
                                 // Small jitter so threads don't lockstep.
-                                thread::sleep(std::time::Duration::from_micros((state & 0xff) as u64));
+                                thread::sleep(std::time::Duration::from_micros(state & 0xff));
                             }
                             Err("insufficient funds") => {
                                 insufficient += 1;

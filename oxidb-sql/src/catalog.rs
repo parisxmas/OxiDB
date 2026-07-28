@@ -530,6 +530,53 @@ impl Catalog {
     }
 }
 
+/// Minimal RFC 4648 base64 (standard alphabet, `=` padding) — kept local so
+/// the engine gains no dependency for one wire shim.
+pub(crate) fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
+    fn val(c: u8) -> std::result::Result<u32, ()> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(()),
+        }
+    }
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = (acc << 6) | val(c)?;
+        }
+        let bits = chunk.len() * 6;
+        acc <<= 24 - bits;
+        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&bytes[..bits / 8]);
+    }
+    Ok(out)
+}
+
+pub(crate) fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let mut acc = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            acc |= (c as u32) << (16 - i * 8);
+        }
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((acc >> (18 - i * 6)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,51 +678,4 @@ mod tests {
             .is_err()
         );
     }
-}
-
-/// Minimal RFC 4648 base64 (standard alphabet, `=` padding) — kept local so
-/// the engine gains no dependency for one wire shim.
-pub(crate) fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
-    fn val(c: u8) -> std::result::Result<u32, ()> {
-        match c {
-            b'A'..=b'Z' => Ok((c - b'A') as u32),
-            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(()),
-        }
-    }
-    let s = s.trim_end_matches('=').as_bytes();
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    for chunk in s.chunks(4) {
-        let mut acc = 0u32;
-        for &c in chunk {
-            acc = (acc << 6) | val(c)?;
-        }
-        let bits = chunk.len() * 6;
-        acc <<= 24 - bits;
-        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
-        out.extend_from_slice(&bytes[..bits / 8]);
-    }
-    Ok(out)
-}
-
-pub(crate) fn base64_encode(b: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
-    for chunk in b.chunks(3) {
-        let mut acc = 0u32;
-        for (i, &c) in chunk.iter().enumerate() {
-            acc |= (c as u32) << (16 - i * 8);
-        }
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(A[((acc >> (18 - i * 6)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }

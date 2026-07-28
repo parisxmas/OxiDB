@@ -148,12 +148,12 @@ pub fn parse_interval(s: &str) -> Result<Duration> {
         return Err(Error::ScheduleError("empty interval string".into()));
     }
 
-    let (num_str, suffix) = if s.ends_with('s') {
-        (&s[..s.len() - 1], "s")
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], "m")
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], "h")
+    let (num_str, suffix) = if let Some(rest) = s.strip_suffix('s') {
+        (rest, "s")
+    } else if let Some(rest) = s.strip_suffix('m') {
+        (rest, "m")
+    } else if let Some(rest) = s.strip_suffix('h') {
+        (rest, "h")
     } else {
         return Err(Error::ScheduleError(format!(
             "interval must end with 's', 'm', or 'h': {s}"

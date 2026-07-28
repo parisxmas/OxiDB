@@ -89,7 +89,8 @@ pub(super) fn handle(
                     // Keyset paging: `after` is the last key of the previous
                     // page. Stable across uploads and deletes, unlike an offset.
                     let after = params.get("after").map(|v| url_decode(v));
-                    match db.list_objects_from(&bucket, prefix.as_deref(), after.as_deref(), limit) {
+                    match db.list_objects_from(&bucket, prefix.as_deref(), after.as_deref(), limit)
+                    {
                         Ok(objects) => json_response(200, "OK", json!({"objects": objects})),
                         Err(e) => storage_err(&e),
                     }
@@ -109,8 +110,7 @@ pub(super) fn handle(
                 "PUT" | "POST" => {
                     // OxiBase project quota: usage + this upload must fit.
                     if let (Some(name), Some(mgr)) = (db_name, &state.db_manager)
-                        && let Some(max) =
-                            crate::tenant_auth::project_storage_limit(mgr, name)
+                        && let Some(max) = crate::tenant_auth::project_storage_limit(mgr, name)
                         && max > 0
                     {
                         let used = total_bytes(db);
@@ -181,7 +181,11 @@ pub(super) fn total_bytes(db: &oxidb::OxiDb) -> u64 {
 }
 
 fn method_not_allowed() -> HttpResponse {
-    json_response(405, "Method Not Allowed", json!({"error": "method not allowed"}))
+    json_response(
+        405,
+        "Method Not Allowed",
+        json!({"error": "method not allowed"}),
+    )
 }
 
 /// Map engine errors: missing bucket/object → 404, everything else → 400.
@@ -190,7 +194,11 @@ fn storage_err(e: &oxidb::Error) -> HttpResponse {
     let status = if msg.contains("not found") { 404 } else { 400 };
     json_response(
         status,
-        if status == 404 { "Not Found" } else { "Bad Request" },
+        if status == 404 {
+            "Not Found"
+        } else {
+            "Bad Request"
+        },
         json!({"error": msg}),
     )
 }

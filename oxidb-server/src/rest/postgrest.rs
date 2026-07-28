@@ -422,15 +422,15 @@ fn parse_logic(bool_op: &str, raw: &str) -> PgResult<Value> {
 /// A single condition inside a logic group: `col.op.value`, `col.not.op.value`,
 /// or a nested `or(...)`/`and(...)`.
 fn parse_dotted_condition(cond: &str) -> PgResult<Value> {
-    if let Some(rest) = cond.strip_prefix("or") {
-        if rest.starts_with('(') {
-            return parse_logic("$or", rest);
-        }
+    if let Some(rest) = cond.strip_prefix("or")
+        && rest.starts_with('(')
+    {
+        return parse_logic("$or", rest);
     }
-    if let Some(rest) = cond.strip_prefix("and") {
-        if rest.starts_with('(') {
-            return parse_logic("$and", rest);
-        }
+    if let Some(rest) = cond.strip_prefix("and")
+        && rest.starts_with('(')
+    {
+        return parse_logic("$and", rest);
     }
     let (col, spec) = cond.split_once('.').ok_or((
         400,
@@ -658,10 +658,11 @@ fn resolve_embed(
         let mut seen = HashSet::new();
         let mut ids = Vec::new();
         for d in docs.iter() {
-            if let Some(v) = d.get(&fk) {
-                if !v.is_null() && seen.insert(join_key(v)) {
-                    ids.push(v.clone());
-                }
+            if let Some(v) = d.get(&fk)
+                && !v.is_null()
+                && seen.insert(join_key(v))
+            {
+                ids.push(v.clone());
             }
         }
         let mut by_id: HashMap<String, Value> = HashMap::new();

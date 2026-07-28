@@ -12,14 +12,14 @@ pub fn handle_get_tagging(db: &OxiDb, bucket: &str, key: &str) -> HttpResponse {
 
             if let Some(user_meta) = meta.get("metadata").and_then(|v| v.as_object()) {
                 for (k, v) in user_meta {
-                    if let Some(tag_key) = k.strip_prefix("tag-") {
-                        if let Some(val) = v.as_str() {
-                            xml.push_str(&format!(
-                                "    <Tag><Key>{}</Key><Value>{}</Value></Tag>\n",
-                                xml_escape(tag_key),
-                                xml_escape(val)
-                            ));
-                        }
+                    if let Some(tag_key) = k.strip_prefix("tag-")
+                        && let Some(val) = v.as_str()
+                    {
+                        xml.push_str(&format!(
+                            "    <Tag><Key>{}</Key><Value>{}</Value></Tag>\n",
+                            xml_escape(tag_key),
+                            xml_escape(val)
+                        ));
                     }
                 }
             }

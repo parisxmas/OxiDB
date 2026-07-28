@@ -62,13 +62,13 @@ fn count_total_entries(audit_dir: &Path) -> usize {
 
 /// Age=300ms, write one event immediately and one after a
 /// >300ms sleep. The SECOND write must trigger rotation — the live
-/// file at that moment is older than the threshold.
+/// > file at that moment is older than the threshold.
 #[test]
 fn audit_log_rotates_when_age_exceeds_threshold() {
     let dir = tempdir().unwrap();
     let log = AuditLog::open_with_policy(
         dir.path(),
-        RotationPolicy::age_secs(0).clone(), // placeholder; replaced below
+        RotationPolicy::age_secs(0), // placeholder; replaced below
     )
     .unwrap();
     drop(log); // discard — we want the real policy with subsecond age

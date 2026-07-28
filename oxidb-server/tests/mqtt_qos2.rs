@@ -118,7 +118,6 @@ struct Rx {
     payload: String,
     qos: u8,
     pkt_id: u16,
-    dup: bool,
 }
 
 fn parse_publish(flags: u8, p: &[u8]) -> Rx {
@@ -138,7 +137,6 @@ fn parse_publish(flags: u8, p: &[u8]) -> Rx {
         payload: String::from_utf8_lossy(&p[off..]).to_string(),
         qos,
         pkt_id,
-        dup: flags & 0x08 != 0,
     }
 }
 
@@ -181,6 +179,8 @@ fn test_port(base: u16, span_per_pid: u16) -> u16 {
 fn start(port: u16, data: &Path, persist: bool, log: &str) -> Child {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    // The child is owned by a guard that kills and waits on Drop.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
         .env("OXIDB_MQTT_PERSIST", if persist { "1" } else { "0" })
         .env("OXIDB_MQTT_PORT", port.to_string())
@@ -190,7 +190,8 @@ fn start(port: u16, data: &Path, persist: bool, log: &str) -> Child {
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {  // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
+    for _ in 0..600 {
+        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return child;
         }
@@ -246,7 +247,10 @@ fn a_duplicate_qos2_publish_is_delivered_exactly_once() {
         got.iter().map(|r| &r.payload).collect::<Vec<_>>()
     );
     assert_eq!(got[0].payload, "only-once");
-    assert_eq!(got[0].qos, 2, "a QoS-2 publish to a QoS-2 subscription delivers at 2");
+    assert_eq!(
+        got[0].qos, 2,
+        "a QoS-2 publish to a QoS-2 subscription delivers at 2"
+    );
 
     broker.kill().ok();
     broker.wait().ok();

@@ -793,11 +793,11 @@ impl PagedFieldIndex {
         // Pre-allocate: at most pairs.len() unique values
         self.entries.reserve(pairs.len() / 2);
         for (val, id) in pairs {
-            if let Some(last) = self.entries.last_mut() {
-                if last.0 == val {
-                    last.1.insert(id);
-                    continue;
-                }
+            if let Some(last) = self.entries.last_mut()
+                && last.0 == val
+            {
+                last.1.insert(id);
+                continue;
             }
             self.entries.push((val, DocIdSet::One(id)));
         }
