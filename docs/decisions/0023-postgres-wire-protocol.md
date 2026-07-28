@@ -1,10 +1,9 @@
 # ADR-0023: PostgreSQL wire protocol as a separate listener
 
 **Status:** Accepted — v1 (startup + SCRAM auth, simple and extended query,
-transactions, SQLSTATE mapping, session/catalog interception) landed & tested
-2026-07-28, verified against real `psql` 18, `psycopg` 3.3, **Npgsql 8.0 and
-pgjdbc 42.7** (the last two after the type-catalog and mixed-batch work below;
-pgjdbc's `DatabaseMetaData` remains unimplemented).
+transactions, SQLSTATE mapping, session/catalog interception, the driver type
+catalog and JDBC's `DatabaseMetaData`) landed & tested 2026-07-28, verified
+against real `psql` 18, `psycopg` 3.3, **Npgsql 8.0** and **pgjdbc 42.7**.
 **Supersedes:** —
 **Related:** [ADR-0010](0010-sql-engine.md) (the engine this exposes),
 [ADR-0012](0012-multi-database.md) (the `database` startup parameter resolves
@@ -119,9 +118,25 @@ Executing these queries for real would be the *harder* path, not the easier
 one: they use `~`, `::regclass`, `pg_get_expr()` and window functions the
 engine would have to grow first.
 
+The same reasoning extends to JDBC's `DatabaseMetaData`: those queries are
+unanswerable as written (they use `information_schema._pg_expandarray`,
+`pg_get_indexdef`, `generate_series`, `current_schemas`), but the *questions*
+are ones the engine's catalog answers directly — which tables, which columns,
+which keys, which indexes. So each is matched and answered from `list_tables`,
+`table_def`, `list_indexes` and `Table::foreign_keys`.
+
 The cost is that the match is per-driver and per-version text, and a driver
 upgrade can change it. That is why the fallback is a refusal rather than an
 empty result — a stale match fails loudly.
+
+**Matching must be keyed on a marker unique to the query, not on the tables it
+reads.** Getting this wrong is the one way this design produces a *silently*
+wrong answer, and it did during development: `getIndexInfo` matched a broad
+"mentions `pg_class`" rule and came back holding the **table list** under index
+column names. A caller cannot tell that from a correct answer. Every matcher is
+now keyed on an alias only that call uses (`self_referencing_col_name`,
+`index_qualifier`, `elemtypoid`, `fkcolumn_name`), and `tests/pg_wire.rs` pins
+the property that no catalog query is ever answered in another one's shape.
 
 ## Consequences
 
@@ -137,10 +152,9 @@ owns no state: every request is a call into machinery that already existed, so
 the failure modes are the engine's, not a second implementation's.
 
 **What is deliberately missing** (each refused with an error naming it):
-per-table catalog introspection — so pgjdbc's `DatabaseMetaData`, psql's
-`\d <table>`, `pg_dump` and BI tools; `COPY`; `LISTEN`/`NOTIFY`; `DECLARE …
-CURSOR`; query cancellation; real schemas and `information_schema`;
-server-side parameter type inference.
+arbitrary catalog queries — so psql's `\d <table>`, `pg_dump` and BI tools;
+`COPY`; `LISTEN`/`NOTIFY`; `DECLARE … CURSOR`; query cancellation; real schemas
+and `information_schema`; server-side parameter type inference.
 
 **A lesson about scoping from documentation.** Every prediction here about
 which drivers would work was wrong until the drivers were actually run: pgjdbc

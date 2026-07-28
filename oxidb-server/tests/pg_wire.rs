@@ -715,6 +715,157 @@ fn the_type_catalog_answers_what_drivers_load_on_connect() {
     assert_eq!(rows(&msgs).len(), 0);
 }
 
+/// Column values of the first row, by column name from the RowDescription.
+fn row_map(msgs: &[Msg], row: usize) -> std::collections::HashMap<String, Option<String>> {
+    let fields = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .expect("RowDescription")
+        .fields();
+    let cells = rows(msgs).remove(row);
+    fields
+        .into_iter()
+        .map(|(n, _)| n)
+        .zip(cells)
+        .collect()
+}
+
+#[test]
+fn jdbc_metadata_reports_the_engines_own_schema() {
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE parent (id INT PRIMARY KEY, label TEXT)");
+    c.query("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id), note VARCHAR(50))");
+    c.query("CREATE TABLE enrol (a INT, b TEXT, CONSTRAINT pk PRIMARY KEY (a, b))");
+    c.query("CREATE INDEX idx_note ON child (note)");
+
+    // getTables — a pass-through query, so the result IS the JDBC shape.
+    let msgs = c.query(
+        "SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, c.relname AS TABLE_NAME, \
+         '' AS SELF_REFERENCING_COL_NAME FROM pg_catalog.pg_class c \
+         WHERE c.relname LIKE '%' AND ( c.relkind = 'r' )",
+    );
+    let names: Vec<String> = rows(&msgs).into_iter().filter_map(|r| r[2].clone()).collect();
+    assert!(names.contains(&"parent".to_string()), "{names:?}");
+    assert!(names.contains(&"child".to_string()), "{names:?}");
+    // ...and the name pattern is honoured, not ignored.
+    let msgs = c.query(
+        "SELECT NULL AS TABLE_CAT, c.relname AS TABLE_NAME, '' AS SELF_REFERENCING_COL_NAME \
+         FROM pg_catalog.pg_class c WHERE c.relname LIKE 'child' AND ( c.relkind = 'r' )",
+    );
+    assert_eq!(rows(&msgs).len(), 1);
+
+    // getColumns — pgjdbc reads these by name, so the names are the contract.
+    let msgs = c.query(
+        "SELECT a.attname, a.atttypid, nullif(a.attidentity, '') as attidentity \
+         FROM pg_catalog.pg_attribute a WHERE c.relname LIKE 'child' AND attname LIKE '%'",
+    );
+    let cols: Vec<String> = row_names(&msgs, "attname");
+    assert_eq!(cols, vec!["id", "pid", "note"]);
+    let first = row_map(&msgs, 0);
+    assert_eq!(first["atttypid"].as_deref(), Some("20"), "INT is int8");
+    assert_eq!(first["attnotnull"].as_deref(), Some("t"), "PK is NOT NULL");
+    assert_eq!(first["attnum"].as_deref(), Some("1"));
+    // VARCHAR(50) is varchar with a length, not unbounded text.
+    let msgs = c.query(
+        "SELECT a.attname, nullif(a.attidentity, '') as attidentity \
+         FROM pg_catalog.pg_attribute a WHERE c.relname LIKE 'child' AND attname LIKE 'note'",
+    );
+    let note = row_map(&msgs, 0);
+    assert_eq!(note["atttypid"].as_deref(), Some("1043"), "varchar");
+    assert_eq!(note["atttypmod"].as_deref(), Some("54"), "50 + varlena header");
+
+    // getPrimaryKeys — every part of a composite key, in order.
+    let msgs = c.query(
+        "SELECT ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, i.indkey AS KEY_SEQ, \
+         ci.relname AS PK_NAME FROM pg_index i WHERE ct.relname = 'enrol'",
+    );
+    assert_eq!(row_names(&msgs, "column_name"), vec!["a", "b"]);
+    assert_eq!(row_names(&msgs, "key_seq"), vec!["1", "2"]);
+
+    // getIndexInfo — the primary key counts as a unique index, as it does in
+    // PostgreSQL, plus the secondary index.
+    let msgs = c.query(
+        "SELECT tmp.INDEX_QUALIFIER, tmp.INDEX_NAME FROM pg_index tmp WHERE ct.relname = 'child'",
+    );
+    let ix = row_names(&msgs, "index_name");
+    assert!(ix.contains(&"child_pkey".to_string()), "{ix:?}");
+    assert!(ix.contains(&"idx_note".to_string()), "{ix:?}");
+    let unique: Vec<String> = row_names(&msgs, "non_unique");
+    assert_eq!(unique[0], "f", "the primary key is unique");
+
+    // getImportedKeys — the FK the engine actually holds.
+    let msgs = c.query(
+        "SELECT fk.FKCOLUMN_NAME, fk.FK_NAME, fk.KEY_SEQ, fk.PK_NAME \
+         FROM pg_constraint WHERE fkt.relname = 'child'",
+    );
+    let m = row_map(&msgs, 0);
+    assert_eq!(m["fktable_name"].as_deref(), Some("child"));
+    assert_eq!(m["fkcolumn_name"].as_deref(), Some("pid"));
+    assert_eq!(m["pktable_name"].as_deref(), Some("parent"));
+    assert_eq!(m["pkcolumn_name"].as_deref(), Some("id"));
+    // A table with no foreign keys reports none — not its primary key.
+    let msgs = c.query(
+        "SELECT fk.FKCOLUMN_NAME, fk.FK_NAME, fk.KEY_SEQ, fk.PK_NAME \
+         FROM pg_constraint WHERE fkt.relname = 'parent'",
+    );
+    assert_eq!(rows(&msgs).len(), 0);
+}
+
+#[test]
+fn a_catalog_query_is_never_answered_in_another_ones_shape() {
+    // Every one of these once matched a *different* answer and came back with
+    // the wrong columns — or worse, the right columns holding the wrong rows
+    // (getIndexInfo returned the table list). A caller cannot tell that from a
+    // correct answer, so precision here is the whole safety property.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE t (id INT PRIMARY KEY)");
+
+    // An index query must not come back as the table list.
+    let msgs = c.query(
+        "SELECT tmp.INDEX_QUALIFIER, tmp.INDEX_NAME FROM pg_index tmp WHERE ct.relname = 't'",
+    );
+    let fields: Vec<String> = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .expect("RowDescription")
+        .fields()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(fields.contains(&"index_name".to_string()), "{fields:?}");
+    assert!(!fields.contains(&"Name".to_string()), "that is the \\dt shape");
+
+    // A type query must not come back as the table list either.
+    let msgs = c.query(
+        "SELECT typinput='pg_catalog.array_in'::regproc as is_array, typtype, typname, \
+         pg_type.oid FROM pg_catalog.pg_type",
+    );
+    let names = row_names(&msgs, "typname");
+    assert!(names.contains(&"int8".to_string()), "{names:?}");
+    assert!(!names.contains(&"t".to_string()), "that is the table list");
+}
+
+/// The values of one named column, in row order.
+fn row_names(msgs: &[Msg], column: &str) -> Vec<String> {
+    let fields = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .expect("RowDescription")
+        .fields();
+    let idx = fields
+        .iter()
+        .position(|(n, _)| n == column)
+        .unwrap_or_else(|| panic!("no column {column:?} in {fields:?}"));
+    rows(msgs)
+        .into_iter()
+        .filter_map(|r| r[idx].clone())
+        .collect()
+}
+
 #[test]
 fn per_table_introspection_is_still_refused_not_answered_empty() {
     // The type catalog is static and safe to answer from a constant; per-table

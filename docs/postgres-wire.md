@@ -14,7 +14,7 @@ Verified against the real drivers, not inferred:
 | **psql** 18 | Queries, DDL, transactions, `\dt`, `\l`. `\d <table>` is refused (see Limitations). |
 | **psycopg** 3.3 | Everything tested works: extended protocol, server-side parameters, `executemany`, typed exceptions, transaction recovery, `fetchmany`. |
 | **Npgsql** 8.0 | Everything tested works, including the type catalog it loads on connect — no `Server Compatibility Mode` flag needed. |
-| **pgjdbc** 42.7 | Queries, `PreparedStatement`, transactions, `SQLState`, `ResultSetMetaData`. **`DatabaseMetaData.getTables`/`getColumns` are refused** — they need per-table catalog introspection. |
+| **pgjdbc** 42.7 | Everything tested works, including `DatabaseMetaData`: `getTables`, `getColumns`, `getPrimaryKeys` (composite keys included), `getIndexInfo`, `getImportedKeys`, `getTypeInfo`, `getSchemas`. |
 | pg_dump, BI tools | Not supported. |
 
 ## Enabling
@@ -77,6 +77,9 @@ applies.
   opens with exactly that.)
 - **The type catalog** a driver loads on connect (`pg_type` and friends),
   answered from the fixed list of types this server has.
+- **JDBC `DatabaseMetaData`** — tables, columns (with `VARCHAR(n)` lengths),
+  primary keys (every part of a composite one), indexes, foreign keys, types
+  and schemas, all built from the engine's own catalog.
 - **psql `\dt` and `\l`**, answered from the engine's own catalog.
 
 ## Type mapping
@@ -103,13 +106,18 @@ supported for `bool`, `int2/4/8`, `float4/8`, `text` and `bytea`. Binary
 This is a v1 aimed at `psql` and `psycopg`. What is missing is refused with an
 error naming it — never answered with a plausible-looking empty result.
 
-- **Per-table catalog introspection is not implemented.** The *type* catalog is
-  answered, because its content is static — the list of types this server has.
-  Per-table metadata is not: psql's `\d <table>` and JDBC's
-  `DatabaseMetaData.getTables`/`getColumns` are refused with `0A000`, pointing
-  at `DESCRIBE <table>`, `SHOW TABLES` and `SHOW INDEXES`. Anything else under
-  `pg_catalog` or `information_schema` (`pg_roles`, `pg_index`, …) is refused
-  the same way — never answered with an empty result, which would be believed.
+- **The system catalogs are not queryable.** What is answered is a fixed set of
+  *known questions* — the type catalog, JDBC's `DatabaseMetaData` calls, psql's
+  `\dt` and `\l` — each matched on a marker unique to it and answered from the
+  engine's own catalog. An arbitrary `pg_catalog` or `information_schema` query,
+  including psql's `\d <table>`, is refused with `0A000` pointing at
+  `DESCRIBE <table>`, `SHOW TABLES` and `SHOW INDEXES`. Nothing is answered
+  with an empty result, which would be believed.
+
+  The consequence to know: matching is **per-driver and per-version text**. A
+  driver upgrade that rewrites one of these queries loses the match and gets
+  the refusal — loudly, which is the intended failure. It will not quietly
+  return the wrong answer.
 - No `COPY`, `LISTEN`/`NOTIFY`, or `DECLARE ... CURSOR` (psycopg's *named*
   server-side cursors; unnamed cursors and `fetchmany` do work).
 - No query cancellation: `CancelRequest` is accepted and ignored.

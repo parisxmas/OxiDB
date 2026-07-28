@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub use ast::QueryResult;
-pub use catalog::{Column, IndexDef, Table};
+pub use catalog::{Column, FkAction, ForeignKey, IndexDef, Table};
 pub use decimal::Decimal;
 pub use error::{Result, SqlError};
 pub use parser::{

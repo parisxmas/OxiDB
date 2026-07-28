@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use oxidb_sql::{CommandKind, SqlType, Value};
+use oxidb_sql::{CommandKind, FkAction, SqlType, Value};
 
 use super::errors::{PgError, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
 use super::session::{describe_columns, PgSession, Reply};
@@ -172,7 +172,7 @@ pub fn intercept(session: &mut PgSession, sql: &str) -> Result<Option<Vec<Reply>
         return Ok(Some(session_command(session, &norm)?));
     }
 
-    if let Some(replies) = catalog_query(session, &norm)? {
+    if let Some(replies) = catalog_query(session, &norm, sql)? {
         return Ok(Some(replies));
     }
 
@@ -257,8 +257,15 @@ fn session_command(session: &mut PgSession, norm: &str) -> Result<Vec<Reply>, Pg
     unreachable!("is_session_command gated this")
 }
 
-/// Catalog and system-function queries.
-fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, PgError> {
+/// Catalog and system-function queries. `norm` is the normalized form every
+/// match is written against; `sql` is the original, needed where a *value*
+/// matters (normalization lowercases string literals along with everything
+/// else, and a table name is case-sensitive).
+fn catalog_query(
+    session: &PgSession,
+    norm: &str,
+    sql: &str,
+) -> Result<Option<Vec<Reply>>, PgError> {
     // The one-liners clients and REPLs open with.
     let scalar: BTreeMap<&str, String> = BTreeMap::from([
         ("select version()", server_version()),
@@ -294,6 +301,65 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
         return Ok(Some(vec![reply]));
     }
 
+    // JDBC's DatabaseMetaData. Matched before the per-relation refusal below,
+    // which they would otherwise trip: all of them join on `c.oid`.
+    //
+    // Each match is keyed on an alias unique to that call, not on the tables it
+    // reads. Matching loosely here is how `getIndexInfo` once came back holding
+    // the *table list*: a wrong answer a caller cannot tell from a right one.
+    if norm.contains("self_referencing_col_name") {
+        return Ok(Some(vec![jdbc_tables(session, norm, sql)]));
+    }
+    if norm.contains("attidentity") || norm.contains("partition by a.attrelid") {
+        return Ok(Some(vec![jdbc_columns(session, sql)]));
+    }
+    // getImportedKeys/getExportedKeys also select `key_seq` and `pk_name`, so
+    // the foreign-key columns are what tell them apart — without this check,
+    // asking for a table's foreign keys came back holding its primary key.
+    if norm.contains("fkcolumn_name") || norm.contains("fk_name") {
+        return Ok(Some(vec![jdbc_foreign_keys(session, norm, sql)]));
+    }
+    if norm.contains("key_seq") && norm.contains("pk_name") {
+        return Ok(Some(vec![jdbc_primary_keys(session, sql)]));
+    }
+    if norm.contains("is_array") && norm.contains("typname") {
+        return Ok(Some(vec![jdbc_type_info()]));
+    }
+    // pgjdbc's type cache, loaded before getTypeInfo's own query: name and oid
+    // for every type, keyed on the `typrelid = 0` predicate that asks for
+    // non-composite ones.
+    if norm.contains("typrelid = 0") {
+        let rows = SUPPORTED_TYPES
+            .iter()
+            .map(|(oid, name)| vec![text(*name), Value::Int(*oid as i64)])
+            .collect();
+        return Ok(Some(vec![typed_rows(
+            &[("typname", types::OID_TEXT), ("oid", types::OID_OID)],
+            rows,
+        )]));
+    }
+    if norm.contains("index_qualifier") {
+        return Ok(Some(vec![jdbc_index_info(session, sql)]));
+    }
+    if norm.contains("table_catalog") && norm.contains("pg_namespace") {
+        // getSchemas: this server has exactly one, and it is not configurable.
+        return Ok(Some(vec![typed_rows(
+            &[
+                ("table_schem", types::OID_TEXT),
+                ("table_catalog", types::OID_TEXT),
+            ],
+            vec![vec![text("public"), Value::Null]],
+        )]));
+    }
+    if norm.contains("pg_settings") && norm.contains("max_index_keys") {
+        // Asked before the metadata calls above; the answer is PostgreSQL's
+        // own compiled-in default and nothing here depends on it.
+        return Ok(Some(vec![typed_rows(
+            &[("setting", types::OID_TEXT)],
+            vec![vec![text("32")]],
+        )]));
+    }
+
     // psql's \l — the SQL engine's databases are opened on demand and not
     // enumerable, so this reports the one this connection is attached to
     // rather than inventing a list.
@@ -324,7 +390,9 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
     // and joins onward from it. Refusing tells the caller why; answering with
     // the table list instead made psql fail on a column it expected to be
     // there ("column number 4 is out of range" — how this was found).
-    if norm.contains("pg_class") && norm.contains("c.oid") {
+    // (A query that also reads `pg_type` is asking about types, not relations,
+    // and gets the general message below instead of this one.)
+    if norm.contains("pg_class") && norm.contains("c.oid") && !norm.contains("pg_type") {
         return Err(PgError::new(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             "per-table introspection reads the PostgreSQL system catalogs, which OxiDB \
@@ -333,8 +401,24 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
         ));
     }
 
-    // psql's \dt — answered from the engine's own catalog.
-    if norm.contains("pg_class") {
+    // psql's \dt — answered from the engine's own catalog. Guarded by what it
+    // must *not* mention, so a catalog query about indexes, constraints or
+    // settings falls through to the refusal instead of being handed a list of
+    // tables under someone else's column names.
+    const NOT_A_TABLE_LIST: &[&str] = &[
+        "pg_index",
+        "pg_attribute",
+        "pg_constraint",
+        "pg_settings",
+        "pg_proc",
+        "pg_get_indexdef",
+        "indisprimary",
+        "information_schema.",
+    ];
+    if norm.contains("pg_class")
+        && norm.contains("relkind")
+        && !NOT_A_TABLE_LIST.iter().any(|t| norm.contains(t))
+    {
         let tables = session
             .engine
             .execute("SHOW TABLES")
@@ -398,8 +482,11 @@ fn type_catalog(norm: &str) -> Option<Reply> {
             Vec::new(),
         ));
     }
-    // The type list itself.
-    if !norm.contains("pg_type") || !norm.contains("typname") {
+    // The type list itself. Keyed on `elemtypoid` — the alias this specific
+    // query gives its element-type column — not on "mentions pg_type", which
+    // also matches JDBC's getTypeInfo and would answer it with the wrong
+    // columns instead of refusing.
+    if !norm.contains("elemtypoid") {
         return None;
     }
     let rows = SUPPORTED_TYPES
@@ -431,6 +518,413 @@ fn type_catalog(norm: &str) -> Option<Reply> {
     ))
 }
 
+/// `DatabaseMetaData.getTables` — a pass-through query, so the result *is* the
+/// JDBC row shape and the column names have to be the ones JDBC reads.
+///
+/// The requested relation kinds are read back out of the predicate pgjdbc
+/// builds (`c.relkind = 'r'` for tables, `'v'` for views), so asking for only
+/// views does not get tables.
+fn jdbc_tables(session: &PgSession, norm: &str, sql: &str) -> Reply {
+    let pattern = like_pattern(sql, "relname").unwrap_or_else(|| "%".to_string());
+    let want_tables = norm.contains("relkind = 'r'");
+    let want_views = norm.contains("relkind = 'v'");
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let row = |name: &str, kind: &str| {
+        vec![
+            Value::Null, // table_cat — this server has no catalogs
+            text("public"),
+            text(name),
+            text(kind),
+            Value::Null, // remarks
+            text(""),
+            text(""),
+            text(""),
+            text(""),
+            text(""),
+        ]
+    };
+    if want_tables {
+        for t in session.engine.list_tables() {
+            if like_match(&pattern, &t.name) {
+                rows.push(row(&t.name, "TABLE"));
+            }
+        }
+    }
+    if want_views {
+        for (name, _) in session.engine.list_views() {
+            if like_match(&pattern, &name) {
+                rows.push(row(&name, "VIEW"));
+            }
+        }
+    }
+    rows.sort_by(|a, b| format!("{:?}", a[2]).cmp(&format!("{:?}", b[2])));
+
+    typed_rows(
+        &[
+            ("table_cat", types::OID_TEXT),
+            ("table_schem", types::OID_TEXT),
+            ("table_name", types::OID_TEXT),
+            ("table_type", types::OID_TEXT),
+            ("remarks", types::OID_TEXT),
+            ("type_cat", types::OID_TEXT),
+            ("type_schem", types::OID_TEXT),
+            ("type_name", types::OID_TEXT),
+            ("self_referencing_col_name", types::OID_TEXT),
+            ("ref_generation", types::OID_TEXT),
+        ],
+        rows,
+    )
+}
+
+/// `DatabaseMetaData.getColumns` — unlike getTables this is pgjdbc's *internal*
+/// query, whose rows it reshapes itself, reading each field **by name**. So the
+/// names below are the contract, and the values are the engine's own schema.
+///
+/// Views are not included: a view's column types are only knowable by running
+/// it, and reporting a guess would be worse than reporting nothing.
+fn jdbc_columns(session: &PgSession, sql: &str) -> Reply {
+    let table_pattern = like_pattern(sql, "relname").unwrap_or_else(|| "%".to_string());
+    let column_pattern = like_pattern(sql, "attname").unwrap_or_else(|| "%".to_string());
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut tables = session.engine.list_tables();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    for t in tables {
+        if !like_match(&table_pattern, &t.name) {
+            continue;
+        }
+        for (i, col) in t.columns.iter().filter(|c| !c.dropped).enumerate() {
+            if !like_match(&column_pattern, &col.name) {
+                continue;
+            }
+            // A declared length makes it `varchar(n)` rather than unbounded
+            // `text` — a schema tool shows the length, and a code generator
+            // emits the right column type.
+            let oid = match col.max_len {
+                Some(_) => types::OID_VARCHAR,
+                None => types::oid_of(Some(col.ty)),
+            };
+            rows.push(vec![
+                text("public"),
+                text(&t.name),
+                text(&col.name),
+                Value::Int(oid as i64),
+                Value::Bool(!col.nullable),
+                // atttypmod carries a declared length: PostgreSQL stores
+                // VARCHAR(n) as n + 4 (the varlena header), and -1 for
+                // everything unbounded.
+                Value::Int(col.max_len.map_or(-1, |n| i64::from(n) + 4)),
+                Value::Int(i64::from(types::type_len(oid))),
+                Value::Int(-1), // typtypmod
+                Value::Int(i as i64 + 1),
+                Value::Null, // attidentity — no identity columns
+                Value::Null, // attgenerated — no generated columns
+                Value::Null, // adsrc — defaults are not rendered as SQL text
+                Value::Null, // description — no column comments
+                Value::Int(0), // typbasetype — nothing is a domain
+                text("b"),     // typtype — every type here is a base type
+            ]);
+        }
+    }
+
+    typed_rows(
+        &[
+            ("nspname", types::OID_TEXT),
+            ("relname", types::OID_TEXT),
+            ("attname", types::OID_TEXT),
+            ("atttypid", types::OID_OID),
+            ("attnotnull", types::OID_BOOL),
+            ("atttypmod", types::OID_INT4),
+            ("attlen", types::OID_INT2),
+            ("typtypmod", types::OID_INT4),
+            ("attnum", types::OID_INT4),
+            ("attidentity", types::OID_CHAR),
+            ("attgenerated", types::OID_CHAR),
+            ("adsrc", types::OID_TEXT),
+            ("description", types::OID_TEXT),
+            ("typbasetype", types::OID_OID),
+            ("typtype", types::OID_CHAR),
+        ],
+        rows,
+    )
+}
+
+/// `DatabaseMetaData.getPrimaryKeys` — one row per key column, `key_seq`
+/// counting from 1, so a composite key reports all of its parts in order.
+fn jdbc_primary_keys(session: &PgSession, sql: &str) -> Reply {
+    let pattern = like_pattern(sql, "relname")
+        .or_else(|| equals_literal(sql, "ct.relname"))
+        .unwrap_or_else(|| "%".to_string());
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut tables = session.engine.list_tables();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    for t in tables {
+        if !like_match(&pattern, &t.name) {
+            continue;
+        }
+        for (seq, pos) in t.pk_cols().into_iter().enumerate() {
+            rows.push(vec![
+                Value::Null,
+                text("public"),
+                text(&t.name),
+                text(&t.columns[pos].name),
+                Value::Int(seq as i64 + 1),
+                text(format!("{}_pkey", t.name)),
+            ]);
+        }
+    }
+    typed_rows(
+        &[
+            ("table_cat", types::OID_TEXT),
+            ("table_schem", types::OID_TEXT),
+            ("table_name", types::OID_TEXT),
+            ("column_name", types::OID_TEXT),
+            ("key_seq", types::OID_INT2),
+            ("pk_name", types::OID_TEXT),
+        ],
+        rows,
+    )
+}
+
+/// `DatabaseMetaData.getIndexInfo` — the table's secondary indexes, plus the
+/// primary key, which PostgreSQL also reports as a unique index and a schema
+/// tool expects to see. Column-level `UNIQUE` constraints have no named index
+/// in this engine and are not reported.
+fn jdbc_index_info(session: &PgSession, sql: &str) -> Reply {
+    let pattern = like_pattern(sql, "relname")
+        .or_else(|| equals_literal(sql, "ct.relname"))
+        .unwrap_or_else(|| "%".to_string());
+
+    // JDBC's tableIndexOther.
+    const INDEX_TYPE: i64 = 3;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let indexes = session.engine.list_indexes();
+    let mut tables = session.engine.list_tables();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for t in tables {
+        if !like_match(&pattern, &t.name) {
+            continue;
+        }
+        let mut row = |index: &str, unique: bool, ordinal: usize, column: &str| {
+            rows.push(vec![
+                Value::Null,
+                text("public"),
+                text(&t.name),
+                Value::Bool(!unique),
+                Value::Null, // index_qualifier
+                text(index),
+                Value::Int(INDEX_TYPE),
+                Value::Int(ordinal as i64),
+                text(column),
+                text("A"),   // asc_or_desc — indexes are ascending here
+                Value::Null, // cardinality: not tracked
+                Value::Null, // pages: not applicable
+                Value::Null, // filter_condition: no partial indexes
+            ]);
+        };
+        for (i, pos) in t.pk_cols().into_iter().enumerate() {
+            let name = format!("{}_pkey", t.name);
+            row(&name, true, i + 1, &t.columns[pos].name);
+        }
+        for def in indexes.iter().filter(|d| d.table == t.name) {
+            for (i, col) in def.columns.iter().enumerate() {
+                row(&def.name, false, i + 1, col);
+            }
+        }
+    }
+    typed_rows(
+        &[
+            ("table_cat", types::OID_TEXT),
+            ("table_schem", types::OID_TEXT),
+            ("table_name", types::OID_TEXT),
+            ("non_unique", types::OID_BOOL),
+            ("index_qualifier", types::OID_TEXT),
+            ("index_name", types::OID_TEXT),
+            ("type", types::OID_INT2),
+            ("ordinal_position", types::OID_INT2),
+            ("column_name", types::OID_TEXT),
+            ("asc_or_desc", types::OID_TEXT),
+            ("cardinality", types::OID_INT8),
+            ("pages", types::OID_INT8),
+            ("filter_condition", types::OID_TEXT),
+        ],
+        rows,
+    )
+}
+
+/// `DatabaseMetaData.getImportedKeys` / `getExportedKeys` — the engine's
+/// single-column foreign keys. `getExportedKeys` asks the same question from
+/// the other side (which children point at *this* table), so the direction is
+/// read from which side the query pins down.
+fn jdbc_foreign_keys(session: &PgSession, norm: &str, sql: &str) -> Reply {
+    // pgjdbc names the two sides `fkt`/`pkt` in its predicate; whichever is
+    // constrained to a literal is the table being asked about.
+    let child = equals_literal(sql, "fkt.relname").or_else(|| like_pattern(sql, "fkt.relname"));
+    let parent = equals_literal(sql, "pkt.relname").or_else(|| like_pattern(sql, "pkt.relname"));
+    let _ = norm;
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut tables = session.engine.list_tables();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    for t in &tables {
+        if let Some(c) = &child
+            && !like_match(c, &t.name)
+        {
+            continue;
+        }
+        for (i, fk) in t.foreign_keys.iter().enumerate() {
+            if let Some(p) = &parent
+                && !like_match(p, &fk.parent_table)
+            {
+                continue;
+            }
+            // An unnamed reference resolves to the parent's primary key.
+            let parent_column = if fk.parent_column.is_empty() {
+                session
+                    .engine
+                    .table_def(&fk.parent_table)
+                    .and_then(|d| d.pk_cols().first().map(|p| d.columns[*p].name.clone()))
+                    .unwrap_or_default()
+            } else {
+                fk.parent_column.clone()
+            };
+            rows.push(vec![
+                Value::Null,
+                text("public"),
+                text(&fk.parent_table),
+                text(parent_column),
+                Value::Null,
+                text("public"),
+                text(&t.name),
+                text(&fk.column),
+                Value::Int(i as i64 + 1),
+                Value::Int(fk_rule(fk.on_update)),
+                Value::Int(fk_rule(fk.on_delete)),
+                text(format!("{}_{}_fkey", t.name, fk.column)),
+                text(format!("{}_pkey", fk.parent_table)),
+                // importedKeyNotDeferrable
+                Value::Int(7),
+            ]);
+        }
+    }
+    typed_rows(
+        &[
+            ("pktable_cat", types::OID_TEXT),
+            ("pktable_schem", types::OID_TEXT),
+            ("pktable_name", types::OID_TEXT),
+            ("pkcolumn_name", types::OID_TEXT),
+            ("fktable_cat", types::OID_TEXT),
+            ("fktable_schem", types::OID_TEXT),
+            ("fktable_name", types::OID_TEXT),
+            ("fkcolumn_name", types::OID_TEXT),
+            ("key_seq", types::OID_INT2),
+            ("update_rule", types::OID_INT2),
+            ("delete_rule", types::OID_INT2),
+            ("fk_name", types::OID_TEXT),
+            ("pk_name", types::OID_TEXT),
+            ("deferrability", types::OID_INT2),
+        ],
+        rows,
+    )
+}
+
+/// JDBC's referential-action codes.
+fn fk_rule(action: FkAction) -> i64 {
+    match action {
+        FkAction::Cascade => 0,  // importedKeyCascade
+        FkAction::SetNull => 2,  // importedKeySetNull
+        FkAction::NoAction => 3, // importedKeyNoAction
+    }
+}
+
+/// `DatabaseMetaData.getTypeInfo` — the same type list the connect-time
+/// catalog reports, in the shape pgjdbc's own reader expects.
+fn jdbc_type_info() -> Reply {
+    let rows = SUPPORTED_TYPES
+        .iter()
+        .map(|(oid, name)| {
+            vec![
+                // Nothing here is an array type.
+                Value::Bool(false),
+                text("b"),
+                text(*name),
+                Value::Int(*oid as i64),
+            ]
+        })
+        .collect();
+    typed_rows(
+        &[
+            ("is_array", types::OID_BOOL),
+            ("typtype", types::OID_CHAR),
+            ("typname", types::OID_TEXT),
+            ("oid", types::OID_OID),
+        ],
+        rows,
+    )
+}
+
+/// Pull the value out of `<field> = '<value>'` — the form the metadata queries
+/// use where they match a table exactly rather than by pattern.
+fn equals_literal(sql: &str, field: &str) -> Option<String> {
+    let hay = sql.to_ascii_lowercase();
+    let at = hay.find(&format!("{field} = "))?;
+    let rest = sql[at + field.len() + 3..].trim_start();
+    let body = rest.strip_prefix('\'')?;
+    let end = body.find('\'')?;
+    Some(body[..end].to_string())
+}
+
+/// Pull the pattern out of `<field> LIKE '<pattern>'`, from the **original**
+/// SQL so the literal keeps its case.
+fn like_pattern(sql: &str, field: &str) -> Option<String> {
+    let hay = sql.to_ascii_lowercase();
+    let needle = format!("{field} like ");
+    let mut from = 0;
+    loop {
+        let at = hay[from..].find(&needle)? + from;
+        let rest = &sql[at + needle.len()..];
+        let rest = rest.trim_start();
+        if let Some(body) = rest.strip_prefix('\'') {
+            let end = body.find('\'')?;
+            return Some(body[..end].to_string());
+        }
+        // Not a literal (a bind parameter, say) — keep looking.
+        from = at + needle.len();
+    }
+}
+
+/// SQL `LIKE`: `%` matches any run, `_` any single character. Backtracking is
+/// bounded by the pattern length, which comes from a driver, not a user.
+fn like_match(pattern: &str, value: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    let (mut pi, mut vi) = (0, 0);
+    let (mut star, mut mark) = (usize::MAX, 0);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = pi;
+            mark = vi;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            vi = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// The types this server can produce, by their real PostgreSQL OIDs — so a
 /// driver's existing handler for each one applies unchanged.
 const SUPPORTED_TYPES: &[(i32, &str)] = &[
@@ -454,12 +948,18 @@ fn mentions_catalog_table(norm: &str) -> bool {
     [
         "pg_class",
         "pg_attribute",
+        "pg_attrdef",
+        "pg_constraint",
+        "pg_description",
+        "pg_enum",
         "pg_namespace",
         "pg_type",
+        "pg_range",
         "pg_database",
         "pg_index",
         "pg_proc",
         "pg_roles",
+        "pg_settings",
         "pg_tablespace",
         "information_schema.",
     ]
