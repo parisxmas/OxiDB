@@ -53,6 +53,7 @@ with OxiDbClient() as db:
 
 - **[Protocol Reference](protocol-reference.md)** -- Complete TCP protocol command reference with all fields, return values, and RBAC role requirements.
 
+- **[Query performance vs PostgreSQL](query-benchmark.md)** -- point access is a dead heat; scans, aggregates and joins are 2-3.5x slower. One client drives both, since OxiDB speaks the PostgreSQL wire.
 - **[Memory vs PostgreSQL](pg-memory-benchmark.md)** -- the same 1,000,000 rows in both engines: OxiDB's startup floor and on-disk size against PostgreSQL's bounded buffer pool, and why the flattering startup number is an artifact.
 - **[Wire Benchmark](wire-benchmark.md)** -- OxiWire vs the PostgreSQL wire over the same SQL engine: where each wins, and the server-side buffering bug the comparison uncovered.
 
