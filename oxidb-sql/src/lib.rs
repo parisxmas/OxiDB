@@ -359,16 +359,15 @@ impl TableState {
     /// than `exclude_row`. A composite key collides only when *every* member
     /// matches.
     fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
-        if let Some(key) = self.pk_key(cells) {
-            if let Some(&existing) = self.pk_map.get(&key)
-                && Some(existing) != exclude_row
-            {
-                return Err(SqlError::DuplicateKey(format!(
-                    "PRIMARY KEY value {} already exists in {:?}",
-                    types::render_key(&self.pk_cols, cells),
-                    self.def.name
-                )));
-            }
+        if let Some(key) = self.pk_key(cells)
+            && let Some(&existing) = self.pk_map.get(&key)
+            && Some(existing) != exclude_row
+        {
+            return Err(SqlError::DuplicateKey(format!(
+                "PRIMARY KEY value {} already exists in {:?}",
+                types::render_key(&self.pk_cols, cells),
+                self.def.name
+            )));
         }
         for (pos, map) in &self.uniques {
             if matches!(cells[*pos], Value::Null) {
@@ -385,6 +384,103 @@ impl TableState {
             }
         }
         Ok(())
+    }
+}
+
+/// One table's view of a committing batch, for the commit-time uniqueness
+/// re-check (`SqlEngine::validate_batch`). Holds what the batch has done so
+/// far, which is what the committed constraint maps have to be read against.
+struct BatchSim<'a> {
+    state: &'a TableState,
+    keys: Vec<BatchKey>,
+    /// Rows the batch has rewritten or deleted: what the committed maps say
+    /// they own no longer stands.
+    touched: BTreeSet<u64>,
+}
+
+/// One uniqueness constraint, as the commit-time re-check tracks it.
+struct BatchKey {
+    /// The cells that form the key.
+    cols: Vec<usize>,
+    /// Where the committed owner lives: `None` = the PRIMARY KEY map,
+    /// `Some(i)` = `TableState::uniques[i]`.
+    unique_idx: Option<usize>,
+    /// Keys this batch has claimed so far, and the row that claimed each.
+    claimed: BTreeMap<Vec<IndexKey>, u64>,
+}
+
+impl<'a> BatchSim<'a> {
+    fn new(state: &'a TableState) -> Self {
+        let mut keys = Vec::new();
+        if !state.pk_cols.is_empty() {
+            keys.push(BatchKey {
+                cols: state.pk_cols.clone(),
+                unique_idx: None,
+                claimed: BTreeMap::new(),
+            });
+        }
+        for (i, (pos, _)) in state.uniques.iter().enumerate() {
+            keys.push(BatchKey {
+                cols: vec![*pos],
+                unique_idx: Some(i),
+                claimed: BTreeMap::new(),
+            });
+        }
+        BatchSim {
+            state,
+            keys,
+            touched: BTreeSet::new(),
+        }
+    }
+
+    /// Error if writing `cells` as `row_id` would take a key already owned by
+    /// a committed row the batch hasn't touched, or by another row within it.
+    fn check(&self, row_id: u64, cells: &[Value]) -> Result<()> {
+        for k in &self.keys {
+            // SQL: NULLs never collide under UNIQUE. PRIMARY KEY columns are
+            // NOT NULL, so its map is consulted unconditionally (matching
+            // `TableState::check_pk`).
+            if k.unique_idx.is_some() && matches!(cells[k.cols[0]], Value::Null) {
+                continue;
+            }
+            let key: Vec<IndexKey> = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+            let committed = match k.unique_idx {
+                None => self.state.pk_map.get(&key).copied(),
+                Some(i) => self.state.uniques[i].1.get(&key[0]).copied(),
+            };
+            let taken = committed
+                .filter(|rid| *rid != row_id && !self.touched.contains(rid))
+                .or_else(|| k.claimed.get(&key).copied().filter(|rid| *rid != row_id));
+            if taken.is_some() {
+                return Err(SqlError::DuplicateKey(format!(
+                    "{} value {} already exists in {:?} (committed by another writer \
+                     while this transaction was open)",
+                    if k.unique_idx.is_none() {
+                        "PRIMARY KEY"
+                    } else {
+                        "UNIQUE"
+                    },
+                    types::render_key(&k.cols, cells),
+                    self.state.def.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the batch's effect on `row_id`: `Some(cells)` claims its keys,
+    /// `None` (a delete) just releases the old ones.
+    fn claim(&mut self, row_id: u64, cells: Option<&[Value]>) {
+        self.touched.insert(row_id);
+        for k in &mut self.keys {
+            k.claimed.retain(|_, rid| *rid != row_id);
+            let Some(cells) = cells else { continue };
+            if k.unique_idx.is_some() && matches!(cells[k.cols[0]], Value::Null) {
+                continue;
+            }
+            let key: Vec<IndexKey> = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+            k.claimed.insert(key, row_id);
+        }
     }
 }
 
@@ -1432,21 +1528,32 @@ impl SqlEngine {
         Ok(start)
     }
 
-    /// The next auto-increment value a table would assign (for transaction
-    /// counter seeding).
-    pub(crate) fn peek_next_auto(&self, table: &str) -> Option<i64> {
-        let inner = self.inner.lock().unwrap();
-        inner.tables.get(table).map(|s| s.next_auto)
-    }
-
-    /// The next `row_id` a table would assign (for transaction id seeding).
-    pub(crate) fn peek_next_row_id(&self, table: &str) -> Option<u64> {
-        let inner = self.inner.lock().unwrap();
-        inner.tables.get(table).map(|s| s.next_row_id)
+    /// Atomically reserve `n` consecutive `row_id`s for `table`, returning the
+    /// first (`None` when the table isn't in the engine — created inside the
+    /// caller's transaction, or dropped underneath it).
+    ///
+    /// A buffered transaction must take its ids from here rather than reading
+    /// the counter and allocating locally: the counter advances under the
+    /// engine lock, so no other writer — another transaction, or a plain
+    /// autocommit INSERT — can be handed the same id while the transaction is
+    /// still uncommitted. Ids belonging to a transaction that never commits
+    /// are simply never used (a gap, as with auto-increment).
+    pub(crate) fn reserve_row_ids(&self, table: &str, n: u64) -> Option<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner.tables.get_mut(table)?;
+        let start = state.next_row_id;
+        state.next_row_id += n;
+        Some(start)
     }
 
     /// Atomically apply a group of records produced by a committing transaction:
     /// one `Batch` WAL record (a single fsync), then applied to live state.
+    ///
+    /// **Applies without re-checking** — this is the path a replicated commit
+    /// takes (`apply_replicated_txn_ops`), where the decision to commit was
+    /// already made and every node must apply exactly the same ops or diverge.
+    /// A locally-committing transaction goes through
+    /// [`commit_batch_checked`](Self::commit_batch_checked) instead.
     pub(crate) fn commit_batch(&self, ops: Vec<WalRecord>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -1461,6 +1568,90 @@ impl SqlEngine {
             &rec,
             inner.disk_first,
         );
+        Ok(())
+    }
+
+    /// Commit a local transaction's ops: re-check their uniqueness constraints
+    /// against the committed state **as of now**, then log and apply the batch
+    /// — all under one lock, so nothing can slip in between the check and the
+    /// write.
+    ///
+    /// The transaction checked each write when it buffered it, but another
+    /// writer may have committed a colliding key since. Without this the batch
+    /// would apply anyway and leave two rows sharing one key.
+    pub(crate) fn commit_batch_checked(&self, ops: Vec<WalRecord>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        Self::validate_batch(&inner.tables, &ops)?;
+        let rec = WalRecord::Batch(ops);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Ok(())
+    }
+
+    /// Re-check a committing batch's uniqueness constraints against committed
+    /// state, simulating the ops in order so the batch's own effects count: a
+    /// row it deletes or rewrites no longer owns its old keys, and a key it
+    /// claims is owned by the row that claimed it.
+    ///
+    /// Tables the batch creates or drops are skipped — they have no committed
+    /// state to check against, and the transaction already checked them
+    /// against its own overlay. A row whose arity no longer matches its table
+    /// (a concurrent `ALTER`) is skipped rather than indexed out of bounds.
+    fn validate_batch(tables: &BTreeMap<String, TableState>, ops: &[WalRecord]) -> Result<()> {
+        let mut sims: BTreeMap<&str, BatchSim<'_>> = BTreeMap::new();
+        let mut skip: BTreeSet<&str> = BTreeSet::new();
+        for op in ops {
+            match op {
+                WalRecord::CreateTable(t) => {
+                    skip.insert(t.name.as_str());
+                }
+                WalRecord::DropTable(name) => {
+                    skip.insert(name.as_str());
+                    sims.remove(name.as_str());
+                }
+                WalRecord::Insert {
+                    table,
+                    row_id,
+                    cells,
+                } => {
+                    if skip.contains(table.as_str()) {
+                        continue;
+                    }
+                    let Some(state) = tables.get(table.as_str()) else {
+                        continue;
+                    };
+                    if cells.len() != state.def.columns.len() {
+                        continue;
+                    }
+                    let sim = sims
+                        .entry(table.as_str())
+                        .or_insert_with(|| BatchSim::new(state));
+                    sim.check(*row_id, cells)?;
+                    sim.claim(*row_id, Some(cells));
+                }
+                WalRecord::Delete { table, row_id } => {
+                    if skip.contains(table.as_str()) {
+                        continue;
+                    }
+                    let Some(state) = tables.get(table.as_str()) else {
+                        continue;
+                    };
+                    sims.entry(table.as_str())
+                        .or_insert_with(|| BatchSim::new(state))
+                        .claim(*row_id, None);
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 

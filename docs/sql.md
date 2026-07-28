@@ -490,19 +490,31 @@ open transaction back; a transaction is bound to the database it began on.
 Embedded/one-shot callers using `execute()` keep the old batch-scoped
 contract: an unmatched `BEGIN` at the end of the request is rolled back.
 
-While a transaction is inserting into a table, **no other writer may insert
-into that table** — its rows can be overwritten by the commit (see
-Limitations). `SELECT ... FOR UPDATE` takes real row locks that exclude other
-transactions' writes to those rows until commit/rollback
-(`OXIDB_SQL_LOCK_TIMEOUT_MS`, default 5000, bounds the wait and turns a
-deadlock into an error), and plain `UPDATE`s exclude each other the same way —
-but neither covers the insert case above.
+Other writers may work on the same table while a transaction is open. Its
+row ids and `AUTO_INCREMENT` values are reserved from the engine as it
+buffers each write, so nothing it wrote can be handed to — or overwritten by
+— a concurrent transaction or autocommit statement; and its uniqueness
+constraints are re-checked at `COMMIT`, so a key another writer took in the
+meantime **fails the commit** (duplicate-key error, nothing applied) instead
+of producing two rows with one key. Retry the transaction.
+
+`SELECT ... FOR UPDATE` takes real row locks that exclude other transactions'
+writes to those rows until commit/rollback (`OXIDB_SQL_LOCK_TIMEOUT_MS`,
+default 5000, bounds the wait and turns a deadlock into an error); plain
+`UPDATE`s exclude each other the same way.
 
 **Cluster mode**: interactive transactions work — statements run on the
 leader and a lone `COMMIT` replicates the buffered writes through Raft as
 one atomic entry applied on every node. Self-contained `BEGIN..COMMIT`
 batches also replicate whole. `BEGIN`/`COMMIT` must each be the only
 statement in their request in cluster mode.
+
+The commit-time uniqueness re-check above is **single-node only**: a
+replicated commit was already agreed by the cluster, and every node has to
+apply exactly the agreed ops or diverge, so the apply path never second-
+guesses them. Two transactions racing for the same key on a leader can
+therefore both commit there. Row-id and `AUTO_INCREMENT` reservation is
+unaffected (the leader reserves as it buffers), so no write is lost.
 
 ## Limitations
 
@@ -533,14 +545,15 @@ error rather than being skipped or updated — check first, or `UPDATE` then
 
 **Transactions.**
 
-- Transactions are **single-writer for INSERTs**. A transaction seeds its
-  row-id allocator when it first inserts into a table and does not reserve
-  those ids, so any other writer inserting into the *same table* before it
-  commits — another transaction, or a plain autocommit `INSERT` — can be
-  overwritten by that commit, and the row simply disappears. Serialize
-  writers per table for the lifetime of a transaction that inserts.
-  `UPDATE`/`DELETE` of existing rows are not affected (row locks serialize
-  them), and inserts into different tables are independent
+- A transaction that cannot commit its writes fails at `COMMIT` rather than
+  earlier: uniqueness is re-checked against the committed state at that
+  point, so if another writer took one of its keys while it was open, the
+  commit is refused with a duplicate-key error and nothing of it lands.
+  Retry the transaction
+- Row ids and `AUTO_INCREMENT` values are reserved when a transaction
+  buffers the insert, not at commit, so a transaction that rolls back leaves
+  a gap — normal sequence behaviour, and the price of never handing two
+  writers the same value
 - `ALTER TABLE`, `CREATE/DROP VIEW` and `CREATE/DROP PROCEDURE` are not
   allowed inside a transaction
 - No cross-engine transactions: a document-engine write and a SQL write are

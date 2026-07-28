@@ -164,7 +164,7 @@ impl<'a> Transaction<'a> {
         let engine = self.engine;
         let state = self.state.into_inner();
         let owner = state.lock_owner;
-        let r = engine.commit_batch(state.ops);
+        let r = engine.commit_batch_checked(state.ops);
         // Either way the transaction is over: success committed, failure
         // aborted. The locks go with it.
         engine.row_locks_release(owner);
@@ -224,23 +224,28 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// Seed and bump the row-id allocator for `table`.
+    /// Allocate a row id for `table`.
+    ///
+    /// For a table that already exists, the id is **reserved from the engine**
+    /// (one lock acquisition, alongside the one the uniqueness check already
+    /// takes) rather than counted locally from a peeked value. Reading the
+    /// counter and allocating locally handed the same id to any writer that
+    /// inserted before this transaction committed, and the commit then
+    /// overwrote their row — a silent lost write.
+    ///
+    /// A table created inside this transaction doesn't exist in the engine
+    /// yet, so its ids are private to the overlay and start at 1.
     fn alloc_row_id(&self, table: &str) -> u64 {
+        if !self.state.borrow().created.contains_key(table)
+            && let Some(id) = self.engine.reserve_row_ids(table, 1)
+        {
+            return id;
+        }
         let mut st = self.state.borrow_mut();
-        let next = match st.next_row_id.get(table) {
-            Some(n) => *n,
-            None => {
-                // Created-in-txn tables start at 1; otherwise continue the
-                // engine's sequence.
-                if st.created.contains_key(table) {
-                    1
-                } else {
-                    self.engine.peek_next_row_id(table).unwrap_or(1)
-                }
-            }
-        };
-        st.next_row_id.insert(table.to_string(), next + 1);
-        next
+        let next = st.next_row_id.entry(table.to_string()).or_insert(1);
+        let id = *next;
+        *next += 1;
+        id
     }
 
     /// Enforce PRIMARY KEY / UNIQUE uniqueness for a candidate row against
@@ -613,15 +618,16 @@ impl Store for Transaction<'_> {
     }
 
     fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
+        // Reserved from the engine, for the same reason as row ids: a peeked
+        // counter hands a concurrent writer the same values, and two rows then
+        // claim one auto-increment key.
+        if !self.state.borrow().created.contains_key(table)
+            && let Ok(start) = self.engine.next_auto_block(table, n)
+        {
+            return Ok(start);
+        }
         let mut st = self.state.borrow_mut();
-        let created = st.created.contains_key(table);
-        let next = st.next_auto.entry(table.to_string()).or_insert_with(|| {
-            if created {
-                1
-            } else {
-                self.engine.peek_next_auto(table).unwrap_or(1)
-            }
-        });
+        let next = st.next_auto.entry(table.to_string()).or_insert(1);
         let start = *next;
         *next += n;
         Ok(start)

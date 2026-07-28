@@ -110,11 +110,15 @@ fn works_inside_transactions() {
         ]
     );
 
-    // Rolled-back values leave a gap but nothing else.
+    // Rolled-back values leave a gap but nothing else. The gap is real: a
+    // transaction reserves its auto-increment values from the engine when it
+    // buffers the insert (so a concurrent writer can never be handed the same
+    // ones), and a rollback does not give them back — the same trade every
+    // SQL engine makes for its sequences.
     db.execute("BEGIN; INSERT INTO u (name) VALUES ('lost'); ROLLBACK;")
         .unwrap();
     let (_, id) = ins(&db, "INSERT INTO u (name) VALUES ('after')");
-    assert_eq!(id, Some(4)); // engine counter untouched by the rollback
+    assert_eq!(id, Some(5)); // 4 was reserved by the rolled-back transaction
 }
 
 #[test]
