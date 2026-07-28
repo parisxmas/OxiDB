@@ -824,6 +824,21 @@ thread_local! {
 /// inlined into SQL, which shouldn't be cached anyway).
 const STMT_CACHE_CAP: usize = 512;
 
+/// Longest statement text worth caching.
+///
+/// The cache exists so a repeated statement parses once, which pays off for the
+/// parameterized text an application sends over and over — and that text is
+/// short. A statement long enough to exceed this is one with its values inlined,
+/// which is unique by construction: caching it stores a large key and a much
+/// larger AST that can never be hit.
+///
+/// It is not free to get this wrong. A bulk load of 500-row `INSERT`s filled
+/// the cache with 512 such entries — tens of megabytes of text and AST for a
+/// zero percent hit rate — and that showed up as resident memory for as long as
+/// the process lived. Above the limit the statement is still parsed, just not
+/// kept.
+const STMT_CACHE_MAX_TEXT: usize = 4096;
+
 impl SqlEngine {
     /// Open (creating if needed) a SQL engine rooted at `dir` (e.g.
     /// `oxidb_data/sql`), with options from the environment. Loads the catalog
@@ -2175,6 +2190,9 @@ impl SqlEngine {
             return Ok(hit.clone());
         }
         let parsed = std::sync::Arc::new(parser::parse(sql)?);
+        if sql.len() > STMT_CACHE_MAX_TEXT {
+            return Ok(parsed);
+        }
         let mut cache = self.stmt_cache.lock().unwrap();
         if cache.len() >= STMT_CACHE_CAP {
             cache.clear();
@@ -3485,6 +3503,54 @@ mod tests {
                 .is_err()
         );
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stmt_cache_tests {
+    use super::*;
+
+    fn open() -> (tempfile::TempDir, SqlEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (a INT, b TEXT)").unwrap();
+        (dir, db)
+    }
+
+    fn cached(db: &SqlEngine) -> usize {
+        db.stmt_cache.lock().unwrap().len()
+    }
+
+    /// A short, repeatable statement is what the cache is for.
+    #[test]
+    fn short_statements_are_cached() {
+        let (_d, db) = open();
+        let before = cached(&db);
+        db.execute("SELECT a FROM t WHERE a = 1").unwrap();
+        assert!(cached(&db) > before, "a short SELECT should be cached");
+    }
+
+    /// A statement big enough to be carrying its values inline is unique by
+    /// construction, so caching it costs a large key and a much larger AST for
+    /// a hit that never comes. A bulk load of these held ~250 MB resident.
+    #[test]
+    fn statements_with_inlined_values_are_not_cached() {
+        let (_d, db) = open();
+        let rows: Vec<String> = (0..600).map(|i| format!("({i},'v{i}')")).collect();
+        let sql = format!("INSERT INTO t (a,b) VALUES {}", rows.join(","));
+        assert!(
+            sql.len() > STMT_CACHE_MAX_TEXT,
+            "the test's statement must exceed the limit to test anything"
+        );
+        let before = cached(&db);
+        db.execute(&sql).unwrap();
+        assert_eq!(cached(&db), before, "a bulk INSERT must not be cached");
+        // ...and it still ran.
+        assert_eq!(
+            db.row_count("t").unwrap(),
+            600,
+            "skipping the cache must not skip the work"
+        );
     }
 }
 

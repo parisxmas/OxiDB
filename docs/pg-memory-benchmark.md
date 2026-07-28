@@ -40,13 +40,13 @@ PostgreSQL 18.4 runs stock: `shared_buffers=128MB`, `max_connections=100`.
 
 | | PostgreSQL 18.4 | OxiDB (resident) | OxiDB (disk-first) |
 |---|---:|---:|---:|
-| Boot, empty database | 40 MB | **4 MB** | **4 MB** |
-| After loading 1M rows | 70 MB | 770 MB | 611 MB |
+| Boot, empty database | 39 MB | **4 MB** | **4 MB** |
+| After loading 1M rows | 69 MB | 521 MB | 363 MB |
 | Restart, before any query | 26 MB | *4 MB** | *4 MB** |
-| **Warm — every table read** | 105 MB | 370 MB | **162 MB** |
-| **+ every index used once** | **106 MB** | 520 MB | 310 MB |
+| **Warm — every table read** | 106 MB | 370 MB | **162 MB** |
+| **+ every index used once** | **106 MB** | 520 MB | 311 MB |
 | Processes | 9 | **1** | **1** |
-| Load time | **7.2 s** | 23 s | 24 s |
+| Load time | **7.4 s** | 19 s | 19 s |
 | Data directory on disk | 504 MB | 81 MB | **74 MB** |
 
 \** Lazy open — see below. This number is real but does not mean what it looks
@@ -60,9 +60,9 @@ its favourable workload.
 
 ### What changed, and what it cost
 
-The first run of this benchmark measured 423 MB warm in disk-first mode. Five
-changes, each measured on the same dataset, took it to 162 MB (310 MB with every
-index exercised):
+The first run of this benchmark measured 423 MB warm in disk-first mode, and
+611 MB immediately after the load. Six changes, each measured on the same
+dataset, took those to 162 MB and 363 MB (311 MB with every index exercised):
 
 | Change | Effect |
 |---|---|
@@ -71,6 +71,7 @@ index exercised):
 | Unboxed `i64` primary-key map for single-column integer keys | **103 → 34 bytes per row** |
 | Fold the replayed WAL tail at open (disk-first) | a 55 MB WAL tail cost 60 MB of resident overlay |
 | Build secondary indexes on first use, not at open | 318 MB for three indexes on 1M rows, paid before answering anything |
+| Stop caching statements that carry their values inline | **~250 MB** of parsed bulk `INSERT`s, for a hit rate of zero |
 
 ## Read this before quoting the startup row
 
@@ -126,8 +127,8 @@ it can drop and the other stores them in a `BTreeMap` it cannot.
 
 OxiDB holds every index key and primary key in RAM. `OXIDB_SQL_DISK_FIRST` moves
 *row data* to an mmap'd snapshot; keys stay resident by design. So the gap is
-now small when a workload does not use its indexes (162 MB against 105 MB) and
-still ~3× when it uses all of them (310 MB against 106 MB).
+now small when a workload does not use its indexes (162 MB against 106 MB) and
+still ~3× when it uses all of them (311 MB against 106 MB).
 
 Measured cost of what remains, on 1M rows in disk-first mode:
 
@@ -158,13 +159,13 @@ makes memory a configured number rather than a function of row count.
 - **Disk**: 74 MB against 504 MB for the whole data directory, and against
   153 MB counting only tables and indexes. Roughly half the bytes for the same
   million rows, before counting PostgreSQL's WAL and free-space maps.
-- **Scan-heavy workloads**: 162 MB against 105 MB is a gap; it used to be 4×.
+- **Scan-heavy workloads**: 162 MB against 106 MB is a gap; it used to be 4×.
 
 ## What this benchmark does not measure
 
 Query speed (see [the wire benchmark](wire-benchmark.md)), concurrency, larger
 datasets, or a tuned PostgreSQL. It also flatters neither engine on load time:
-7.2 s against 23 s is real, but both went through `psql` with multi-row
+7.4 s against 19 s is real, but both went through `psql` with multi-row
 `INSERT`s — PostgreSQL's `COPY` would be far faster and OxiDB has no equivalent.
 
 The honest summary is that OxiDB now starts small and *stays* small until a
