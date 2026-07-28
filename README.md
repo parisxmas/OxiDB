@@ -103,7 +103,19 @@ Typed fields (float, integer, boolean, string). Aggregations include mean, sum, 
 
 **RESP** — strings, hashes, lists, sets, sorted sets, pub/sub, `MULTI`/`EXEC`/`WATCH`, Lua via `EVAL`, and persistence.
 
-**MQTT and AMQP** — publish/subscribe with honest QoS 1/2 ([ADR-0015](docs/decisions/0015-durable-mqtt-qos.md)), durable queues that survive `SIGKILL`, and a bridge between the two ([ADR-0016](docs/decisions/0016-amqp-protocol.md)).
+**MQTT 3.1.1** — publish/subscribe with honest QoS 1 and 2 ([ADR-0015](docs/decisions/0015-durable-mqtt-qos.md)): a `PUBACK` means the message is on disk, retained messages and sessions survive a restart, and the guarantee is the one the level actually promises rather than a best effort.
+
+**AMQP 0-9-1** ([ADR-0016](docs/decisions/0016-amqp-protocol.md)) — exchanges (direct, fanout, topic), queues, bindings, acknowledgements, prefetch and publisher confirms, spoken well enough that `pika`, the .NET client and the Go client connect unmodified. Durable queues survive `SIGKILL`. Messages bridge between AMQP and MQTT, so a sensor publishing MQTT can be consumed by a worker speaking AMQP.
+
+## Logs and alerting
+
+The database is also a place to put logs, without another system to run.
+
+**GELF** (`OXIDB_GELF_PORT`) receives Graylog-format messages over UDP, reassembles chunked ones, and indexes every field it finds — Elasticsearch-style dynamic mapping — so arbitrary structured queries work immediately. **MessagePack** (`OXIDB_MSGPACK_PORT`) is the cheaper sibling: a compact binary frame, and deliberately *no* per-field indexing, because a log stream is append-only and rarely queried by arbitrary field. Both batch their writes and take their own collection and retention.
+
+**Retention** is per collection — `set_retention` with a day count, swept by the same TTL machinery that expires documents. **Alerting** evaluates count and aggregation thresholds in the background, fires webhooks with a cooldown, and records what it did in `_alert_history`.
+
+The server can also *emit* to a GELF or MessagePack endpoint (`OXIDB_GELF_ADDR`, `OXIDB_MSGPACK_ADDR`), including to itself — which is how a single process ends up storing its own request log.
 
 ## Durability
 
