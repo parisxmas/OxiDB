@@ -137,6 +137,16 @@ impl Ord for IndexKey {
     }
 }
 
+/// One index or primary key, as a tuple of column values.
+///
+/// Composite and single-column keys take one code path, so this is a sequence
+/// even when it holds one element — and one element is the overwhelmingly
+/// common case, which is why it inlines. A `Vec` here would put a separate heap
+/// allocation behind every key in every index and primary-key map: 24 bytes of
+/// header plus a rounded-up 32-byte allocation to hold a 24-byte value. At a
+/// million rows that is the difference between tens and hundreds of megabytes.
+pub type KeyTuple = smallvec::SmallVec<[IndexKey; 1]>;
+
 /// How a key reads in a constraint-violation message: the bare value for a
 /// single column (`Int(1)`), a tuple for a composite one (`(Int(1), Text("a"))`).
 pub(crate) fn render_key(cols: &[usize], cells: &[Value]) -> String {

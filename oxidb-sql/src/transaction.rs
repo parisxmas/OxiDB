@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::catalog::{IndexDef, Table};
 use crate::error::{Result, SqlError};
 use crate::store::Store;
-use crate::types::{IndexKey, Value};
+use crate::types::{IndexKey, KeyTuple, Value};
 use crate::wal::WalRecord;
 use crate::SqlEngine;
 
@@ -31,7 +31,7 @@ type RowChange = Option<Vec<Value>>;
 struct UniqueMap {
     cols: Vec<usize>,
     is_pk: bool,
-    map: BTreeMap<Vec<IndexKey>, u64>,
+    map: BTreeMap<KeyTuple, u64>,
 }
 
 /// Per-table uniqueness maps: the PRIMARY KEY (when there is one) followed by
@@ -295,7 +295,7 @@ impl<'a> Transaction<'a> {
             if c.cols.iter().any(|&p| matches!(cells[p], Value::Null)) {
                 continue;
             }
-            let key: Vec<IndexKey> = c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+            let key: KeyTuple = c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             // Owned by a row this transaction wrote?
             if let Some(&rid) = c.map.get(&key)
                 && Some(rid) != exclude
@@ -370,7 +370,7 @@ impl<'a> Transaction<'a> {
             if let Some(cells) = cells
                 && !c.cols.iter().any(|&p| matches!(cells[p], Value::Null))
             {
-                let key: Vec<IndexKey> =
+                let key: KeyTuple =
                     c.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
                 c.map.insert(key, row_id);
             }

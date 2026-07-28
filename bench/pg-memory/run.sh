@@ -10,7 +10,8 @@
 #   boot    a freshly started server with an empty database
 #   loaded  the same process after ingesting 1M rows
 #   reboot  a restart against the 1M rows already on disk, before any query
-#   warm    the same process after every table has been read   <- the honest one
+#   warm    the same process after every table has been read
+#   +index  after every index has been used at least once        <- both matter
 #
 # The reboot row is measured on purpose *and* is the one not to quote alone:
 # OxiDB opens its SQL engine lazily, so before the first statement it has not
@@ -70,6 +71,20 @@ warm() { sql "$1" "$2" -tAc "SELECT count(*) FROM customers;
                               SELECT count(*) FROM order_items;
                               SELECT count(*) FROM inventory" >/dev/null; }
 
+# Every index exercised at least once. Measured separately from `warm` because
+# the two answer different questions, and quoting only the first would flatter
+# OxiDB: it builds an index when a query wants it, so a workload that scans and
+# never seeks pays for none of them. PostgreSQL reads index pages on demand too,
+# but its cache is capped, so this step barely moves it and moves OxiDB a lot.
+seek() { sql "$1" "$2" -tAc "SELECT count(*) FROM customers WHERE country = 'TR';
+    SELECT count(*) FROM products WHERE category = 'tools';
+    SELECT count(*) FROM orders WHERE customer_id = 42;
+    SELECT count(*) FROM order_items WHERE product = 7;
+    SELECT count(*) FROM inventory WHERE warehouse = 'ist';
+    SELECT count(*) FROM customers WHERE country='TR' AND created = TIMESTAMP '2024-01-01 00:00:07';
+    SELECT count(*) FROM products WHERE category='tools' AND price = 1.5;
+    SELECT count(*) FROM orders WHERE status='paid' AND created = TIMESTAMP '2024-01-01 00:00:03'" >/dev/null; }
+
 # ---------------------------------------------------------------------------
 # Dataset (generated once, used by both)
 # ---------------------------------------------------------------------------
@@ -105,6 +120,9 @@ measure "postgres reboot" "$PGPID"
 warm "$PG_PORT" bench
 sleep 2
 measure "postgres warm" "$PGPID"
+seek "$PG_PORT" bench
+sleep 2
+measure "postgres +indexes" "$PGPID"
 pg_ctl -D "$WORK/pgdata" -m fast stop >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -138,6 +156,9 @@ run_oxidb() { # run_oxidb <label> <disk_first 0|1>
   warm "$OXI_PG_PORT" oxidb
   sleep 2
   measure "oxidb warm" "$pid"
+  seek "$OXI_PG_PORT" oxidb
+  sleep 2
+  measure "oxidb +indexes" "$pid"
   echo "on-disk: $(du -sh "$dir" | awk '{print $1}')"
   kill "$pid"; wait "$pid" 2>/dev/null || true; sleep 1
 }

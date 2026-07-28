@@ -38,6 +38,7 @@ pub use error::{Result, SqlError};
 pub use parser::{
     DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,
 };
+use types::KeyTuple;
 pub use types::{SqlType, Value};
 
 use catalog::Catalog;
@@ -100,13 +101,164 @@ impl SqlOptions {
 
 /// An in-memory secondary index over one or more columns:
 /// key tuple -> set of row ids.
+/// The row ids one index key points at, kept sorted and ascending.
+///
+/// A `BTreeSet<u64>` was the obvious choice and the expensive one: an empty set
+/// is 24 bytes, but the moment it holds a single id it allocates a whole leaf
+/// node — sized for eleven keys whether it has one or eleven — so a key
+/// matching one row cost about 150 bytes to say so. Index keys are mostly
+/// selective, so that was the common case, not the corner.
+///
+/// A sorted inline vector answers the same three questions (insert, remove,
+/// iterate in order) with zero allocations for a unique key and one small one
+/// beyond that. Insert and remove are a binary search plus a memmove, which for
+/// the posting-list sizes indexes actually produce beats pointer-chasing a
+/// tree.
+#[derive(Default, Debug, Clone)]
+struct RowIds(smallvec::SmallVec<[u64; 1]>);
+
+impl RowIds {
+    fn insert(&mut self, id: u64) {
+        if let Err(at) = self.0.binary_search(&id) {
+            self.0.insert(at, id);
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Ok(at) = self.0.binary_search(&id) {
+            self.0.remove(at);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &u64> {
+        self.0.iter()
+    }
+}
+
+/// PRIMARY KEY tuple -> `row_id`, in whichever representation the key shape
+/// allows.
+///
+/// The general form has to be `BTreeMap<KeyTuple, u64>`, because a key may be
+/// composite and may hold any value. But the overwhelmingly common primary key
+/// is a single integer column, and paying the general price for it is what made
+/// this the engine's single largest resident structure: measured at **103 bytes
+/// per row** for an `INT PRIMARY KEY`, against the 16 the key and row id
+/// actually occupy. The rest is a 24-byte `Value` discriminant, the `SmallVec`
+/// length word, and `BTreeMap` node slack.
+///
+/// So a single-column integer key is stored as the bare `i64`. Everything else
+/// — composite, text, anything — keeps the general map. The representation is
+/// chosen from the declared column type, and *upgrades itself* if a value that
+/// does not fit ever arrives (an old WAL record written before an
+/// `ALTER COLUMN TYPE`, say), so the specialization can never silently lose or
+/// conflate a key.
+enum PkMap {
+    Int(BTreeMap<i64, u64>),
+    Tuple(BTreeMap<KeyTuple, u64>),
+}
+
+impl PkMap {
+    /// `Int` when the key is exactly one column of an integer type.
+    fn for_key(def: &Table, pk_cols: &[usize]) -> PkMap {
+        match pk_cols {
+            [p] if matches!(def.columns[*p].ty, SqlType::Int) => PkMap::Int(BTreeMap::new()),
+            _ => PkMap::Tuple(BTreeMap::new()),
+        }
+    }
+
+    /// The `i64` a key reduces to, when it reduces to one.
+    fn as_int(key: &[IndexKey]) -> Option<i64> {
+        match key {
+            [IndexKey(Value::Int(n))] => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            PkMap::Int(m) => m.clear(),
+            PkMap::Tuple(m) => m.clear(),
+        }
+    }
+
+    fn get(&self, key: &[IndexKey]) -> Option<u64> {
+        match self {
+            PkMap::Int(m) => Self::as_int(key).and_then(|k| m.get(&k)).copied(),
+            PkMap::Tuple(m) => m.get(key).copied(),
+        }
+    }
+
+    fn remove(&mut self, key: &[IndexKey]) {
+        match self {
+            PkMap::Int(m) => {
+                if let Some(k) = Self::as_int(key) {
+                    m.remove(&k);
+                }
+            }
+            PkMap::Tuple(m) => {
+                m.remove(key);
+            }
+        }
+    }
+
+    fn insert(&mut self, key: KeyTuple, row_id: u64) {
+        if let PkMap::Int(m) = self {
+            match Self::as_int(&key) {
+                Some(k) => {
+                    m.insert(k, row_id);
+                    return;
+                }
+                // A key the compact form cannot hold. Rather than drop it —
+                // which would lose a uniqueness constraint silently — widen the
+                // whole map and carry on in the general representation.
+                None => self.widen(),
+            }
+        }
+        let PkMap::Tuple(m) = self else {
+            unreachable!()
+        };
+        m.insert(key, row_id);
+    }
+
+    fn widen(&mut self) {
+        if let PkMap::Int(m) = self {
+            let general = std::mem::take(m)
+                .into_iter()
+                .map(|(k, rid)| (KeyTuple::from_elem(IndexKey(Value::Int(k)), 1), rid))
+                .collect();
+            *self = PkMap::Tuple(general);
+        }
+    }
+}
+
+/// A secondary index, which may not be **populated** yet.
+///
+/// An index that exists in the catalog costs nothing until something reads it.
+/// At open the engine used to rebuild every index into RAM before answering a
+/// single query — the single largest thing a restart pays for, and pure waste
+/// for any index the workload never touches. Measured at 1M rows, three
+/// indexes cost 318 MB to reconstruct that way.
+///
+/// PostgreSQL never does this: its indexes live on disk and pages enter the
+/// buffer pool only when a scan needs them. `populated: false` is the same
+/// bargain at the granularity available here — pay for an index when a query
+/// actually uses it, not because it was declared.
+///
+/// An unpopulated index also needs **no maintenance**: writes skip it, because
+/// it is built from the rows as they stand whenever it is finally wanted. That
+/// is what keeps this from being a trade of memory for correctness.
 struct SecondaryIndex {
     col_pos: Vec<usize>,
-    map: BTreeMap<Vec<IndexKey>, BTreeSet<u64>>,
+    map: BTreeMap<KeyTuple, RowIds>,
+    populated: bool,
 }
 
 impl SecondaryIndex {
-    fn key_of(&self, cells: &[Value]) -> Vec<IndexKey> {
+    fn key_of(&self, cells: &[Value]) -> KeyTuple {
         self.col_pos
             .iter()
             .map(|&p| IndexKey(cells[p].clone()))
@@ -132,7 +284,7 @@ struct TableState {
     /// single-column key is simply a one-element tuple, so composite and
     /// simple primary keys take one code path.
     pk_cols: Vec<usize>,
-    pk_map: BTreeMap<Vec<IndexKey>, u64>,
+    pk_map: PkMap,
     /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
     /// NULLs are exempt (per SQL).
     uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
@@ -156,6 +308,7 @@ struct TableState {
 impl TableState {
     fn empty(def: Table, disk_first: bool) -> Self {
         let pk_cols = def.pk_cols();
+        let pk_map = PkMap::for_key(&def, &pk_cols);
         let auto_pos = def.columns.iter().position(|c| c.auto_increment);
         let uniques = def
             .columns
@@ -172,7 +325,7 @@ impl TableState {
             next_auto: 1,
             indexes: BTreeMap::new(),
             pk_cols,
-            pk_map: BTreeMap::new(),
+            pk_map,
             uniques,
             has_dropped: false,
             scan_cache: None,
@@ -227,7 +380,7 @@ impl TableState {
 
     /// This row's PRIMARY KEY tuple, or `None` when the table has no primary
     /// key. `cells` is a **physical** row (`pk_cols` are physical positions).
-    fn pk_key(&self, cells: &[Value]) -> Option<Vec<IndexKey>> {
+    fn pk_key(&self, cells: &[Value]) -> Option<KeyTuple> {
         if self.pk_cols.is_empty() {
             return None;
         }
@@ -305,6 +458,7 @@ impl TableState {
         let mut idx = SecondaryIndex {
             col_pos,
             map: BTreeMap::new(),
+            populated: true,
         };
         // `col_pos` are physical positions, so index the physical rows.
         for (rid, cells) in self.rows.iter_physical() {
@@ -315,8 +469,59 @@ impl TableState {
         Ok(())
     }
 
+    /// Register an index without populating it — the open path. It costs a
+    /// `col_pos` vector until a query wants it.
+    fn declare_index(&mut self, index_name: &str, columns: &[String]) -> Result<()> {
+        let col_pos: Vec<usize> = columns
+            .iter()
+            .map(|column| {
+                self.def
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == column)
+                    .ok_or_else(|| SqlError::NoSuchColumn(column.to_string()))
+            })
+            .collect::<Result<_>>()?;
+        self.indexes.insert(
+            index_name.to_string(),
+            SecondaryIndex {
+                col_pos,
+                map: BTreeMap::new(),
+                populated: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Fill an index declared but never built. Reads the rows as they stand, so
+    /// the result is identical to having maintained it since open.
+    fn populate_index(&mut self, index_name: &str) {
+        let Some(idx) = self.indexes.get(index_name) else {
+            return;
+        };
+        if idx.populated {
+            return;
+        }
+        let col_pos = idx.col_pos.clone();
+        let mut map: BTreeMap<KeyTuple, RowIds> = BTreeMap::new();
+        for (rid, cells) in self.rows.iter_physical() {
+            let key: KeyTuple = col_pos
+                .iter()
+                .map(|&p| IndexKey(cells[p].clone()))
+                .collect();
+            map.entry(key).or_default().insert(rid);
+        }
+        if let Some(idx) = self.indexes.get_mut(index_name) {
+            idx.map = map;
+            idx.populated = true;
+        }
+    }
+
     fn index_insert(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
+            if !idx.populated {
+                continue;
+            }
             let key = idx.key_of(cells);
             idx.map.entry(key).or_default().insert(row_id);
         }
@@ -332,9 +537,12 @@ impl TableState {
 
     fn index_remove(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
+            if !idx.populated {
+                continue;
+            }
             let key = idx.key_of(cells);
             if let Some(set) = idx.map.get_mut(&key) {
-                set.remove(&row_id);
+                set.remove(row_id);
                 if set.is_empty() {
                     idx.map.remove(&key);
                 }
@@ -343,7 +551,7 @@ impl TableState {
         if let Some(key) = self.pk_key(cells) {
             // Only remove the mapping if it still points at this row (an
             // idempotent WAL replay can re-insert before the old delete).
-            if self.pk_map.get(&key) == Some(&row_id) {
+            if self.pk_map.get(&key) == Some(row_id) {
                 self.pk_map.remove(&key);
             }
         }
@@ -360,7 +568,7 @@ impl TableState {
     /// matches.
     fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
         if let Some(key) = self.pk_key(cells)
-            && let Some(&existing) = self.pk_map.get(&key)
+            && let Some(existing) = self.pk_map.get(&key)
             && Some(existing) != exclude_row
         {
             return Err(SqlError::DuplicateKey(format!(
@@ -406,7 +614,7 @@ struct BatchKey {
     /// `Some(i)` = `TableState::uniques[i]`.
     unique_idx: Option<usize>,
     /// Keys this batch has claimed so far, and the row that claimed each.
-    claimed: BTreeMap<Vec<IndexKey>, u64>,
+    claimed: BTreeMap<KeyTuple, u64>,
 }
 
 impl<'a> BatchSim<'a> {
@@ -443,9 +651,9 @@ impl<'a> BatchSim<'a> {
             if k.unique_idx.is_some() && matches!(cells[k.cols[0]], Value::Null) {
                 continue;
             }
-            let key: Vec<IndexKey> = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+            let key: KeyTuple = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             let committed = match k.unique_idx {
-                None => self.state.pk_map.get(&key).copied(),
+                None => self.state.pk_map.get(&key),
                 Some(i) => self.state.uniques[i].1.get(&key[0]).copied(),
             };
             let taken = committed
@@ -478,7 +686,7 @@ impl<'a> BatchSim<'a> {
             if k.unique_idx.is_some() && matches!(cells[k.cols[0]], Value::Null) {
                 continue;
             }
-            let key: Vec<IndexKey> = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
+            let key: KeyTuple = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             k.claimed.insert(key, row_id);
         }
     }
@@ -708,7 +916,7 @@ impl SqlEngine {
             if let Some(state) = tables.get_mut(&def.table)
                 && !state.indexes.contains_key(&def.name)
             {
-                let _ = state.build_index(&def.name, &def.columns);
+                let _ = state.declare_index(&def.name, &def.columns);
             }
         }
 
@@ -722,7 +930,26 @@ impl SqlEngine {
             mode: wal.sync_mode(),
         };
 
-        Ok(SqlEngine {
+        // A replayed WAL tail lands in RAM: in disk-first mode every record
+        // past the watermark becomes an overlay row, and the overlay is only
+        // folded back into the mmap'd snapshot by a checkpoint. So a restart
+        // inherits the previous process's pending WAL as resident memory and
+        // holds it until the next checkpoint — which, if the database has gone
+        // quiet, may be never.
+        //
+        // The effect is large: measured on 1M rows, a 55 MB WAL tail cost
+        // 60 MB of overlay, doubling the engine's resident footprint (123 MB
+        // against 63 MB with a folded WAL). It is also invisible — the mode is
+        // called disk-first, and the rows are in RAM.
+        //
+        // So fold it now. The threshold is a fraction of the auto-checkpoint
+        // size rather than the size itself, because the trade differs at open:
+        // a tail costs RAM for the whole life of the process, not just until
+        // the next write. `checkpoint_bytes == 0` means checkpoints are manual,
+        // and that is respected.
+        let tail = wal.bytes();
+        let fold_at = opts.checkpoint_bytes / 8;
+        let engine = SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
@@ -741,7 +968,14 @@ impl SqlEngine {
                 committed_wal_seq: watermark,
                 pinned_gens: std::collections::BTreeMap::new(),
             }),
-        })
+        };
+        if opts.disk_first && opts.checkpoint_bytes > 0 && tail > fold_at {
+            // Best-effort: a database that opened is more useful than one that
+            // refused to because it could not tidy itself. A failure here just
+            // leaves the tail resident, which is the old behaviour.
+            let _ = engine.checkpoint();
+        }
+        Ok(engine)
     }
 
     /// Delete every `gen.<N>/` directory except the committed generation —
@@ -928,7 +1162,7 @@ impl SqlEngine {
             WalRecord::CreateIndex(def) => {
                 catalog.indexes.insert(def.name.clone(), def.clone());
                 if let Some(state) = tables.get_mut(&def.table) {
-                    let _ = state.build_index(&def.name, &def.columns);
+                    let _ = state.declare_index(&def.name, &def.columns);
                 }
             }
             WalRecord::DropIndex(name) => {
@@ -1050,6 +1284,13 @@ impl SqlEngine {
             columns: columns.to_vec(),
         });
         let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        // Applying the record only *declares* the index — that is what makes a
+        // WAL replay at open cheap. But an explicit `CREATE INDEX` is work the
+        // caller asked for, so build it here rather than surprising whoever
+        // runs the next query with the scan.
+        if let Some(state) = inner.tables.get_mut(table) {
+            state.populate_index(name);
+        }
         drop(inner);
         self.commit_pending(seq)?;
         Ok(())
@@ -1219,7 +1460,7 @@ impl SqlEngine {
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        let mut batch_keys: BTreeSet<Vec<IndexKey>> = BTreeSet::new();
+        let mut batch_keys: BTreeSet<KeyTuple> = BTreeSet::new();
         let mut phys_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for cells in rows {
             let cells = state.prepare_write(cells)?;
@@ -1413,13 +1654,15 @@ impl SqlEngine {
     /// must be built from the table's `pk_cols` in order.
     pub(crate) fn pk_owner(&self, table: &str, key: &[IndexKey]) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
-        inner.tables.get(table)?.pk_map.get(key).copied()
+        inner.tables.get(table)?.pk_map.get(key)
     }
 
     /// Look up rows using a secondary index whose columns are all present in
     /// the `column = value` pairs `eqs`. `Ok(None)` when no index qualifies.
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
-        let inner = self.inner.lock().unwrap();
+        // `mut` because a qualifying index may not be populated yet — see
+        // `SecondaryIndex::populated`. Reads still take the same single lock.
+        let mut inner = self.inner.lock().unwrap();
         let Some(state) = inner.tables.get(table) else {
             return Err(SqlError::NoSuchTable(table.to_string()));
         };
@@ -1429,7 +1672,7 @@ impl SqlEngine {
         // qualifies only when *every* member column has an equality pair —
         // a partial key isn't unique, so it would miss rows.
         if !state.pk_cols.is_empty() {
-            let key: Option<Vec<IndexKey>> = state
+            let key: Option<KeyTuple> = state
                 .pk_cols
                 .iter()
                 .map(|&p| {
@@ -1442,7 +1685,7 @@ impl SqlEngine {
                 let rows: store::Rows = state
                     .pk_map
                     .get(&key)
-                    .and_then(|id| state.rows.get(*id).map(|c| (*id, c)))
+                    .and_then(|id| state.rows.get(id).map(|c| (id, c)))
                     .into_iter()
                     .collect();
                 return Ok(Some(rows));
@@ -1465,11 +1708,22 @@ impl SqlEngine {
         let Some(def) = best else {
             return Ok(None);
         };
-        let Some(idx) = state.indexes.get(&def.name) else {
+        if !state.indexes.contains_key(&def.name) {
             return Ok(None);
-        };
-        let key: Vec<IndexKey> = def
-            .columns
+        }
+        // First real use of this index since open: build it now. `state` is
+        // reborrowed mutably for exactly this, then dropped back to a shared
+        // borrow for the lookup itself.
+        let name = def.name.clone();
+        let key_cols: Vec<String> = def.columns.clone();
+        let state = inner
+            .tables
+            .get_mut(table)
+            .expect("looked up immediately above");
+        state.populate_index(&name);
+        let state = &*state;
+        let idx = state.indexes.get(&name).expect("just populated");
+        let key: KeyTuple = key_cols
             .iter()
             .map(|c| {
                 let (_, v) = eqs.iter().find(|(col, _)| col == c).expect("checked");
@@ -3231,6 +3485,121 @@ mod tests {
                 .is_err()
         );
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lazy_index_tests {
+    use super::*;
+
+    fn open_at(dir: &std::path::Path) -> SqlEngine {
+        SqlEngine::open_with_options(
+            dir,
+            SqlOptions {
+                disk_first: false,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The last statement's SELECT rows.
+    fn q(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop() {
+            Some(QueryResult::Select { rows, .. }) => rows,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    fn populated(db: &SqlEngine, table: &str, index: &str) -> bool {
+        db.inner.lock().unwrap().tables[table].indexes[index].populated
+    }
+
+    fn seed(dir: &std::path::Path) {
+        let db = open_at(dir);
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX ti ON t (k)").unwrap();
+        for i in 1..=20 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {}, 'v{i}')", i % 4))
+                .unwrap();
+        }
+    }
+
+    /// An index is not rebuilt at open, and building it on first use gives the
+    /// same answer it would have given had it been maintained all along.
+    #[test]
+    fn an_index_is_built_on_first_use_not_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path());
+
+        let db = open_at(dir.path());
+        assert!(
+            !populated(&db, "t", "ti"),
+            "reopening must not rebuild the index"
+        );
+
+        // An equality lookup on the indexed column is what triggers the build.
+        let rows = q(&db, "SELECT id FROM t WHERE k = 2");
+        assert_eq!(rows.len(), 5, "wrong rows through the index: {rows:?}");
+        assert!(populated(&db, "t", "ti"), "the lookup must have built it");
+    }
+
+    /// The dangerous case: rows written while the index was unpopulated are
+    /// skipped by maintenance on purpose, so the build has to see them. If it
+    /// did not, an index would silently miss every row written since open.
+    #[test]
+    fn rows_written_before_the_build_are_in_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path());
+
+        let db = open_at(dir.path());
+        assert!(!populated(&db, "t", "ti"));
+        // Writes land while the index is still unpopulated — including a delete
+        // of a row that was there at open.
+        db.execute("INSERT INTO t VALUES (21, 2, 'new')").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        assert!(!populated(&db, "t", "ti"), "a write must not build it");
+
+        let rows = q(&db, "SELECT id FROM t WHERE k = 2");
+        assert!(populated(&db, "t", "ti"));
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                _ => panic!("expected int"),
+            })
+            .collect();
+        ids.sort();
+        // id=2 was deleted; id=21 was inserted; 6,10,14,18 were already there.
+        assert_eq!(ids, vec![6, 10, 14, 18, 21], "the build missed a write");
+    }
+
+    /// Once populated, an index is maintained normally again.
+    #[test]
+    fn writes_after_the_build_are_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path());
+        let db = open_at(dir.path());
+        q(&db, "SELECT id FROM t WHERE k = 1");
+        assert!(populated(&db, "t", "ti"));
+
+        db.execute("INSERT INTO t VALUES (99, 1, 'after')").unwrap();
+        let rows = q(&db, "SELECT id FROM t WHERE k = 1");
+        assert_eq!(rows.len(), 6, "a post-build write is missing: {rows:?}");
+    }
+
+    /// `CREATE INDEX` on a live table still builds immediately — it is DDL the
+    /// caller asked for, not an artefact of opening a database.
+    #[test]
+    fn create_index_still_builds_eagerly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_at(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 7)").unwrap();
+        db.execute("CREATE INDEX ti ON t (k)").unwrap();
+        assert!(populated(&db, "t", "ti"));
     }
 }
 

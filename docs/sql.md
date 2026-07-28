@@ -33,6 +33,27 @@ At 1M rows (4 columns, PK), disk-first cuts resident memory roughly in half
 Mapped snapshot pages are clean file pages the OS can evict under memory
 pressure, so the effective floor is lower than RSS suggests.
 
+### Memory at startup
+
+Two things the engine deliberately does *not* do when it opens a database:
+
+- **Secondary indexes are built on first use, not at open.** An index that
+  exists in the catalog costs a column list until a query needs it, at which
+  point it is built from the current rows. Writes to a table skip any index that
+  is not built yet — it will see them when it is built — so this trades startup
+  memory and time for one scan on the first query that seeks. `CREATE INDEX`
+  itself still builds immediately: that is work the caller asked for.
+- **In disk-first mode, a replayed WAL tail is folded at open.** Records past
+  the last checkpoint replay into the in-memory overlay, and only a checkpoint
+  moves them into the mmap'd snapshot — so without this a restart inherited the
+  previous process's pending WAL as resident memory and held it until the next
+  write. Measured at 1M rows, a 55 MB tail cost 60 MB of overlay.
+
+Both are measured in [the memory benchmark](pg-memory-benchmark.md), which also
+sets out honestly where OxiDB still loses to PostgreSQL: index and primary keys
+are held in RAM, so a workload that uses every index pays for every index, while
+PostgreSQL never exceeds its `shared_buffers` cap.
+
 ### SQL-only servers (`OXIDB_DOC=0`)
 
 The document engine is the server's default and starts unconditionally. Setting
