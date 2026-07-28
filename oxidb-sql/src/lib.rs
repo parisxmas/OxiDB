@@ -145,6 +145,27 @@ impl RowIds {
     }
 }
 
+/// One column-level `UNIQUE` constraint: the value -> row id mapping that
+/// enforces it, split the same way the primary key is.
+///
+/// `map` holds only what has been written since the last checkpoint; `base` is
+/// that checkpoint's file, mapped. Both are hints and both are verified against
+/// the live row — a `UNIQUE` column is a constraint, so the cost of trusting a
+/// stale one is a wrong answer, not a slow one.
+struct UniqueCol {
+    /// Physical column position.
+    pos: usize,
+    map: BTreeMap<IndexKey, u64>,
+    base: Option<index_file::MappedIndex>,
+}
+
+/// File name a table's `UNIQUE` column is materialized under. Prefixed like
+/// `$pk` so it cannot collide with a user index, and suffixed by *position*
+/// rather than name so a `RENAME COLUMN` cannot silently point at a stale file.
+fn unique_index_name(pos: usize) -> String {
+    format!("$uq{pos}")
+}
+
 /// File name a table's primary key is materialized under, alongside its
 /// secondary indexes. `$` is not legal in an identifier, so this can never
 /// collide with a user-created index on the same table.
@@ -335,9 +356,8 @@ struct TableState {
     /// insert there descends the on-disk index and binary-searches a locked
     /// leaf page (`_bt_check_unique`, `src/backend/access/nbtree/nbtinsert.c`).
     pk_base: Option<index_file::MappedIndex>,
-    /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
-    /// NULLs are exempt (per SQL).
-    uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
+    /// Column-level `UNIQUE` constraints. NULLs are exempt (per SQL).
+    uniques: Vec<UniqueCol>,
     /// Cached `def.has_dropped()` — true once a lazy `DROP COLUMN` tombstoned
     /// a column, so writes must expand logical rows to physical layout. False
     /// keeps the write path a no-op fast path.
@@ -365,7 +385,11 @@ impl TableState {
             .iter()
             .enumerate()
             .filter(|(_, c)| c.unique && !c.primary_key)
-            .map(|(i, _)| (i, BTreeMap::new()))
+            .map(|(i, _)| UniqueCol {
+                pos: i,
+                map: BTreeMap::new(),
+                base: None,
+            })
             .collect();
         let mut state = TableState {
             def,
@@ -454,7 +478,11 @@ impl TableState {
             .iter()
             .enumerate()
             .filter(|(_, c)| c.unique && !c.primary_key)
-            .map(|(i, _)| (i, BTreeMap::new()))
+            .map(|(i, _)| UniqueCol {
+                pos: i,
+                map: BTreeMap::new(),
+                base: None,
+            })
             .collect();
         self.pk_map.clear();
         // The mapped base was built at the *old* physical layout, so after an
@@ -474,9 +502,9 @@ impl TableState {
             if let Some(key) = self.pk_key(&cells) {
                 self.pk_map.insert(key, rid);
             }
-            for (pos, map) in self.uniques.iter_mut() {
-                if !matches!(cells[*pos], Value::Null) {
-                    map.insert(IndexKey(cells[*pos].clone()), rid);
+            for u in self.uniques.iter_mut() {
+                if !matches!(cells[u.pos], Value::Null) {
+                    u.map.insert(IndexKey(cells[u.pos].clone()), rid);
                 }
             }
             self.observe_auto(&cells);
@@ -593,9 +621,9 @@ impl TableState {
         if let Some(key) = self.pk_key(cells) {
             self.pk_map.insert(key, row_id);
         }
-        for (pos, map) in self.uniques.iter_mut() {
-            if !matches!(cells[*pos], Value::Null) {
-                map.insert(IndexKey(cells[*pos].clone()), row_id);
+        for u in self.uniques.iter_mut() {
+            if !matches!(cells[u.pos], Value::Null) {
+                u.map.insert(IndexKey(cells[u.pos].clone()), row_id);
             }
         }
     }
@@ -620,10 +648,10 @@ impl TableState {
                 self.pk_map.remove(&key);
             }
         }
-        for (pos, map) in self.uniques.iter_mut() {
-            let key = IndexKey(cells[*pos].clone());
-            if map.get(&key) == Some(&row_id) {
-                map.remove(&key);
+        for u in self.uniques.iter_mut() {
+            let key = IndexKey(cells[u.pos].clone());
+            if u.map.get(&key) == Some(&row_id) {
+                u.map.remove(&key);
             }
         }
     }
@@ -650,6 +678,26 @@ impl TableState {
         base.get(key).ok()?.into_iter().find_map(verify)
     }
 
+    /// The live row owning `key` in `UNIQUE` column `u` — overlay, then mapped
+    /// base, each hit verified against the live physical row for the same
+    /// reason the primary key is.
+    fn unique_owner_of(&self, u: &UniqueCol, key: &IndexKey) -> Option<u64> {
+        let verify = |rid: u64| -> Option<u64> {
+            let phys = self.rows.get_physical(rid)?;
+            (phys.get(u.pos) == Some(&key.0)).then_some(rid)
+        };
+        if let Some(&rid) = u.map.get(key)
+            && let Some(rid) = verify(rid)
+        {
+            return Some(rid);
+        }
+        let base = u.base.as_ref()?;
+        base.get(std::slice::from_ref(key))
+            .ok()?
+            .into_iter()
+            .find_map(verify)
+    }
+
     /// Error if `cells`' PRIMARY KEY value already belongs to a row other
     /// than `exclude_row`. A composite key collides only when *every* member
     /// matches.
@@ -664,17 +712,17 @@ impl TableState {
                 self.def.name
             )));
         }
-        for (pos, map) in &self.uniques {
-            if matches!(cells[*pos], Value::Null) {
+        for u in &self.uniques {
+            if matches!(cells[u.pos], Value::Null) {
                 continue; // SQL: NULLs never collide under UNIQUE
             }
-            let key = IndexKey(cells[*pos].clone());
-            if let Some(&existing) = map.get(&key)
+            let key = IndexKey(cells[u.pos].clone());
+            if let Some(existing) = self.unique_owner_of(u, &key)
                 && Some(existing) != exclude_row
             {
                 return Err(SqlError::DuplicateKey(format!(
                     "UNIQUE value {:?} already exists in {:?}.{:?}",
-                    cells[*pos], self.def.name, self.def.columns[*pos].name
+                    cells[u.pos], self.def.name, self.def.columns[u.pos].name
                 )));
             }
         }
@@ -714,9 +762,9 @@ impl<'a> BatchSim<'a> {
                 claimed: BTreeMap::new(),
             });
         }
-        for (i, (pos, _)) in state.uniques.iter().enumerate() {
+        for (i, u) in state.uniques.iter().enumerate() {
             keys.push(BatchKey {
-                cols: vec![*pos],
+                cols: vec![u.pos],
                 unique_idx: Some(i),
                 claimed: BTreeMap::new(),
             });
@@ -741,7 +789,10 @@ impl<'a> BatchSim<'a> {
             let key: KeyTuple = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             let committed = match k.unique_idx {
                 None => self.state.pk_owner_of(&key),
-                Some(i) => self.state.uniques[i].1.get(&key[0]).copied(),
+                Some(i) => {
+                    let u = &self.state.uniques[i];
+                    self.state.unique_owner_of(u, &key[0])
+                }
             };
             let taken = committed
                 .filter(|rid| *rid != row_id && !self.touched.contains(rid))
@@ -977,6 +1028,16 @@ impl SqlEngine {
                 // the rows, but it stops retaining a key per row.
                 state.pk_base = index_file::MappedIndex::open(&load_dir, name, PK_INDEX_NAME)?;
                 let seed_pk = state.pk_base.is_none();
+                for u in state.uniques.iter_mut() {
+                    u.base =
+                        index_file::MappedIndex::open(&load_dir, name, &unique_index_name(u.pos))?;
+                }
+                let seed_unique: std::collections::BTreeSet<usize> = state
+                    .uniques
+                    .iter()
+                    .filter(|u| u.base.is_none())
+                    .map(|u| u.pos)
+                    .collect();
                 if let Some(snap) = storage::MappedSnapshot::open(&load_dir, name, def.arity())? {
                     for (row_id, cells) in snap.entries() {
                         state.observe_row_id(row_id);
@@ -984,9 +1045,10 @@ impl SqlEngine {
                         if seed_pk && let Some(key) = state.pk_key(&cells) {
                             state.pk_map.insert(key, row_id);
                         }
-                        for (pos, map) in state.uniques.iter_mut() {
-                            if !matches!(cells[*pos], Value::Null) {
-                                map.insert(IndexKey(cells[*pos].clone()), row_id);
+                        for u in state.uniques.iter_mut() {
+                            if seed_unique.contains(&u.pos) && !matches!(cells[u.pos], Value::Null)
+                            {
+                                u.map.insert(IndexKey(cells[u.pos].clone()), row_id);
                             }
                         }
                     }
@@ -999,9 +1061,9 @@ impl SqlEngine {
                     if let Some(key) = state.pk_key(&cells) {
                         state.pk_map.insert(key, row_id);
                     }
-                    for (pos, map) in state.uniques.iter_mut() {
-                        if !matches!(cells[*pos], Value::Null) {
-                            map.insert(IndexKey(cells[*pos].clone()), row_id);
+                    for u in state.uniques.iter_mut() {
+                        if !matches!(cells[u.pos], Value::Null) {
+                            u.map.insert(IndexKey(cells[u.pos].clone()), row_id);
                         }
                     }
                     state.rows.insert(row_id, cells);
@@ -1770,11 +1832,8 @@ impl SqlEngine {
     pub(crate) fn unique_owner(&self, table: &str, pos: usize, key: &IndexKey) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
         let state = inner.tables.get(table)?;
-        state
-            .uniques
-            .iter()
-            .find(|(p, _)| *p == pos)
-            .and_then(|(_, map)| map.get(key).copied())
+        let u = state.uniques.iter().find(|u| u.pos == pos)?;
+        state.unique_owner_of(u, key)
     }
 
     /// The committed row currently owning PRIMARY KEY tuple `key` — the
@@ -2166,6 +2225,25 @@ impl SqlEngine {
             index_file::write_index(&new_dir, name, PK_INDEX_NAME, state.pk_cols.len(), refs)?;
         }
 
+        // Column-level UNIQUE constraints, same shape one column wide. NULLs
+        // are exempt under SQL, so they are simply not written — a key absent
+        // from the file is a key nothing owns.
+        for (name, state) in tables.iter() {
+            for u in &state.uniques {
+                let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
+                for (rid, cells) in state.rows.iter_physical() {
+                    if !matches!(cells[u.pos], Value::Null) {
+                        let key: KeyTuple =
+                            std::iter::once(IndexKey(cells[u.pos].clone())).collect();
+                        entries.entry(key).or_default().push(rid);
+                    }
+                }
+                let refs: Vec<(&KeyTuple, &[u64])> =
+                    entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
+                index_file::write_index(&new_dir, name, &unique_index_name(u.pos), 1, refs)?;
+            }
+        }
+
         // Every declared index is materialized into the generation, whether or
         // not it is currently in memory — that is what lets the next open serve
         // it from a mapping instead of rebuilding it into RAM. The sort is
@@ -2221,6 +2299,15 @@ impl SqlEngine {
                 {
                     state.pk_base = Some(base);
                     state.pk_map.clear();
+                }
+                for i in 0..state.uniques.len() {
+                    let pos = state.uniques[i].pos;
+                    if let Some(base) =
+                        index_file::MappedIndex::open(&new_dir, name, &unique_index_name(pos))?
+                    {
+                        state.uniques[i].base = Some(base);
+                        state.uniques[i].map = BTreeMap::new();
+                    }
                 }
                 // Same for the indexes: adopt the files just written and drop
                 // the in-RAM maps they now contain. The overlay restarts empty
@@ -4064,6 +4151,138 @@ mod disk_pk_tests {
         assert!(db.execute("INSERT INTO t VALUES (7, 'dup')").is_err());
         db.execute("INSERT INTO t VALUES (21, 'ok')").unwrap();
         assert_eq!(db.row_count("t").unwrap(), 21);
+    }
+}
+
+#[cfg(test)]
+mod disk_unique_tests {
+    //! Column-level `UNIQUE` served from a mapped file. Same constraint risk as
+    //! the primary key, plus one rule of its own: NULLs never collide, so they
+    //! are not written to the file at all.
+    use super::*;
+
+    fn open(dir: &std::path::Path) -> SqlEngine {
+        SqlEngine::open_with_options(
+            dir,
+            SqlOptions {
+                disk_first: true,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn has_base(db: &SqlEngine, table: &str) -> bool {
+        db.inner.lock().unwrap().tables[table]
+            .uniques
+            .iter()
+            .all(|u| u.base.is_some())
+    }
+
+    fn resident(db: &SqlEngine, table: &str) -> usize {
+        db.inner.lock().unwrap().tables[table]
+            .uniques
+            .iter()
+            .map(|u| u.map.len())
+            .sum()
+    }
+
+    fn seeded() -> (tempfile::TempDir, SqlEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE, v TEXT)")
+                .unwrap();
+            for i in 1..=20 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'u{i}@x', 'v')"))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let db = open(dir.path());
+        assert!(has_base(&db, "t"), "the checkpoint must write a $uq file");
+        (dir, db)
+    }
+
+    #[test]
+    fn the_value_set_is_not_rebuilt_in_memory() {
+        let (_d, db) = seeded();
+        assert_eq!(resident(&db, "t"), 0, "opening must not rebuild the map");
+    }
+
+    #[test]
+    fn a_duplicate_of_a_checkpointed_value_is_refused() {
+        let (_d, db) = seeded();
+        let err = db
+            .execute("INSERT INTO t VALUES (99, 'u7@x', 'dup')")
+            .unwrap_err();
+        assert!(
+            matches!(err, SqlError::DuplicateKey(_)),
+            "expected a duplicate-key error, got {err:?}"
+        );
+        assert_eq!(db.row_count("t").unwrap(), 20);
+    }
+
+    #[test]
+    fn a_deleted_rows_value_can_be_reused() {
+        let (_d, db) = seeded();
+        db.execute("DELETE FROM t WHERE id = 7").unwrap();
+        db.execute("INSERT INTO t VALUES (99, 'u7@x', 'again')")
+            .unwrap();
+        assert!(
+            db.execute("INSERT INTO t VALUES (100, 'u7@x', 'no')")
+                .is_err(),
+            "the reused value must now collide"
+        );
+    }
+
+    #[test]
+    fn a_changed_value_frees_the_old_one() {
+        let (_d, db) = seeded();
+        db.execute("UPDATE t SET email = 'moved@x' WHERE id = 7")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (99, 'u7@x', 'reused')")
+            .unwrap();
+        assert!(
+            db.execute("INSERT INTO t VALUES (100, 'moved@x', 'no')")
+                .is_err(),
+            "the new value must be taken"
+        );
+    }
+
+    /// SQL exempts NULL from `UNIQUE`, so many rows may hold it. The file must
+    /// not record them — writing one would make the second NULL a duplicate.
+    #[test]
+    fn nulls_never_collide_across_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+            db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let db = open(dir.path());
+        db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 3, "NULLs must not collide");
+    }
+
+    #[test]
+    fn values_written_after_the_checkpoint_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'a@x')").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (2, 'b@x')").unwrap();
+        }
+        let db = open(dir.path());
+        assert!(db.execute("INSERT INTO t VALUES (3, 'a@x')").is_err());
+        assert!(db.execute("INSERT INTO t VALUES (4, 'b@x')").is_err());
+        db.execute("INSERT INTO t VALUES (5, 'c@x')").unwrap();
     }
 }
 

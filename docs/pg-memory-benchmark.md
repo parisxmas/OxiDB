@@ -41,27 +41,28 @@ PostgreSQL 18.4 runs stock: `shared_buffers=128MB`, `max_connections=100`.
 | | PostgreSQL 18.4 | OxiDB (resident) | OxiDB (disk-first) |
 |---|---:|---:|---:|
 | Boot, empty database | 40 MB | **4 MB** | **4 MB** |
-| After loading | 67 MB | 522 MB | **106 MB** |
+| After loading | 69 MB | 522 MB | **68 MB** |
 | Restart, before any query | 26 MB | *4 MB** | *4 MB** |
-| **Warm — every table read** | 105 MB | 370 MB | **58 MB** |
-| **+ every index used once** | 105 MB | 520 MB | **58 MB** |
+| **Warm — every table read** | 106 MB | 370 MB | **36 MB** |
+| **+ every index used once** | 106 MB | 520 MB | **36 MB** |
 | Processes | 9 | **1** | **1** |
-| Load time | **5.6 s** | 18 s | 21 s |
-| Data directory on disk | 511 MB | 162 MB | **157 MB** |
+| Load time | **5.7 s** | 21 s | 22 s |
+| Data directory on disk | 511 MB | 173 MB | **169 MB** |
 
 \** Lazy open — see below. This number is real but does not mean what it looks
 like, and should not be quoted on its own.
 
-**In disk-first mode OxiDB now uses less memory than PostgreSQL** — 58 MB
-against 105 — and, like PostgreSQL, exercising every index does not move it.
+**In disk-first mode OxiDB now uses about a third of PostgreSQL's memory** —
+36 MB against 106 — and, like PostgreSQL, exercising every index does not move
+it.
 Resident mode is unchanged by design: it keeps rows, indexes and keys in RAM
 because that is what it is for.
 
 ### What changed, and what it cost
 
 The first run of this benchmark measured 423 MB warm in disk-first mode and
-611 MB after the load. Eight changes, each measured on the same dataset, took
-those to 58 MB and 106 MB:
+611 MB after the load. Nine changes, each measured on the same dataset, took
+those to **36 MB** and 68 MB:
 
 | Change | Effect |
 |---|---|
@@ -72,7 +73,8 @@ those to 58 MB and 106 MB:
 | Build secondary indexes on first use, not at open | 318 MB for three indexes, paid before answering anything |
 | Stop caching statements that carry their values inline | **~250 MB** of parsed bulk `INSERT`s, for a hit rate of zero |
 | **Disk-backed secondary indexes** (`.sidx`) | 318 MB resident became 41 MB on disk; using every index became free |
-| **Disk-backed primary keys** (`$pk.sidx`) | the last per-row resident structure: **163 → 58 MB** |
+| **Disk-backed primary keys** (`$pk.sidx`) | 163 → 58 MB |
+| **Disk-backed `UNIQUE` columns** (`$uq<pos>.sidx`) | the last per-row resident structure: **58 → 36 MB** |
 
 ## Read this before quoting the startup row
 
@@ -84,7 +86,7 @@ jumps it to the warm figure:
 
 ```
 after boot (no query):            4368 KB
-after 'SELECT 1' (engine open):     58 MB
+after 'SELECT 1' (engine open):     36 MB
 ```
 
 This is what made the number worth chasing rather than quoting. Before the
@@ -125,26 +127,27 @@ served by mmap; only writes since that checkpoint are resident. The file is a
 deleted or re-keyed row corrects itself without any tombstone bookkeeping.
 
 What is left resident, and why it is small: the row-offset index of the mmap'd
-`.rdat`, the `UNIQUE`-column maps (not yet moved to disk), the catalog, and the
-post-checkpoint overlays. None of them is a copy of the key set.
+`.rdat`, the catalog, and the post-checkpoint overlays. **No key set of any kind
+is held in memory** — primary keys, `UNIQUE` columns and secondary indexes are
+all mapped files.
 
 ## What OxiDB does win
 
 - **Startup floor**: 4 MB against 40 MB for an empty database, and one process
   against nine. For many small databases per host — the OxiBase multi-tenant
   case — that per-instance floor matters more than the warm figure.
-- **Disk**: 157 MB against 511 MB for the whole data directory. The `.sidx`
+- **Disk**: 169 MB against 511 MB for the whole data directory. The `.sidx`
   files are part of that — the memory did not vanish, it moved somewhere the OS
   can reclaim.
-- **Memory, now**: 58 MB against 105 MB, on the same data, with every index
+- **Memory, now**: 36 MB against 106 MB, on the same data, with every index
   used. It used to be 4× the other way.
 
 ## What this benchmark does not measure
 
 Query speed (see [the wire benchmark](wire-benchmark.md)), concurrency, larger
 datasets, or a tuned PostgreSQL. It also flatters neither engine on load time:
-5.6 s against 21 s is real, and materializing indexes at checkpoint is part of
-why OxiDB's is slower. Both went through `psql` with multi-row `INSERT`s —
+5.7 s against 22 s is real, and materializing indexes and key sets at every
+checkpoint is part of why OxiDB's is slower. Both went through `psql` with multi-row `INSERT`s —
 PostgreSQL's `COPY` would be far faster and OxiDB has no equivalent.
 
 The honest summary is that OxiDB in disk-first mode now holds no per-row
