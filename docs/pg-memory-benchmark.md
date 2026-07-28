@@ -84,13 +84,9 @@ that its data directory is a third the size, so there is less to cache.
 its whole non-evictable footprint; the other 168 MB is clean file-backed pages
 the kernel can drop under pressure. PostgreSQL's 108 MB *is* `shared_buffers`
 and a per-backend allocation — anonymous memory it will not return whatever the
-machine needs. So under memory pressure OxiDB shrinks to ~35 MB and keeps
-working from disk, while PostgreSQL's floor stays near its configured cache.
-
-That is a genuine property, and it is the one the earlier "36 MB against
-106 MB" line was accidentally describing. Stated properly: **OxiDB's
-non-evictable floor is about a third of PostgreSQL's; its total is about
-two-thirds.**
+machine needs. The obvious inference is that OxiDB should therefore survive in a smaller box.
+**It does not** — see the pressure test below, which measures rather than infers
+and finds OxiDB's floor at ~96 MB against a tuned PostgreSQL's ~64 MB.
 
 ### What changed, and what it cost
 
@@ -174,6 +170,61 @@ difference is that they are the kernel's to reclaim, not the engine's to hold.
 That is the same bargain PostgreSQL makes for its *heap* — it is `shared_buffers`
 that is not evictable, and OxiDB no longer has an equivalent.
 
+## Under actual memory pressure
+
+The `fair.sh` numbers say 83% of OxiDB's footprint is evictable against 64% of
+PostgreSQL's, which predicts that OxiDB should keep working in a tighter box.
+[`pressure.sh`](../bench/pg-memory/pressure.sh) tests that instead of inferring
+it: both engines in Linux containers with a hard `--memory` limit, same data,
+same workload, cgroup v2 — where page cache is charged to the limit and
+reclaimed under pressure, and anonymous memory is not.
+
+**The prediction was wrong.**
+
+| Memory limit | OxiDB | PostgreSQL (stock, `shared_buffers=128MB`) | PostgreSQL (`shared_buffers=32MB`) |
+|---|---|---|---|
+| 128 MB | ok | ok | ok |
+| 112 MB | ok | ok | ok |
+| 96 MB | ok | OOM-killed | ok |
+| 88 MB | **OOM-killed** | — | ok |
+| 80 MB | — | did not start | ok |
+| 64 MB | — | did not start | ok |
+| 48 MB | — | — | OOM-killed |
+
+**OxiDB's floor is ~96 MB; a tuned PostgreSQL's is ~64 MB.** OxiDB beats
+PostgreSQL *at its defaults* — it survives 96 MB where stock PostgreSQL is
+killed — but loses to a PostgreSQL told to use less, which is a one-line
+configuration change. Peak usage inside the cgroup at the floor is 94 MB.
+
+The reason the evictable share did not translate into a lower floor: the
+cgroup's own accounting shows **`anon 72 MB, file 0 MB`** for a warm OxiDB.
+What remains anonymous still scales with the data — the `.rdat` row-offset
+index is 24 bytes per row (27 MB at 1.2M rows) — on top of a 37 MB floor for an
+*empty* database. Evictable pages do not help when the non-evictable part is
+already most of what you need.
+
+### The worse finding: opening costs 4× running
+
+A database opened with an unflushed WAL tail — the state a bulk load leaves —
+peaks at **415 MB**, against the 94 MB it then runs in:
+
+```
+opening with a WAL tail:   peak 415 MB   current 254 MB
+steady state:              peak  94 MB
+```
+
+Opening replays the tail and checkpoints, and a checkpoint materializes every
+index, primary key and `UNIQUE` column as a sorted map in memory before writing
+it. **A server that runs comfortably in 128 MB cannot restart in it after a
+bulk load.** That is an operational trap, and it is a direct cost of the
+disk-backed index design: what was a steady drain became a spike.
+
+Streaming the file writes instead of assembling each one in a `Vec` was worth
+doing and did not move it — the peak is the transient sorted maps, not the
+output buffers. Fixing it properly means building an index file without holding
+all its entries at once: sort in bounded chunks and merge, the way an external
+sort does. Not done.
+
 ## What OxiDB does win
 
 - **Startup floor**: 4 MB against 40 MB for an empty database, and one process
@@ -182,30 +233,31 @@ that is not evictable, and OxiDB no longer has an equivalent.
 - **Disk**: 169 MB against 511 MB for the whole data directory. The `.sidx`
   files are part of that — the memory did not vanish, it moved somewhere the OS
   can reclaim.
-- **Non-evictable memory**: 35 MB against 108 MB. Under pressure OxiDB gives
-  back 83% of what it holds and keeps serving from disk; PostgreSQL's
-  `shared_buffers` is not returnable.
+- **Non-evictable memory**: 35 MB against 108 MB, as measured on macOS — but
+  see the pressure test below, where this does *not* translate into a lower
+  operating floor.
 - **Total physical**: 203 MB against 297 MB — a third less, largely because
   there is a third as much data directory to cache.
 
 ## What this benchmark does not measure
 
-Query speed (see [the wire benchmark](wire-benchmark.md)), concurrency, larger
-datasets, or a tuned PostgreSQL. Nor does it measure behaviour *under* memory
-pressure, which is where the evictable/non-evictable split above would actually
-be tested — that needs a constrained cgroup or container and is the obvious next
-experiment. It also flatters neither engine on load time:
+Query speed (see [the wire benchmark](wire-benchmark.md)), concurrency, or
+larger datasets. It does now measure behaviour under memory pressure, and that
+section is the one to read before believing any of the others. It also flatters neither engine on load time:
 5.7 s against 22 s is real, and materializing indexes and key sets at every
 checkpoint is part of why OxiDB's is slower. Both went through `psql` with multi-row `INSERT`s —
 PostgreSQL's `COPY` would be far faster and OxiDB has no equivalent.
 
-The honest summary is that OxiDB in disk-first mode holds no per-row structure
-in anonymous memory at all: rows, secondary indexes, primary keys and `UNIQUE`
-columns are files it maps. Its non-evictable floor is about a third of
-PostgreSQL's and does not grow with row count; its total physical use is about
-two-thirds, mostly because its files are smaller. It is not three times
-lighter — that reading came from a metric that did not count the pages it had
-moved into files.
+The honest summary: OxiDB in disk-first mode holds no *key set* in anonymous
+memory — rows, secondary indexes, primary keys and `UNIQUE` columns are files it
+maps — and that took its process memory from 423 MB to 36 MB and its total
+physical use to about two-thirds of PostgreSQL's. But it is not three times
+lighter (that came from a metric which stopped counting the pages it had moved
+into files), and it does not run in a smaller box: its floor is ~96 MB against a
+tuned PostgreSQL's ~64 MB, because what is left anonymous — a 37 MB baseline
+plus 24 bytes per row of offset index — is still most of what it needs. And
+opening after a bulk load peaks at 415 MB, which is the sharpest edge in the
+whole design.
 
 Resident mode still trades memory for speed on purpose, and is the right default
 for databases that fit comfortably in RAM.

@@ -38,23 +38,27 @@ where
     let path = rdat_path(dir, table);
     let tmp = path.with_extension("rdat.tmp");
 
-    let mut buf = Vec::with_capacity(HEADER_LEN + 64);
-    buf.extend_from_slice(RDAT_MAGIC);
-    buf.extend_from_slice(&RDAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
-
-    for (row_id, cells) in rows {
-        let payload = encode_row(cells.borrow());
-        let crc = crc32fast::hash(&payload);
-        buf.extend_from_slice(&row_id.to_le_bytes());
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&payload);
-    }
-
+    // Streamed through a BufWriter rather than assembled in one `Vec`. Building
+    // the whole file in memory first cost a second copy of the table at every
+    // checkpoint — invisible on an unconstrained machine, fatal in a cgroup: a
+    // 1.2M-row database could not open inside a 256 MB limit that it otherwise
+    // runs in comfortably, because opening replays the WAL tail and checkpoints.
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&buf)?;
+        let f = File::create(&tmp)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
+        w.write_all(RDAT_MAGIC)?;
+        w.write_all(&RDAT_VERSION.to_le_bytes())?;
+        w.write_all(&0u16.to_le_bytes())?; // flags
+
+        for (row_id, cells) in rows {
+            let payload = encode_row(cells.borrow());
+            let crc = crc32fast::hash(&payload);
+            w.write_all(&row_id.to_le_bytes())?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(&crc.to_le_bytes())?;
+            w.write_all(&payload)?;
+        }
+        let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;

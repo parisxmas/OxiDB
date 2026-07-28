@@ -73,6 +73,15 @@ pub fn write_index<'a, I>(
 where
     I: IntoIterator<Item = (&'a KeyTuple, &'a [u64])>,
 {
+    // The entry table has to be written before the key and id blobs it points
+    // into, and its offsets are only known once those blobs are laid out — so
+    // keys and ids are built up while the fixed-size table rows are collected,
+    // then the three are streamed out in order.
+    //
+    // Only the two blobs are held, not a second copy of the finished file. An
+    // earlier version assembled the whole thing in one `Vec` before writing,
+    // which doubled a checkpoint's peak and is why a 1.2M-row database could
+    // not open inside a 256 MB cgroup.
     let mut table_buf: Vec<u8> = Vec::new();
     let mut keys: Vec<u8> = Vec::new();
     let mut ids: Vec<u8> = Vec::new();
@@ -101,21 +110,23 @@ where
         count += 1;
     }
 
-    let mut buf = Vec::with_capacity(HEADER_LEN + table_buf.len() + keys.len() + ids.len());
-    buf.extend_from_slice(SIDX_MAGIC);
-    buf.extend_from_slice(&SIDX_VERSION.to_le_bytes());
-    buf.extend_from_slice(&(slots as u16).to_le_bytes());
-    buf.extend_from_slice(&count.to_le_bytes());
-    buf.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&table_buf);
-    buf.extend_from_slice(&keys);
-    buf.extend_from_slice(&ids);
-
     let path = sidx_path(dir, table, index);
     let tmp = path.with_extension("sidx.tmp");
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&buf)?;
+        let f = File::create(&tmp)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
+        w.write_all(SIDX_MAGIC)?;
+        w.write_all(&SIDX_VERSION.to_le_bytes())?;
+        w.write_all(&(slots as u16).to_le_bytes())?;
+        w.write_all(&count.to_le_bytes())?;
+        w.write_all(&(keys.len() as u64).to_le_bytes())?;
+        w.write_all(&table_buf)?;
+        drop(table_buf);
+        w.write_all(&keys)?;
+        drop(keys);
+        w.write_all(&ids)?;
+        drop(ids);
+        let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
