@@ -138,11 +138,6 @@ impl RowIds {
     fn iter(&self) -> impl Iterator<Item = &u64> {
         self.0.iter()
     }
-
-    /// The ids as a sorted slice — what the on-disk index format writes.
-    fn as_slice(&self) -> &[u64] {
-        &self.0
-    }
 }
 
 /// One column-level `UNIQUE` constraint: the value -> row id mapping that
@@ -1106,8 +1101,11 @@ impl SqlEngine {
         // 5. Replay the WAL past the manifest watermark (idempotent). Records at
         //    or below it are already folded into the snapshots above.
         let (wal, records) = Wal::open_since(&dir, watermark)?;
-        for rec in &records {
-            Self::apply_live(&mut catalog, &mut tables, rec, opts.disk_first);
+        // Consumed, not borrowed: each record's payload is freed as soon as it
+        // has been applied. Holding the whole parsed tail alive across the loop
+        // put a second copy of it beside the overlay it was building.
+        for rec in records {
+            Self::apply_live(&mut catalog, &mut tables, &rec, opts.disk_first);
         }
 
         // Everything already in the WAL at open is on disk (it was read from
@@ -2207,48 +2205,49 @@ impl SqlEngine {
         for (name, state) in tables.iter() {
             storage::write_snapshot(&new_dir, name, state.rows.iter_physical())?;
         }
-        // The primary key is materialized the same way, from the rows — with a
-        // base present the map is only an overlay, so the rows are the one
-        // source that reflects both.
+        // Primary keys, UNIQUE columns and secondary indexes are all
+        // materialized into the generation, whether or not they are currently
+        // in memory — that is what lets the next open serve them from a mapping
+        // instead of rebuilding them into RAM.
+        //
+        // Each streams through an `IndexBuilder`, which sorts in bounded chunks
+        // and spills. Collecting the entries into a map first was simpler and
+        // made a checkpoint's peak proportional to the table: a 1.2M-row
+        // database peaked at 415 MB opening against the 94 MB it then ran in,
+        // so it could not restart inside a limit it ran fine in.
         for (name, state) in tables.iter() {
-            if state.pk_cols.is_empty() {
-                continue;
-            }
-            let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
-            for (rid, cells) in state.rows.iter_physical() {
-                if let Some(key) = state.pk_key(&cells) {
-                    entries.entry(key).or_default().push(rid);
-                }
-            }
-            let refs: Vec<(&KeyTuple, &[u64])> =
-                entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
-            index_file::write_index(&new_dir, name, PK_INDEX_NAME, state.pk_cols.len(), refs)?;
-        }
-
-        // Column-level UNIQUE constraints, same shape one column wide. NULLs
-        // are exempt under SQL, so they are simply not written — a key absent
-        // from the file is a key nothing owns.
-        for (name, state) in tables.iter() {
-            for u in &state.uniques {
-                let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
+            if !state.pk_cols.is_empty() {
+                let mut b = index_file::IndexBuilder::new(
+                    &new_dir,
+                    name,
+                    PK_INDEX_NAME,
+                    state.pk_cols.len(),
+                );
                 for (rid, cells) in state.rows.iter_physical() {
-                    if !matches!(cells[u.pos], Value::Null) {
-                        let key: KeyTuple =
-                            std::iter::once(IndexKey(cells[u.pos].clone())).collect();
-                        entries.entry(key).or_default().push(rid);
+                    if let Some(key) = state.pk_key(&cells) {
+                        b.push(key, rid)?;
                     }
                 }
-                let refs: Vec<(&KeyTuple, &[u64])> =
-                    entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
-                index_file::write_index(&new_dir, name, &unique_index_name(u.pos), 1, refs)?;
+                b.finish()?;
+            }
+
+            // NULLs are exempt from UNIQUE under SQL, so they are simply not
+            // written — a key absent from the file is a key nothing owns.
+            for u in &state.uniques {
+                let mut b =
+                    index_file::IndexBuilder::new(&new_dir, name, &unique_index_name(u.pos), 1);
+                for (rid, cells) in state.rows.iter_physical() {
+                    if !matches!(cells[u.pos], Value::Null) {
+                        b.push(
+                            std::iter::once(IndexKey(cells[u.pos].clone())).collect(),
+                            rid,
+                        )?;
+                    }
+                }
+                b.finish()?;
             }
         }
 
-        // Every declared index is materialized into the generation, whether or
-        // not it is currently in memory — that is what lets the next open serve
-        // it from a mapping instead of rebuilding it into RAM. The sort is
-        // transient: it lives for one index, at a moment already doing bulk IO,
-        // rather than for the life of the process.
         for def in catalog.indexes.values() {
             let Some(state) = tables.get(&def.table) else {
                 continue;
@@ -2256,23 +2255,26 @@ impl SqlEngine {
             let Some(idx) = state.indexes.get(&def.name) else {
                 continue;
             };
-            // A populated index is already the whole truth, in key order — write
-            // it straight out. Otherwise (a mapped base plus an overlay, or an
-            // index never built) rebuild from the rows, which is the only source
-            // that reflects both.
+            let mut b =
+                index_file::IndexBuilder::new(&new_dir, &def.table, &def.name, idx.col_pos.len());
             if idx.populated {
-                let refs: Vec<(&KeyTuple, &[u64])> =
-                    idx.map.iter().map(|(k, v)| (k, v.as_slice())).collect();
-                index_file::write_index(&new_dir, &def.table, &def.name, idx.col_pos.len(), refs)?;
-            } else {
-                let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
-                for (rid, cells) in state.rows.iter_physical() {
-                    entries.entry(idx.key_of(&cells)).or_default().push(rid);
+                // Already the whole truth, in key order — feed it straight
+                // through; the builder will not spill on an ordered stream any
+                // sooner than on an unordered one, and this avoids re-reading
+                // every row.
+                for (key, ids) in idx.map.iter() {
+                    for id in ids.iter() {
+                        b.push(key.clone(), *id)?;
+                    }
                 }
-                let refs: Vec<(&KeyTuple, &[u64])> =
-                    entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
-                index_file::write_index(&new_dir, &def.table, &def.name, idx.col_pos.len(), refs)?;
+            } else {
+                // A mapped base plus an overlay, or an index never built: the
+                // rows are the only source that reflects both.
+                for (rid, cells) in state.rows.iter_physical() {
+                    b.push(idx.key_of(&cells), rid)?;
+                }
             }
+            b.finish()?;
         }
         catalog.save(&new_dir)?;
 

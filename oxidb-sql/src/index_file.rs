@@ -59,78 +59,248 @@ pub fn sidx_path(dir: &Path, table: &str, index: &str) -> PathBuf {
     dir.join(format!("{table}.{index}.sidx"))
 }
 
-/// Write `entries` — which **must** be sorted ascending by key — as a `.sidx`.
-///
-/// Atomic: built in memory, written to a temp file, fsynced, then renamed, so a
-/// crash mid-checkpoint leaves the previous generation's file untouched.
-pub fn write_index<'a, I>(
-    dir: &Path,
-    table: &str,
-    index: &str,
-    slots: usize,
-    entries: I,
-) -> Result<()>
-where
-    I: IntoIterator<Item = (&'a KeyTuple, &'a [u64])>,
-{
-    // The entry table has to be written before the key and id blobs it points
-    // into, and its offsets are only known once those blobs are laid out — so
-    // keys and ids are built up while the fixed-size table rows are collected,
-    // then the three are streamed out in order.
-    //
-    // Only the two blobs are held, not a second copy of the finished file. An
-    // earlier version assembled the whole thing in one `Vec` before writing,
-    // which doubled a checkpoint's peak and is why a 1.2M-row database could
-    // not open inside a 256 MB cgroup.
-    let mut table_buf: Vec<u8> = Vec::new();
-    let mut keys: Vec<u8> = Vec::new();
-    let mut ids: Vec<u8> = Vec::new();
-    let mut count: u64 = 0;
+/// Entries buffered before a sort-and-spill. At ~40 bytes an entry this is a
+/// few megabytes — small enough that a checkpoint's peak stops tracking the
+/// table, large enough that an ordinary table produces one run and never
+/// touches the merge path.
+const SPILL_ENTRIES: usize = 131_072;
 
-    for (key, row_ids) in entries {
-        // `IndexKey` is a transparent newtype over `Value`, but the codec takes
-        // values, so unwrap the tuple for encoding.
+/// Builds a `.sidx` from an unordered stream of `(key, row_id)` pairs in
+/// **bounded memory**.
+///
+/// The obvious implementation — collect everything into a `BTreeMap`, sort by
+/// construction, write it out — is what made a checkpoint's peak proportional
+/// to the table. That was invisible until the memory-pressure test: a 1.2M-row
+/// database peaked at 415 MB opening, against the 94 MB it then ran in, so a
+/// server sized for its steady state could not restart after a bulk load.
+///
+/// This is an external sort. Pairs accumulate until `SPILL_ENTRIES`, then get
+/// sorted and written to a run file and the buffer is cleared; at the end the
+/// runs and the final buffer are merged k-way, coalescing equal keys, straight
+/// into the output. Memory is the buffer plus one small read block per run.
+///
+/// The output is byte-identical to what the in-memory version produced — the
+/// reader is untouched.
+pub struct IndexBuilder {
+    dir: PathBuf,
+    table: String,
+    index: String,
+    slots: usize,
+    buf: Vec<(KeyTuple, u64)>,
+    runs: Vec<PathBuf>,
+}
+
+/// `[key_len u32][key bytes][id_count u32][ids u64…]`, entries ascending by key.
+/// A private spill format — never read after the merge, never left behind.
+fn write_run(path: &Path, entries: &[(KeyTuple, Vec<u64>)]) -> Result<()> {
+    let f = File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
+    for (key, ids) in entries {
         let cells: Vec<Value> = key.iter().map(|k| k.0.clone()).collect();
         let encoded = encode_row(&cells);
-        let key_off = keys.len() as u32;
-        let key_len = encoded.len() as u32;
-        keys.extend_from_slice(&encoded);
-
-        // Element index, not a byte offset — the reader scales by 8.
-        let ids_off = (ids.len() / 8) as u32;
-        for id in row_ids {
-            ids.extend_from_slice(&id.to_le_bytes());
+        w.write_all(&(encoded.len() as u32).to_le_bytes())?;
+        w.write_all(&encoded)?;
+        w.write_all(&(ids.len() as u32).to_le_bytes())?;
+        for id in ids {
+            w.write_all(&id.to_le_bytes())?;
         }
-        let ids_len = row_ids.len() as u32;
-
-        table_buf.extend_from_slice(&key_off.to_le_bytes());
-        table_buf.extend_from_slice(&key_len.to_le_bytes());
-        table_buf.extend_from_slice(&ids_off.to_le_bytes());
-        table_buf.extend_from_slice(&ids_len.to_le_bytes());
-        count += 1;
     }
-
-    let path = sidx_path(dir, table, index);
-    let tmp = path.with_extension("sidx.tmp");
-    {
-        let f = File::create(&tmp)?;
-        let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
-        w.write_all(SIDX_MAGIC)?;
-        w.write_all(&SIDX_VERSION.to_le_bytes())?;
-        w.write_all(&(slots as u16).to_le_bytes())?;
-        w.write_all(&count.to_le_bytes())?;
-        w.write_all(&(keys.len() as u64).to_le_bytes())?;
-        w.write_all(&table_buf)?;
-        drop(table_buf);
-        w.write_all(&keys)?;
-        drop(keys);
-        w.write_all(&ids)?;
-        drop(ids);
-        let f = w.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
+    w.flush()?;
     Ok(())
+}
+
+/// One spill file, read back an entry at a time.
+struct RunReader {
+    r: std::io::BufReader<File>,
+    slots: usize,
+    head: Option<(KeyTuple, Vec<u64>)>,
+}
+
+impl RunReader {
+    fn open(path: &Path, slots: usize) -> Result<RunReader> {
+        let mut rr = RunReader {
+            r: std::io::BufReader::with_capacity(1 << 16, File::open(path)?),
+            slots,
+            head: None,
+        };
+        rr.advance()?;
+        Ok(rr)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        use std::io::Read;
+        let mut u32b = [0u8; 4];
+        if self.r.read_exact(&mut u32b).is_err() {
+            self.head = None;
+            return Ok(());
+        }
+        let klen = u32::from_le_bytes(u32b) as usize;
+        let mut kbuf = vec![0u8; klen];
+        self.r.read_exact(&mut kbuf)?;
+        let key: KeyTuple = decode_row(&kbuf, self.slots)?
+            .into_iter()
+            .map(IndexKey)
+            .collect();
+        self.r.read_exact(&mut u32b)?;
+        let n = u32::from_le_bytes(u32b) as usize;
+        let mut ids = Vec::with_capacity(n);
+        let mut idb = [0u8; 8];
+        for _ in 0..n {
+            self.r.read_exact(&mut idb)?;
+            ids.push(u64::from_le_bytes(idb));
+        }
+        self.head = Some((key, ids));
+        Ok(())
+    }
+}
+
+impl IndexBuilder {
+    pub fn new(dir: &Path, table: &str, index: &str, slots: usize) -> IndexBuilder {
+        IndexBuilder {
+            dir: dir.to_path_buf(),
+            table: table.to_string(),
+            index: index.to_string(),
+            slots,
+            buf: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, key: KeyTuple, row_id: u64) -> Result<()> {
+        self.buf.push((key, row_id));
+        if self.buf.len() >= SPILL_ENTRIES {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Sort the buffer, coalesce equal keys, and write it out as a run.
+    fn spill(&mut self) -> Result<()> {
+        let grouped = Self::drain_sorted(&mut self.buf);
+        let path = self.dir.join(format!(
+            "{}.{}.run{}",
+            self.table,
+            self.index,
+            self.runs.len()
+        ));
+        write_run(&path, &grouped)?;
+        self.runs.push(path);
+        Ok(())
+    }
+
+    /// `(key, row_id)` pairs -> ascending, coalesced `(key, ids)` groups.
+    fn drain_sorted(buf: &mut Vec<(KeyTuple, u64)>) -> Vec<(KeyTuple, Vec<u64>)> {
+        buf.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut out: Vec<(KeyTuple, Vec<u64>)> = Vec::new();
+        for (key, rid) in buf.drain(..) {
+            match out.last_mut() {
+                Some((k, ids)) if *k == key => ids.push(rid),
+                _ => out.push((key, vec![rid])),
+            }
+        }
+        out
+    }
+
+    /// Merge every run and the remaining buffer into the final `.sidx`.
+    pub fn finish(mut self) -> Result<()> {
+        let tail = Self::drain_sorted(&mut self.buf);
+
+        // Sections are written to separate temp files because the entry table
+        // has to precede the blobs it points into, while its offsets are only
+        // known as the blobs are laid out. Concatenating three streams keeps
+        // the whole thing O(1) in memory; holding them was the second half of
+        // the peak this class exists to remove.
+        let base = self.dir.join(format!("{}.{}", self.table, self.index));
+        let (tp, kp, ip) = (
+            base.with_extension("tbl.tmp"),
+            base.with_extension("key.tmp"),
+            base.with_extension("ids.tmp"),
+        );
+        let mut tw = std::io::BufWriter::with_capacity(1 << 16, File::create(&tp)?);
+        let mut kw = std::io::BufWriter::with_capacity(1 << 16, File::create(&kp)?);
+        let mut iw = std::io::BufWriter::with_capacity(1 << 16, File::create(&ip)?);
+
+        let mut readers: Vec<RunReader> = Vec::new();
+        for r in &self.runs {
+            readers.push(RunReader::open(r, self.slots)?);
+        }
+        let mut tail_iter = tail.into_iter().peekable();
+
+        let (mut count, mut keys_len, mut ids_at) = (0u64, 0u64, 0u32);
+        loop {
+            // Smallest head across the runs and the in-memory tail.
+            let mut best: Option<(KeyTuple, Option<usize>)> = None;
+            for (i, rr) in readers.iter().enumerate() {
+                if let Some((k, _)) = &rr.head
+                    && best.as_ref().is_none_or(|(b, _)| k < b)
+                {
+                    best = Some((k.clone(), Some(i)));
+                }
+            }
+            if let Some((k, _)) = tail_iter.peek()
+                && best.as_ref().is_none_or(|(b, _)| k < b)
+            {
+                best = Some((k.clone(), None));
+            }
+            let Some((key, _)) = best else { break };
+
+            // Every source holding that key contributes its ids.
+            let mut ids: Vec<u64> = Vec::new();
+            for rr in readers.iter_mut() {
+                while rr.head.as_ref().is_some_and(|(k, _)| *k == key) {
+                    ids.extend(rr.head.take().expect("checked").1);
+                    rr.advance()?;
+                }
+            }
+            while tail_iter.peek().is_some_and(|(k, _)| *k == key) {
+                ids.extend(tail_iter.next().expect("checked").1);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+
+            let cells: Vec<Value> = key.iter().map(|k| k.0.clone()).collect();
+            let encoded = encode_row(&cells);
+            tw.write_all(&(keys_len as u32).to_le_bytes())?;
+            tw.write_all(&(encoded.len() as u32).to_le_bytes())?;
+            tw.write_all(&ids_at.to_le_bytes())?;
+            tw.write_all(&(ids.len() as u32).to_le_bytes())?;
+            kw.write_all(&encoded)?;
+            keys_len += encoded.len() as u64;
+            for id in &ids {
+                iw.write_all(&id.to_le_bytes())?;
+            }
+            ids_at += ids.len() as u32;
+            count += 1;
+        }
+        tw.flush()?;
+        kw.flush()?;
+        iw.flush()?;
+        drop((tw, kw, iw));
+
+        let path = sidx_path(&self.dir, &self.table, &self.index);
+        let tmp = path.with_extension("sidx.tmp");
+        {
+            let f = File::create(&tmp)?;
+            let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
+            w.write_all(SIDX_MAGIC)?;
+            w.write_all(&SIDX_VERSION.to_le_bytes())?;
+            w.write_all(&(self.slots as u16).to_le_bytes())?;
+            w.write_all(&count.to_le_bytes())?;
+            w.write_all(&keys_len.to_le_bytes())?;
+            for part in [&tp, &kp, &ip] {
+                let mut r = std::io::BufReader::with_capacity(1 << 16, File::open(part)?);
+                std::io::copy(&mut r, &mut w)?;
+            }
+            let f = w.into_inner().map_err(|e| e.into_error())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+
+        for junk in [tp, kp, ip].iter().chain(self.runs.iter()) {
+            let _ = fs::remove_file(junk);
+        }
+        Ok(())
+    }
 }
 
 /// A `.sidx` mapped into the address space.
@@ -267,10 +437,20 @@ mod tests {
         vals.iter().cloned().map(IndexKey).collect()
     }
 
+    /// Feed entries through the builder in a deliberately *unsorted* order —
+    /// the builder is responsible for ordering, so handing it sorted input
+    /// would test less than it looks like it does.
     fn roundtrip(dir: &Path, entries: &[(KeyTuple, Vec<u64>)], slots: usize) -> MappedIndex {
-        let refs: Vec<(&KeyTuple, &[u64])> =
-            entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
-        write_index(dir, "t", "i", slots, refs).unwrap();
+        let mut b = IndexBuilder::new(dir, "t", "i", slots);
+        let mut flat: Vec<(KeyTuple, u64)> = entries
+            .iter()
+            .flat_map(|(k, ids)| ids.iter().map(move |id| (k.clone(), *id)))
+            .collect();
+        flat.reverse();
+        for (k, id) in flat {
+            b.push(k, id).unwrap();
+        }
+        b.finish().unwrap();
         MappedIndex::open(dir, "t", "i").unwrap().unwrap()
     }
 
@@ -331,6 +511,50 @@ mod tests {
             MappedIndex::open(dir.path(), "nope", "nope")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Everything above stays inside one buffer, so it never reaches the merge.
+    /// This crosses `SPILL_ENTRIES` several times, with keys shuffled so runs
+    /// genuinely overlap and duplicate keys land in different runs — the case
+    /// where a merge that failed to coalesce would show up.
+    #[test]
+    fn spilled_runs_merge_back_into_one_sorted_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let n: i64 = (SPILL_ENTRIES as i64) * 3 + 777;
+        let mut b = IndexBuilder::new(dir.path(), "t", "i", 1);
+        // Two row ids per key, pushed far apart so they fall in different runs,
+        // and an order that is neither ascending nor descending.
+        for pass in 0..2 {
+            for i in 0..n {
+                let k = (i * 7919) % n; // coprime stride: a full, scrambled cycle
+                b.push(key(&[Value::Int(k)]), (k as u64) * 2 + pass)
+                    .unwrap();
+            }
+        }
+        b.finish().unwrap();
+
+        let idx = MappedIndex::open(dir.path(), "t", "i").unwrap().unwrap();
+        assert_eq!(idx.len(), n as usize, "one entry per distinct key");
+        for k in [0i64, 1, n / 3, n / 2, n - 1] {
+            assert_eq!(
+                idx.get(&key(&[Value::Int(k)])).unwrap(),
+                vec![k as u64 * 2, k as u64 * 2 + 1],
+                "key {k} lost an id across the merge"
+            );
+        }
+        assert!(idx.get(&key(&[Value::Int(n)])).unwrap().is_empty());
+
+        // No spill files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|f| !f.ends_with(".sidx"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
         );
     }
 

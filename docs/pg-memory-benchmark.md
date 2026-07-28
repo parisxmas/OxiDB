@@ -203,27 +203,43 @@ index is 24 bytes per row (27 MB at 1.2M rows) — on top of a 37 MB floor for a
 *empty* database. Evictable pages do not help when the non-evictable part is
 already most of what you need.
 
-### The worse finding: opening costs 4× running
+### The worse finding: opening costs more than running
 
 A database opened with an unflushed WAL tail — the state a bulk load leaves —
-peaks at **415 MB**, against the 94 MB it then runs in:
+peaks well above the ~94 MB it then runs in. Opening replays the tail and
+checkpoints, and both halves of that were holding whole-table structures:
 
-```
-opening with a WAL tail:   peak 415 MB   current 254 MB
-steady state:              peak  94 MB
-```
+| | Peak opening |
+|---|---:|
+| Originally | 415 MB |
+| Index files built in bounded chunks (external sort) | 365 MB |
+| WAL records freed as they are applied | **328 MB** |
 
-Opening replays the tail and checkpoints, and a checkpoint materializes every
-index, primary key and `UNIQUE` column as a sorted map in memory before writing
-it. **A server that runs comfortably in 128 MB cannot restart in it after a
-bulk load.** That is an operational trap, and it is a direct cost of the
-disk-backed index design: what was a steady drain became a spike.
+The steady-state floor is unchanged at ~96 MB, so neither change cost anything.
 
-Streaming the file writes instead of assembling each one in a `Vec` was worth
-doing and did not move it — the peak is the transient sorted maps, not the
-output buffers. Fixing it properly means building an index file without holding
-all its entries at once: sort in bounded chunks and merge, the way an external
-sort does. Not done.
+**What was fixed.** A checkpoint used to collect every index, primary key and
+`UNIQUE` column into a `BTreeMap` before writing it, making its peak
+proportional to the table. `IndexBuilder` is an external sort instead: pairs
+accumulate to a bounded buffer, get sorted and spilled to a run file, and the
+runs are merged k-way straight into the output. The three file sections go to
+temp files and are concatenated, so nothing holds a copy of the finished index
+either. Separately, `Wal::open_since` hands back the parsed tail as a `Vec` and
+the replay loop *borrowed* it, keeping every record alive beside the overlay it
+was building; consuming it frees each record as it is applied.
+
+**What is still there, and why.** The remaining ~230 MB above steady state is
+the overlay itself: replaying a WAL tail materializes every pending row before
+a checkpoint can fold it. Bounding that means checkpointing *during* the
+replay, and that is not a small change — `checkpoint_locked` truncates the live
+WAL and records `wal.last_seq()` as the watermark, so calling it mid-replay
+would declare records folded that had not been applied yet and then delete
+them. Doing it safely needs the watermark to track the last *applied* sequence
+and truncation to be deferred. Worth doing; not done here, and not worth
+rushing given what it can lose.
+
+The practical shape of the trap is unchanged: a server sized for its steady
+state cannot restart immediately after a bulk load. The margin needed is now
+about 3.5× steady state rather than 4.5×.
 
 ## What OxiDB does win
 
@@ -256,8 +272,8 @@ lighter (that came from a metric which stopped counting the pages it had moved
 into files), and it does not run in a smaller box: its floor is ~96 MB against a
 tuned PostgreSQL's ~64 MB, because what is left anonymous — a 37 MB baseline
 plus 24 bytes per row of offset index — is still most of what it needs. And
-opening after a bulk load peaks at 415 MB, which is the sharpest edge in the
-whole design.
+opening after a bulk load still peaks at 328 MB against a 94 MB steady state,
+which is the sharpest edge in the design.
 
 Resident mode still trades memory for speed on purpose, and is the right default
 for databases that fit comfortably in RAM.
