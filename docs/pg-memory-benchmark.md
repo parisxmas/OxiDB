@@ -41,28 +41,28 @@ PostgreSQL 18.4 runs stock: `shared_buffers=128MB`, `max_connections=100`.
 | | PostgreSQL 18.4 | OxiDB (resident) | OxiDB (disk-first) |
 |---|---:|---:|---:|
 | Boot, empty database | 39 MB | **4 MB** | **4 MB** |
-| After loading 1M rows | 69 MB | 521 MB | 363 MB |
+| After loading 1M rows | 71 MB | 522 MB | **197 MB** |
 | Restart, before any query | 26 MB | *4 MB** | *4 MB** |
-| **Warm — every table read** | 106 MB | 370 MB | **162 MB** |
-| **+ every index used once** | **106 MB** | 520 MB | 311 MB |
+| **Warm — every table read** | 105 MB | 370 MB | **163 MB** |
+| **+ every index used once** | 105 MB | 520 MB | **163 MB** |
 | Processes | 9 | **1** | **1** |
 | Load time | **7.4 s** | 19 s | 19 s |
-| Data directory on disk | 504 MB | 81 MB | **74 MB** |
+| Data directory on disk | 504 MB | 122 MB | **115 MB** |
 
 \** Lazy open — see below. This number is real but does not mean what it looks
 like, and should not be quoted on its own.
 
-The two warm rows are both needed. OxiDB builds a secondary index when a query
-first wants it, so a workload that scans and never seeks pays for none of them;
-PostgreSQL reads index pages on demand too, but its cache is capped, so the same
-step barely moves it. Quoting only the first row would flatter OxiDB by choosing
-its favourable workload.
+The two warm rows are both needed, and in disk-first mode they are now the same
+number: **using every index costs nothing**, the flat shape PostgreSQL has and
+for the same reason — the index is a file, not a resident map. Resident mode
+still keeps indexes in RAM by design, which is what the 370 → 520 MB step is.
 
 ### What changed, and what it cost
 
 The first run of this benchmark measured 423 MB warm in disk-first mode, and
-611 MB immediately after the load. Six changes, each measured on the same
-dataset, took those to 162 MB and 363 MB (311 MB with every index exercised):
+611 MB immediately after the load. Seven changes, each measured on the same
+dataset, took those to **163 MB** warm and 197 MB after the load — and, unlike
+before, exercising every index does not move the warm figure at all:
 
 | Change | Effect |
 |---|---|
@@ -72,6 +72,7 @@ dataset, took those to 162 MB and 363 MB (311 MB with every index exercised):
 | Fold the replayed WAL tail at open (disk-first) | a 55 MB WAL tail cost 60 MB of resident overlay |
 | Build secondary indexes on first use, not at open | 318 MB for three indexes on 1M rows, paid before answering anything |
 | Stop caching statements that carry their values inline | **~250 MB** of parsed bulk `INSERT`s, for a hit rate of zero |
+| Disk-backed secondary indexes (`.sidx`, disk-first) | 318 MB of resident index became **41 MB on disk**; using every index now costs nothing |
 
 ## Read this before quoting the startup row
 

@@ -16,6 +16,7 @@ mod cobra;
 mod decimal;
 mod error;
 mod executor;
+mod index_file;
 pub mod json;
 mod manifest;
 mod parser;
@@ -137,6 +138,11 @@ impl RowIds {
     fn iter(&self) -> impl Iterator<Item = &u64> {
         self.0.iter()
     }
+
+    /// The ids as a sorted slice — what the on-disk index format writes.
+    fn as_slice(&self) -> &[u64] {
+        &self.0
+    }
 }
 
 /// PRIMARY KEY tuple -> `row_id`, in whichever representation the key shape
@@ -255,6 +261,10 @@ struct SecondaryIndex {
     col_pos: Vec<usize>,
     map: BTreeMap<KeyTuple, RowIds>,
     populated: bool,
+    /// The last checkpoint's `.sidx`, mapped. When present the index is served
+    /// from it plus `map` as an overlay of changes since, and `populated` stays
+    /// false — there is nothing to populate, which is the point.
+    base: Option<index_file::MappedIndex>,
 }
 
 impl SecondaryIndex {
@@ -263,6 +273,30 @@ impl SecondaryIndex {
             .iter()
             .map(|&p| IndexKey(cells[p].clone()))
             .collect()
+    }
+
+    /// Row ids that *might* match `key`: the mapped base plus the overlay.
+    ///
+    /// Candidates only — the base describes the rows as they were at the last
+    /// checkpoint, so callers must check each against the live row. See
+    /// [`index_file`] for why that is cheaper than maintaining tombstones.
+    fn candidates(&self, key: &[IndexKey]) -> Result<Vec<u64>> {
+        let mut ids = match &self.base {
+            Some(base) => base.get(key)?,
+            None => Vec::new(),
+        };
+        if let Some(extra) = self.map.get(key) {
+            ids.extend(extra.iter().copied());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Whether this index can answer a lookup at all: either it has a mapped
+    /// base, or it has been populated in memory.
+    fn usable(&self) -> bool {
+        self.base.is_some() || self.populated
     }
 }
 
@@ -459,6 +493,7 @@ impl TableState {
             col_pos,
             map: BTreeMap::new(),
             populated: true,
+            base: None,
         };
         // `col_pos` are physical positions, so index the physical rows.
         for (rid, cells) in self.rows.iter_physical() {
@@ -488,6 +523,7 @@ impl TableState {
                 col_pos,
                 map: BTreeMap::new(),
                 populated: false,
+                base: None,
             },
         );
         Ok(())
@@ -499,7 +535,10 @@ impl TableState {
         let Some(idx) = self.indexes.get(index_name) else {
             return;
         };
-        if idx.populated {
+        // A mapped base already answers lookups; building the map as well would
+        // put the whole index back in RAM, which is what the base exists to
+        // avoid.
+        if idx.populated || idx.base.is_some() {
             return;
         }
         let col_pos = idx.col_pos.clone();
@@ -519,7 +558,10 @@ impl TableState {
 
     fn index_insert(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
-            if !idx.populated {
+            // An index with a mapped base is live: its `map` is the overlay of
+            // changes since the checkpoint the base describes. Only a declared-
+            // but-never-built index is skipped.
+            if !idx.usable() {
                 continue;
             }
             let key = idx.key_of(cells);
@@ -537,7 +579,7 @@ impl TableState {
 
     fn index_remove(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
-            if !idx.populated {
+            if !idx.usable() {
                 continue;
             }
             let key = idx.key_of(cells);
@@ -917,22 +959,42 @@ impl SqlEngine {
             tables.insert(name.clone(), state);
         }
 
-        // 4. Replay the WAL past the manifest watermark (idempotent). Records at
+        // 4. Register the catalog's indexes **before** replaying, and map each
+        //    one's `.sidx` where the generation has it.
+        //
+        //    Order matters. A mapped base describes the rows as of the
+        //    checkpoint; the records replayed below are exactly the ones it
+        //    does not know about. Registering first means those records go
+        //    through the normal write path and land in the overlay. Doing it
+        //    afterwards — as this once did — left the base current only to the
+        //    checkpoint and the overlay empty, so every row written since was
+        //    invisible to an indexed lookup.
+        //
+        //    An index with no `.sidx` (never checkpointed, or created after the
+        //    last one) stays declared-but-unbuilt and is built on first use.
+        let defs: Vec<IndexDef> = catalog.indexes.values().cloned().collect();
+        for def in defs {
+            let Some(state) = tables.get_mut(&def.table) else {
+                continue;
+            };
+            if state.indexes.contains_key(&def.name) {
+                continue;
+            }
+            let _ = state.declare_index(&def.name, &def.columns);
+            if opts.disk_first
+                && let Ok(Some(base)) =
+                    index_file::MappedIndex::open(&load_dir, &def.table, &def.name)
+                && let Some(idx) = state.indexes.get_mut(&def.name)
+            {
+                idx.base = Some(base);
+            }
+        }
+
+        // 5. Replay the WAL past the manifest watermark (idempotent). Records at
         //    or below it are already folded into the snapshots above.
         let (wal, records) = Wal::open_since(&dir, watermark)?;
         for rec in &records {
             Self::apply_live(&mut catalog, &mut tables, rec, opts.disk_first);
-        }
-
-        // 5. Build any indexes that existed before the last checkpoint (they are
-        //    in the loaded catalog but not in the replayed WAL tail).
-        let defs: Vec<IndexDef> = catalog.indexes.values().cloned().collect();
-        for def in defs {
-            if let Some(state) = tables.get_mut(&def.table)
-                && !state.indexes.contains_key(&def.name)
-            {
-                let _ = state.declare_index(&def.name, &def.columns);
-            }
         }
 
         // Everything already in the WAL at open is on disk (it was read from
@@ -1726,9 +1788,9 @@ impl SqlEngine {
         if !state.indexes.contains_key(&def.name) {
             return Ok(None);
         }
-        // First real use of this index since open: build it now. `state` is
-        // reborrowed mutably for exactly this, then dropped back to a shared
-        // borrow for the lookup itself.
+        // First real use of an index that has no mapped base: build it now.
+        // `state` is reborrowed mutably for exactly this, then dropped back to a
+        // shared borrow for the lookup itself.
         let name = def.name.clone();
         let key_cols: Vec<String> = def.columns.clone();
         let state = inner
@@ -1737,7 +1799,7 @@ impl SqlEngine {
             .expect("looked up immediately above");
         state.populate_index(&name);
         let state = &*state;
-        let idx = state.indexes.get(&name).expect("just populated");
+        let idx = state.indexes.get(&name).expect("checked above");
         let key: KeyTuple = key_cols
             .iter()
             .map(|c| {
@@ -1745,13 +1807,25 @@ impl SqlEngine {
                 IndexKey(v.clone())
             })
             .collect();
-        let rows = match idx.map.get(&key) {
-            Some(ids) => ids
-                .iter()
-                .filter_map(|id| state.rows.get(*id).map(|c| (*id, c)))
-                .collect(),
-            None => Vec::new(),
-        };
+        // Candidates from the mapped base and the overlay, each **verified**
+        // against the live row. The base is the last checkpoint's view, so it
+        // can name a row that has since been deleted (gone from the store) or
+        // whose indexed columns have changed (no longer matches the key).
+        // Checking costs one comparison on a row we are fetching anyway.
+        // `col_pos` are PHYSICAL positions, so the key is recomputed from the
+        // physical row — a table with a dropped column has a shorter logical
+        // row, and checking against that would read the wrong cells.
+        let rows: store::Rows = idx
+            .candidates(&key)?
+            .into_iter()
+            .filter(|id| {
+                state
+                    .rows
+                    .get_physical(*id)
+                    .is_some_and(|phys| idx.key_of(&phys) == key)
+            })
+            .filter_map(|id| state.rows.get(id).map(|c| (id, c)))
+            .collect();
         Ok(Some(rows))
     }
 
@@ -2024,6 +2098,36 @@ impl SqlEngine {
         for (name, state) in tables.iter() {
             storage::write_snapshot(&new_dir, name, state.rows.iter_physical())?;
         }
+        // Every declared index is materialized into the generation, whether or
+        // not it is currently in memory — that is what lets the next open serve
+        // it from a mapping instead of rebuilding it into RAM. The sort is
+        // transient: it lives for one index, at a moment already doing bulk IO,
+        // rather than for the life of the process.
+        for def in catalog.indexes.values() {
+            let Some(state) = tables.get(&def.table) else {
+                continue;
+            };
+            let Some(idx) = state.indexes.get(&def.name) else {
+                continue;
+            };
+            // A populated index is already the whole truth, in key order — write
+            // it straight out. Otherwise (a mapped base plus an overlay, or an
+            // index never built) rebuild from the rows, which is the only source
+            // that reflects both.
+            if idx.populated {
+                let refs: Vec<(&KeyTuple, &[u64])> =
+                    idx.map.iter().map(|(k, v)| (k, v.as_slice())).collect();
+                index_file::write_index(&new_dir, &def.table, &def.name, idx.col_pos.len(), refs)?;
+            } else {
+                let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
+                for (rid, cells) in state.rows.iter_physical() {
+                    entries.entry(idx.key_of(&cells)).or_default().push(rid);
+                }
+                let refs: Vec<(&KeyTuple, &[u64])> =
+                    entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
+                index_file::write_index(&new_dir, &def.table, &def.name, idx.col_pos.len(), refs)?;
+            }
+        }
         catalog.save(&new_dir)?;
 
         // Commit: this rename atomically switches the live generation. The
@@ -2042,6 +2146,18 @@ impl SqlEngine {
                     storage::MappedSnapshot::open(&new_dir, name, state.def.arity())?
                 {
                     state.rows.attach_base(snap);
+                }
+                // Same for the indexes: adopt the files just written and drop
+                // the in-RAM maps they now contain. The overlay restarts empty
+                // because the base is current as of this instant.
+                let index_names: Vec<String> = state.indexes.keys().cloned().collect();
+                for iname in index_names {
+                    if let Some(base) = index_file::MappedIndex::open(&new_dir, name, &iname)? {
+                        let idx = state.indexes.get_mut(&iname).expect("just listed");
+                        idx.base = Some(base);
+                        idx.map = BTreeMap::new();
+                        idx.populated = false;
+                    }
                 }
             }
         }
@@ -3550,6 +3666,172 @@ mod stmt_cache_tests {
             db.row_count("t").unwrap(),
             600,
             "skipping the cache must not skip the work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod disk_index_tests {
+    //! The `.sidx` base is a *hint*: it describes the rows as they were at the
+    //! last checkpoint, and every candidate is verified against the live row.
+    //! These pin the ways that could go wrong.
+    use super::*;
+
+    fn open(dir: &std::path::Path) -> SqlEngine {
+        SqlEngine::open_with_options(
+            dir,
+            SqlOptions {
+                disk_first: true,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn q(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop() {
+            Some(QueryResult::Select { rows, .. }) => rows,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
+        let mut v: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                _ => panic!("expected int"),
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn has_base(db: &SqlEngine, table: &str, index: &str) -> bool {
+        db.inner.lock().unwrap().tables[table].indexes[index]
+            .base
+            .is_some()
+    }
+
+    /// Seed 40 rows, checkpoint so a `.sidx` exists, and reopen.
+    fn seeded() -> (tempfile::TempDir, SqlEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v TEXT)")
+                .unwrap();
+            db.execute("CREATE INDEX ti ON t (k)").unwrap();
+            for i in 1..=40 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, {}, 'v{i}')", i % 4))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let db = open(dir.path());
+        assert!(
+            has_base(&db, "t", "ti"),
+            "the checkpoint must write a .sidx"
+        );
+        (dir, db)
+    }
+
+    #[test]
+    fn a_checkpointed_index_is_served_from_disk() {
+        let (_d, db) = seeded();
+        assert_eq!(
+            ids(&q(&db, "SELECT id FROM t WHERE k = 2")),
+            vec![2, 6, 10, 14, 18, 22, 26, 30, 34, 38]
+        );
+        // Serving it must not have pulled the whole index back into RAM.
+        assert!(
+            db.inner.lock().unwrap().tables["t"].indexes["ti"]
+                .map
+                .is_empty(),
+            "a lookup must not populate the in-memory map"
+        );
+    }
+
+    /// A row deleted after the checkpoint is still named by the base. It must
+    /// not come back — the row is gone from the store, so verification drops it.
+    #[test]
+    fn deleted_rows_do_not_come_back_from_the_base() {
+        let (_d, db) = seeded();
+        db.execute("DELETE FROM t WHERE id = 6").unwrap();
+        assert_eq!(
+            ids(&q(&db, "SELECT id FROM t WHERE k = 2")),
+            vec![2, 10, 14, 18, 22, 26, 30, 34, 38]
+        );
+    }
+
+    /// A row whose indexed column changed is named by the base under its OLD
+    /// key. It must not answer for the old key, and must answer for the new one.
+    #[test]
+    fn updated_rows_move_keys() {
+        let (_d, db) = seeded();
+        db.execute("UPDATE t SET k = 3 WHERE id = 2").unwrap();
+        assert!(
+            !ids(&q(&db, "SELECT id FROM t WHERE k = 2")).contains(&2),
+            "the old key must not still answer with the moved row"
+        );
+        assert!(
+            ids(&q(&db, "SELECT id FROM t WHERE k = 3")).contains(&2),
+            "the new key must find the moved row"
+        );
+    }
+
+    /// Rows written after the checkpoint live only in the overlay.
+    #[test]
+    fn rows_written_after_the_checkpoint_are_found() {
+        let (_d, db) = seeded();
+        db.execute("INSERT INTO t VALUES (99, 2, 'new')").unwrap();
+        assert!(ids(&q(&db, "SELECT id FROM t WHERE k = 2")).contains(&99));
+    }
+
+    /// The same, across a restart: the WAL tail replays into the overlay, which
+    /// only works because indexes are registered before the replay.
+    #[test]
+    fn rows_in_the_replayed_wal_tail_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+                .unwrap();
+            db.execute("CREATE INDEX ti ON t (k)").unwrap();
+            for i in 1..=10 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 3))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+            // Written after the checkpoint: in the WAL, not in the .sidx.
+            db.execute("INSERT INTO t VALUES (11, 2)").unwrap();
+            db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        }
+        let db = open(dir.path());
+        assert!(has_base(&db, "t", "ti"));
+        let found = ids(&q(&db, "SELECT id FROM t WHERE k = 2"));
+        assert!(found.contains(&11), "WAL-tail insert missing: {found:?}");
+        assert!(!found.contains(&2), "WAL-tail delete ignored: {found:?}");
+    }
+
+    /// A checkpoint taken while the overlay is non-empty must fold it in, so
+    /// the next base is complete on its own.
+    #[test]
+    fn a_second_checkpoint_folds_the_overlay() {
+        let (dir, db) = seeded();
+        db.execute("INSERT INTO t VALUES (99, 2, 'new')").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+
+        let db = open(dir.path());
+        let found = ids(&q(&db, "SELECT id FROM t WHERE k = 2"));
+        assert!(
+            found.contains(&99),
+            "refolded base lost an insert: {found:?}"
+        );
+        assert!(
+            !found.contains(&2),
+            "refolded base kept a delete: {found:?}"
         );
     }
 }
