@@ -28,8 +28,8 @@ export default function Footer() {
         </div>
         <div className="footer-bottom">
           <p>
-            © 2026 Barış AKIN — OxiDB is proprietary software (
-            <Link href="/license">licensing</Link>) — Built with Rust
+            © 2026 Barış AKIN — OxiDB is source-available: free for your own
+            production use (<Link href="/license">licensing</Link>) — Built with Rust
           </p>
         </div>
       </div>
