@@ -54,12 +54,36 @@ fn spawn_server() -> ServerGuard {
     // assertion; a tight one just converts contention into flakes.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if TcpStream::connect(("127.0.0.1", guard.oximem_port)).is_ok() {
+        // A completed PING/PONG, not merely a successful connect. The listener
+        // accepts before it can serve, so "the port answers" let the test open
+        // its real connection into a half-ready server and occasionally get it
+        // reset — a flake that looked like a protocol bug and was not one.
+        if ping_ok(guard.oximem_port) {
             return guard;
         }
-        assert!(Instant::now() < deadline, "oximem port never opened");
+        assert!(Instant::now() < deadline, "oximem port never answered PING");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// One RESP round trip on a throwaway connection: proof the server is serving.
+fn ping_ok(port: u16) -> bool {
+    let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+        return false;
+    }
+    let mut conn = BufReader::new(stream);
+    if conn
+        .get_mut()
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut line = String::new();
+    matches!(conn.read_line(&mut line), Ok(n) if n > 0) && line.starts_with("+PONG")
 }
 
 // ---- tiny RESP client ------------------------------------------------------
