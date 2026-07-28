@@ -16,9 +16,14 @@
 //! cargo run --release -p oxidb-server --example wire_bench
 //! ```
 //!
-//! What this does *not* measure: concurrency (one connection, one request in
-//! flight — the honest shape for a latency comparison), TLS, and auth, which
-//! is a per-connection cost on both sides.
+//! Two shapes are measured. **Sequential** (one connection, one request in
+//! flight) is the latency comparison. **Concurrent** (N connections, each with
+//! its own thread) is the throughput one — both listeners are
+//! thread-per-connection in standalone mode, so neither is throttled by a pool
+//! the other does not have.
+//!
+//! What this does *not* measure: TLS, and auth, which is a per-connection cost
+//! on both sides.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -376,6 +381,20 @@ fn main() {
     }
     setup.sql("DROP TABLE IF EXISTS bench_w", &[]);
     setup.sql("CREATE TABLE bench_w (id INT PRIMARY KEY, v TEXT)", &[]);
+    setup.sql("DROP TABLE IF EXISTS bench_c", &[]);
+    setup.sql("CREATE TABLE bench_c (id INT PRIMARY KEY, v TEXT)", &[]);
+
+    let mode = args.get("mode").map(String::as_str).unwrap_or("both");
+    let levels: Vec<usize> = args
+        .get("conns")
+        .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32]);
+    let secs: u64 = args.get("secs").and_then(|s| s.parse().ok()).unwrap_or(2);
+
+    if mode == "conc" {
+        run_concurrency(&oxi_addr, &pg_addr, &levels, secs);
+        return;
+    }
 
     let workloads = vec![
         Workload {
@@ -495,6 +514,171 @@ fn main() {
         );
     }
     println!();
+
+    if mode == "both" {
+        run_concurrency(&oxi_addr, &pg_addr, &levels, secs);
+    }
+}
+
+// ── concurrency ─────────────────────────────────────────────────────────────
+
+/// How a wire's client is built, so the sweep can make one per thread.
+#[derive(Clone, Copy)]
+enum Kind {
+    Oxi,
+    PgSimple,
+    PgExtended,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Oxi => "OxiWire",
+            Kind::PgSimple => "PG simple",
+            Kind::PgExtended => "PG extended",
+        }
+    }
+
+    fn connect(self, oxi: &str, pg: &str) -> Box<dyn Wire + Send> {
+        match self {
+            Kind::Oxi => Box::new(OxiWire::connect(oxi)),
+            Kind::PgSimple => Box::new(Pg::connect(pg, false)),
+            Kind::PgExtended => Box::new(Pg::connect(pg, true)),
+        }
+    }
+}
+
+/// Run `sql` from `threads` connections at once for `duration`, and report the
+/// aggregate.
+///
+/// Each thread owns a connection and runs closed-loop: send, wait, send again.
+/// That is the shape a connection pool produces, and it means the reported
+/// throughput and the latency percentiles describe the same run.
+fn sweep(
+    kind: Kind,
+    oxi_addr: &str,
+    pg_addr: &str,
+    sql: &(dyn Fn(usize, usize) -> String + Sync),
+    params: &[i64],
+    threads: usize,
+    duration: Duration,
+    reset: Option<&str>,
+) -> (f64, Duration, Duration) {
+    // A write workload starts each cell from an empty table: keys stay unique
+    // across cells, and a table that grew through the sweep would make later
+    // cells slower for reasons that are not the wire.
+    if let Some(table) = reset {
+        let mut setup = OxiWire::connect(oxi_addr);
+        setup.sql(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+        setup.sql(
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, v TEXT)"),
+            &[],
+        );
+    }
+    let start = Instant::now();
+    let deadline = start + duration;
+    let mut all: Vec<Duration> = Vec::new();
+
+    // Scoped threads so the statement builder can be borrowed rather than
+    // cloned into each thread.
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            handles.push(scope.spawn(move || {
+                let mut wire = kind.connect(oxi_addr, pg_addr);
+                let mut lat = Vec::with_capacity(4096);
+                let mut i = 0usize;
+                while Instant::now() < deadline {
+                    // Rendered per iteration — a write workload needs a fresh
+                    // key every time, and cycling a fixed list collides on the
+                    // second lap. Built *before* the timer starts, so the
+                    // formatting is not measured.
+                    let stmt = sql(t, i);
+                    let t0 = Instant::now();
+                    wire.run(&stmt, params);
+                    lat.push(t0.elapsed());
+                    i += 1;
+                }
+                lat
+            }));
+        }
+        for h in handles {
+            all.extend(h.join().expect("bench thread"));
+        }
+    });
+    let elapsed = start.elapsed();
+    let mut stats = Stats::default();
+    stats.latencies = all;
+    let throughput = stats.latencies.len() as f64 / elapsed.as_secs_f64();
+    (throughput, stats.percentile(0.50), stats.percentile(0.99))
+}
+
+fn run_concurrency(oxi_addr: &str, pg_addr: &str, levels: &[usize], secs: u64) {
+    let duration = Duration::from_secs(secs);
+    // (name, statement builder, params). The builder takes (thread, counter) so
+    // each connection writes its own keys.
+    type Build = Box<dyn Fn(usize, usize) -> String + Sync>;
+    // (name, statement builder, params, table to reset before each cell)
+    let cases: Vec<(&str, Build, Vec<i64>, Option<&str>)> = vec![
+        (
+            "point SELECT by PK",
+            Box::new(|t: usize, i: usize| {
+                format!(
+                    "SELECT id, name, score, tag FROM bench WHERE id = {}",
+                    (t * 37 + i * 11) % 10_000
+                )
+            }),
+            vec![],
+            None,
+        ),
+        (
+            "SELECT 100 rows",
+            Box::new(|_t: usize, _i: usize| {
+                "SELECT id, name, score, tag FROM bench WHERE id < 100".to_string()
+            }),
+            vec![],
+            None,
+        ),
+        (
+            "single-row INSERT",
+            Box::new(|t: usize, i: usize| {
+                // A fresh key per (thread, iteration) round, so a repeat within
+                // one run overwrites rather than colliding — the write path is
+                // what is being measured, not conflict handling.
+                format!("INSERT INTO bench_c VALUES ({}, 'v')", t * 1_000_000 + i)
+            }),
+            vec![],
+            Some("bench_c"),
+        ),
+    ];
+
+    for (name, build, params, reset) in &cases {
+        println!("\n{name} — throughput by concurrent connections");
+        println!(
+            "  {:<14} {:>12} {:>10} {:>10}   {}",
+            "wire", "ops/sec", "p50", "p99", "scaling vs 1 conn"
+        );
+        for kind in [Kind::Oxi, Kind::PgExtended] {
+            let mut base = 0.0;
+            for (n, &threads) in levels.iter().enumerate() {
+                let (ops, p50, p99) = sweep(
+                    kind, oxi_addr, pg_addr, build, params, threads, duration, *reset,
+                );
+                if n == 0 {
+                    base = ops;
+                }
+                println!(
+                    "  {:<14} {:>12.0} {:>10} {:>10}   {:>2} conn  {:.2}x",
+                    if n == 0 { kind.label() } else { "" },
+                    ops,
+                    fmt_dur(p50),
+                    fmt_dur(p99),
+                    threads,
+                    ops / base.max(1.0)
+                );
+            }
+        }
+    }
 }
 
 fn fmt_dur(d: Duration) -> String {
