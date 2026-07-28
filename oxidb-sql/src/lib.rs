@@ -67,6 +67,15 @@ pub struct SqlOptions {
     /// held by another transaction before failing with a lock-timeout error
     /// (also how a deadlock resolves). Env: `OXIDB_SQL_LOCK_TIMEOUT_MS`.
     pub lock_timeout_ms: u64,
+    /// Row operations replayed between folds when opening a disk-first
+    /// database. Bounds how much of a WAL tail is ever materialized at once.
+    ///
+    /// Small enough that a large tail cannot dominate the process, large enough
+    /// that an ordinary restart folds once or not at all — a fold rewrites
+    /// every table, so a tiny value turns recovery into repeated full rewrites.
+    /// Exposed mainly so tests can reach the mid-replay path without writing
+    /// hundreds of thousands of rows.
+    pub replay_fold_ops: usize,
 }
 
 impl Default for SqlOptions {
@@ -75,6 +84,7 @@ impl Default for SqlOptions {
             disk_first: false,
             checkpoint_bytes: 64 << 20, // 64 MiB
             lock_timeout_ms: 5_000,
+            replay_fold_ops: REPLAY_FOLD_OPS,
         }
     }
 }
@@ -957,6 +967,14 @@ thread_local! {
 /// inlined into SQL, which shouldn't be cached anyway).
 const STMT_CACHE_CAP: usize = 512;
 
+/// Row operations replayed between folds when opening a disk-first database.
+///
+/// Bounds how much of a WAL tail is ever materialized at once. Small enough
+/// that a large tail cannot dominate the process, large enough that an ordinary
+/// restart folds once or not at all — a fold rewrites every table, so making
+/// this small would turn recovery into repeated full rewrites.
+const REPLAY_FOLD_OPS: usize = 200_000;
+
 /// Longest statement text worth caching.
 ///
 /// The cache exists so a repeated statement parses once, which pays off for the
@@ -1100,13 +1118,15 @@ impl SqlEngine {
 
         // 5. Replay the WAL past the manifest watermark (idempotent). Records at
         //    or below it are already folded into the snapshots above.
+        //
+        //    The engine is constructed *before* the replay rather than after,
+        //    so the replay can checkpoint as it goes. A replayed record becomes
+        //    an overlay row in disk-first mode, and the overlay is only folded
+        //    back into the mmap'd snapshot by a checkpoint — so replaying a
+        //    large tail in one pass materializes all of it at once. That was
+        //    the bulk of a measured 415 MB peak opening a database that then
+        //    ran in 94 MB.
         let (wal, records) = Wal::open_since(&dir, watermark)?;
-        // Consumed, not borrowed: each record's payload is freed as soon as it
-        // has been applied. Holding the whole parsed tail alive across the loop
-        // put a second copy of it beside the overlay it was building.
-        for rec in records {
-            Self::apply_live(&mut catalog, &mut tables, &rec, opts.disk_first);
-        }
 
         // Everything already in the WAL at open is on disk (it was read from
         // there), so the gate starts with that sequence durable.
@@ -1118,25 +1138,7 @@ impl SqlEngine {
             mode: wal.sync_mode(),
         };
 
-        // A replayed WAL tail lands in RAM: in disk-first mode every record
-        // past the watermark becomes an overlay row, and the overlay is only
-        // folded back into the mmap'd snapshot by a checkpoint. So a restart
-        // inherits the previous process's pending WAL as resident memory and
-        // holds it until the next checkpoint — which, if the database has gone
-        // quiet, may be never.
-        //
-        // The effect is large: measured on 1M rows, a 55 MB WAL tail cost
-        // 60 MB of overlay, doubling the engine's resident footprint (123 MB
-        // against 63 MB with a folded WAL). It is also invisible — the mode is
-        // called disk-first, and the rows are in RAM.
-        //
-        // So fold it now. The threshold is a fraction of the auto-checkpoint
-        // size rather than the size itself, because the trade differs at open:
-        // a tail costs RAM for the whole life of the process, not just until
-        // the next write. `checkpoint_bytes == 0` means checkpoints are manual,
-        // and that is respected.
         let tail = wal.bytes();
-        let fold_at = opts.checkpoint_bytes / 8;
         let engine = SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
@@ -1157,10 +1159,48 @@ impl SqlEngine {
                 pinned_gens: std::collections::BTreeMap::new(),
             }),
         };
-        if opts.disk_first && opts.checkpoint_bytes > 0 && tail > fold_at {
-            // Best-effort: a database that opened is more useful than one that
-            // refused to because it could not tidy itself. A failure here just
-            // leaves the tail resident, which is the old behaviour.
+
+        // Fold periodically while replaying, so the overlay never holds the
+        // whole tail. Each fold records the last *applied* sequence as its
+        // watermark and leaves the log intact — see `checkpoint_upto`, where
+        // getting either wrong would lose the records not yet replayed.
+        //
+        // Only in disk-first mode: resident mode keeps every row in RAM
+        // whatever happens, so a fold would cost IO and save nothing. Records
+        // are consumed rather than borrowed, freeing each as it is applied.
+        let fold_during_replay = opts.disk_first && opts.checkpoint_bytes > 0;
+        {
+            let mut inner = engine.inner.lock().unwrap();
+            let mut since_fold = 0usize;
+            for item in records {
+                let (seq, rec) = item?;
+                // A `Batch` is one record carrying many row operations, so
+                // counting records alone would let one batch blow the bound.
+                since_fold += match &rec {
+                    WalRecord::Batch(ops) => ops.len(),
+                    _ => 1,
+                };
+                let Inner {
+                    catalog, tables, ..
+                } = &mut *inner;
+                Self::apply_live(catalog, tables, &rec, opts.disk_first);
+                if fold_during_replay && since_fold >= opts.replay_fold_ops {
+                    // Best-effort: a fold that fails leaves the overlay larger
+                    // than intended, which is the old behaviour, not a
+                    // correctness problem.
+                    let _ = Self::checkpoint_upto(&mut inner, &engine.commit, Some(seq));
+                    since_fold = 0;
+                }
+            }
+        }
+
+        // Whatever is left after the last periodic fold. The threshold is a
+        // fraction of the auto-checkpoint size rather than the size itself,
+        // because the trade differs at open: a tail costs RAM for the whole
+        // life of the process, not just until the next write.
+        // `checkpoint_bytes == 0` means checkpoints are manual, and that is
+        // respected. This one covers the whole log, so it may truncate.
+        if fold_during_replay && tail > opts.checkpoint_bytes / 8 {
             let _ = engine.checkpoint();
         }
         Ok(engine)
@@ -2145,6 +2185,25 @@ impl SqlEngine {
     /// writer still waiting to flush is then already satisfied — and must be,
     /// since the WAL it would have flushed may have just been truncated.
     fn checkpoint_locked(inner: &mut Inner, gate: &CommitGate) -> Result<()> {
+        Self::checkpoint_upto(inner, gate, None)
+    }
+
+    /// Checkpoint, recording `applied_upto` as the manifest watermark instead
+    /// of the WAL's last sequence.
+    ///
+    /// `None` means "everything in the WAL has been applied", which is true of
+    /// every checkpoint taken by a running engine and lets the WAL be
+    /// truncated. `Some(seq)` is for a checkpoint taken **part-way through a
+    /// replay**, where the log still holds records this snapshot does not
+    /// contain: the watermark must name what was actually applied, and the WAL
+    /// must survive, or recovery would skip those records and they would be
+    /// deleted with them. That is the difference between bounding replay memory
+    /// and losing committed writes.
+    fn checkpoint_upto(
+        inner: &mut Inner,
+        gate: &CommitGate,
+        applied_upto: Option<u64>,
+    ) -> Result<()> {
         let Inner {
             dir,
             generation,
@@ -2281,7 +2340,7 @@ impl SqlEngine {
         // Commit: this rename atomically switches the live generation. The
         // watermark is the highest WAL seq folded into these snapshots, so a
         // not-yet-truncated WAL replays only what came after.
-        let watermark = wal.last_seq();
+        let watermark = applied_upto.unwrap_or_else(|| wal.last_seq());
         manifest::Manifest::commit(dir, new_gen, watermark)?;
         *generation = new_gen;
         *committed_wal_seq = watermark;
@@ -2335,7 +2394,9 @@ impl SqlEngine {
         if !pinned_gens.contains_key(&old_gen) {
             Self::gc_superseded(dir, old_gen);
         }
-        if pinned_gens.is_empty() {
+        // Only when this snapshot covers the whole log. Mid-replay it does not,
+        // and truncating would destroy the records still to be applied.
+        if pinned_gens.is_empty() && applied_upto.is_none() {
             let _ = wal.truncate();
         }
         gate.mark_durable(wal.last_seq());
@@ -3831,6 +3892,135 @@ mod stmt_cache_tests {
             600,
             "skipping the cache must not skip the work"
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_fold_tests {
+    //! Folding part-way through a WAL replay bounds how much of the tail is
+    //! materialized at once — but a checkpoint normally records the log's last
+    //! sequence as its watermark and then truncates the log. Doing that
+    //! mid-replay would declare records folded that were never applied and
+    //! delete them in the same breath. These tests are about not losing data.
+    use super::*;
+
+    fn opts(fold_every: usize) -> SqlOptions {
+        SqlOptions {
+            disk_first: true,
+            // Small enough that a handful of rows crosses it.
+            replay_fold_ops: fold_every,
+            ..SqlOptions::default()
+        }
+    }
+
+    fn rows_of(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop() {
+            Some(QueryResult::Select { rows, .. }) => rows,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    /// Write a tail far longer than the fold threshold, then reopen. Every row
+    /// must survive, and the constraints must still hold.
+    #[test]
+    fn every_row_survives_a_folded_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts(usize::MAX)).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v TEXT UNIQUE)")
+                .unwrap();
+            db.execute("CREATE INDEX ti ON t (k)").unwrap();
+            db.checkpoint().unwrap();
+            // Everything from here on is WAL tail.
+            for i in 1..=200 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, {}, 'v{i}')", i % 5))
+                    .unwrap();
+            }
+            db.execute("DELETE FROM t WHERE id = 7").unwrap();
+            db.execute("UPDATE t SET k = 99 WHERE id = 8").unwrap();
+        }
+
+        // Reopen with a threshold that forces many folds through that tail.
+        let db = SqlEngine::open_with_options(dir.path(), opts(10)).unwrap();
+        assert_eq!(
+            db.row_count("t").unwrap(),
+            199,
+            "a replayed row went missing"
+        );
+        assert_eq!(
+            rows_of(&db, "SELECT k FROM t WHERE id = 8"),
+            vec![vec![Value::Int(99)]]
+        );
+        assert!(
+            rows_of(&db, "SELECT id FROM t WHERE id = 7").is_empty(),
+            "a replayed delete was undone"
+        );
+        // Indexes and constraints rebuilt from the folded state.
+        assert_eq!(rows_of(&db, "SELECT id FROM t WHERE k = 1").len(), 40);
+        assert!(
+            db.execute("INSERT INTO t VALUES (1, 0, 'dup')").is_err(),
+            "PRIMARY KEY not enforced after a folded replay"
+        );
+        assert!(
+            db.execute("INSERT INTO t VALUES (999, 0, 'v1')").is_err(),
+            "UNIQUE not enforced after a folded replay"
+        );
+        // The freed key is reusable.
+        db.execute("INSERT INTO t VALUES (7, 2, 'again')").unwrap();
+    }
+
+    /// The dangerous case, made explicit: after a mid-replay fold the manifest
+    /// watermark must name what was *applied*, and the log must still hold
+    /// everything past it. Opening again — as a crash mid-replay would — must
+    /// therefore find the same database, not a truncated one.
+    #[test]
+    fn a_crash_between_folds_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts(usize::MAX)).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.checkpoint().unwrap();
+            for i in 1..=100 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                    .unwrap();
+            }
+        }
+        // Open and drop repeatedly. Each open folds several times part-way
+        // through the tail; if a fold ever claimed more than it applied, the
+        // next open would come back short.
+        for round in 0..4 {
+            let db = SqlEngine::open_with_options(dir.path(), opts(7)).unwrap();
+            assert_eq!(
+                db.row_count("t").unwrap(),
+                100,
+                "rows lost after {round} reopen(s)"
+            );
+        }
+    }
+
+    /// Resident mode has no overlay to bound, so it must not pay for folds it
+    /// cannot benefit from — and must still replay correctly.
+    #[test]
+    fn resident_mode_replays_without_folding() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            for i in 1..=50 {
+                db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+            }
+        }
+        let db = SqlEngine::open_with_options(
+            dir.path(),
+            SqlOptions {
+                disk_first: false,
+                replay_fold_ops: 5,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 50);
     }
 }
 

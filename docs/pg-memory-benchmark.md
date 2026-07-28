@@ -214,6 +214,7 @@ checkpoints, and both halves of that were holding whole-table structures:
 | Originally | 415 MB |
 | Index files built in bounded chunks (external sort) | 365 MB |
 | WAL records freed as they are applied | **328 MB** |
+| Folding mid-replay + decoding the tail lazily | 337 MB (no better) |
 
 The steady-state floor is unchanged at ~96 MB, so neither change cost anything.
 
@@ -227,15 +228,23 @@ either. Separately, `Wal::open_since` hands back the parsed tail as a `Vec` and
 the replay loop *borrowed* it, keeping every record alive beside the overlay it
 was building; consuming it frees each record as it is applied.
 
-**What is still there, and why.** The remaining ~230 MB above steady state is
-the overlay itself: replaying a WAL tail materializes every pending row before
-a checkpoint can fold it. Bounding that means checkpointing *during* the
-replay, and that is not a small change — `checkpoint_locked` truncates the live
-WAL and records `wal.last_seq()` as the watermark, so calling it mid-replay
-would declare records folded that had not been applied yet and then delete
-them. Doing it safely needs the watermark to track the last *applied* sequence
-and truncation to be deferred. Worth doing; not done here, and not worth
-rushing given what it can lose.
+**Two more things were tried, and neither moved it.** Replaying now folds
+part-way through, so the overlay is bounded rather than holding the whole tail
+(`checkpoint_upto` records the last *applied* sequence as the watermark and
+leaves the log intact — getting either wrong deletes records that were never
+replayed, which two tests pin by failing when the old behaviour is restored).
+And `Wal::open_since` no longer parses the tail into a `Vec` up front; it hands
+back locations and decodes one record at a time. Both are right on their own
+terms. Neither reduced the peak: it went 328 → 337 MB.
+
+**What the peak actually is, measured rather than assumed.** The cgroup's
+breakdown on a *clean* open is `anon 71 MB, file 0 MB` with a peak of 83 MB. On
+the tail open it is 337 MB and still anonymous. So it is not one live structure
+being held — bounding the overlay proved that — it is **allocator retention
+across repeated large allocations**: each fold rebuilds every table's row-offset
+index (24 bytes a row) and musl's allocator does not return the freed pages.
+Fixing that is an allocator-behaviour problem, not a data-structure one, and it
+is where this stops for now.
 
 The practical shape of the trap is unchanged: a server sized for its steady
 state cannot restart immediately after a bulk load. The margin needed is now
