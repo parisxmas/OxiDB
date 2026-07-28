@@ -149,7 +149,7 @@ docker compose up -d
 - **Retention policies** — collection-level `set_retention` with automatic TTL-based cleanup; `{"cmd": "set_retention", "collection": "_gelf_logs", "days": 30}`
 - **Alerting** — background alert evaluator with count/aggregation thresholds, webhook actions, cooldown, and `_alert_history` logging; `{"cmd": "create_alert", "name": "high_errors", "collection": "_gelf_logs", "condition": {...}, "actions": [...]}`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
-- **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; thread-per-connection model with unbounded concurrency; 32K mixed ops/sec with 10 concurrent workers
+- **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; thread-per-connection model with unbounded concurrency
 - **Query optimizer** — selectivity-based index selection; picks the most selective condition in AND queries using index cardinality estimates
 - **JSONB partial extraction** — aggregation extracts only needed fields from binary docs, skipping nested arrays; 1M × 3KB docs aggregated in 300-700ms
 - **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; SO_REUSEPORT multi-thread listeners
@@ -645,77 +645,6 @@ OXIPOOL_SHARDS=localhost:4444,localhost:4445 \
 
 Cross-shard transactions are detected and rejected.
 
-## Benchmark: OxiDB vs MongoDB 7
-
-**1M documents**, employee-shaped (~500 B each, 14 fields including a nested
-object). OxiDB and MongoDB 7 both run in Docker Compose with **real disk
-volumes** (not tmpfs); the Go benchmark client runs **in-network**
-(container-to-container — host-mode runs through Docker's port-forward add
-~160 µs/RT that distorts small-payload workloads). Hardware:
-AMD EPYC-Genoa, 4 vCPU, 8 GiB RAM. Single cold run per test.
-
-**OxiDB wins 24/24 tests.** Reproduce with `tests/comparison-mongodb/run.sh`
-(`BENCH_MODE=innetwork`).
-
-| Category | Operation | OxiDB | MongoDB | Ratio |
-|----------|-----------|-------|---------|-------|
-| **COUNT** | Count all (1M docs) | 200µs | 429ms | **2189x** |
-| | Top 5 cities (aggregation) | 1ms | 822ms | **1262x** |
-| | Count (age ≥ 50) | 200µs | 156ms | **645x** |
-| | Count (department) | 300µs | 53ms | **197x** |
-| **COMPOSITE IDX** | Compound dept+status (composite idx) | 161ms | 626ms | **4.1x** |
-| **POINT LOOKUP** | Random seq lookup × 100K | 8.07s | 27.6s | **3.4x** |
-| **INDEXED QUERY** | Range (salary 80K-120K, 235K results) | 1.01s | 3.25s | **3.2x** |
-| | Equality (city=Tokyo, 100K results) | 448ms | 1.37s | **3.0x** |
-| | Range (age ≥ 60, 300K results) | 1.43s | 4.12s | **2.9x** |
-| | Equality (department, 199K results) | 1.17s | 2.65s | **2.3x** |
-| **INDEX** | Create 4 indexes on 1M docs | 2.82s | 7.33s | **2.6x** |
-| **DELETE** | Bulk delete (10% of corpus) | 5.88s | 13.3s | **2.3x** |
-| **QUERY (no idx)** | `$or` city=Tokyo OR Paris | 1.48s | 3.15s | **2.1x** |
-| | Compound AND (no idx) | 515ms | 1.03s | **2.0x** |
-| | Range (salary, no idx) | 2.06s | 3.95s | **1.9x** |
-| | `$in` country (no idx) | 2.21s | 4.03s | **1.8x** |
-| | Exact match (department, no idx) | 2.18s | 2.95s | **1.4x** |
-| **AGGREGATE** | Match + Group (active engineers) | 247ms | 336ms | **1.4x** |
-| **QUERY (nested)** | Nested `address.zip` range | 1.47s | 1.91s | **1.3x** |
-| **RANGE × 10K** | 10K windows × ~1K rows = 10.2M rows | 30.2s | 35.9s | **1.2x** |
-| **INSERT** | Bulk insert 1M (batch 1000) | 16.0s | 18.3s | **1.1x** |
-
-**Resource footprint** (post-bench, 1M docs):
-
-| Resource     | OxiDB     | MongoDB   | Note |
-|--------------|-----------|-----------|------|
-| Memory (RSS) | 1.71 GiB  | 1.00 GiB  | OxiDB caches env-tunable (`OXIDB_DOC_CACHE_SIZE`, `OXIDB_DOC_BYTES_CACHE_SIZE`). MongoDB WT cache capped at 0.5 GiB. |
-| Disk         | 741 MB    | 626 MB    | OxiDB stores JSONB; MongoDB compresses WiredTiger. ~18% larger on disk. |
-
-How OxiDB's leads are won:
-- **Counts are lopsided** because OxiDB answers them from index-set cardinality
-  without touching documents.
-- **Indexed-query wins (~2-3×)** come from the v0.28.14 bytes-first path — a
-  direct JSONB→OxiWire converter skips the `serde_json::Value` tree
-  materialisation that the standard read path would pay.
-- **Composite-indexed compound (4.1×)** uses the v0.28.15 composite-prefix
-  bytes path — `find_prefix` resolves the exact ID set, no post-filter.
-- **Non-indexed scan wins (1.4–2.0×)** come from v0.28.16/17/18's partial-JSONB
-  matcher: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$and`/`$or` and
-  dot-paths evaluate directly on raw JSONB via `codec::extract_field`,
-  reserving the full decode for predicates outside the partial matcher's
-  scope (regex, `$elemMatch`, `$expr`).
-
-### 1M Telco CRM Scenario (nested documents, ~3KB each)
-
-| Operation | Time |
-|-----------|------|
-| Insert 1M customers | 2m7s (8K/sec) |
-| Create 10 indexes | 40s |
-| Customer lookup (indexed) | 177-343µs |
-| Count (indexed) | 25-93µs |
-| Aggregation (group by region) | 430ms |
-| Aggregation (match + group) | 114-317ms |
-| Campaign update (125K docs) | 14s |
-
-Benchmark sources: [`tests/benchmark-1m/`](tests/benchmark-1m/) | [`tests/go-complex-tests/`](tests/go-complex-tests/) | [`tests/telco-15m-go/`](tests/telco-15m-go/)
-
 ## Architecture
 
 ### Storage Engine
@@ -743,7 +672,7 @@ The same background thread also writes periodic `.btree` snapshots but deliberat
 - **`scc::HashMap`** — write-optimized concurrent hash map with finer-grained bucket locks than DashMap
 - **Selectivity-based query optimizer** — AND queries pick the most selective index condition first using `count_eq`/`count_range` cardinality estimates
 - **JSONB partial extraction** — aggregation uses `feed_raw()` to extract only group key + accumulator fields from binary docs, skipping nested arrays (17-50x faster on large nested documents)
-- **Parallel cache-based scan** — unindexed queries use rayon parallel filter with partial-JSONB pre-filter (skip docs that obviously fail before paying full decode); 1.4–2.0× faster than MongoDB on the bench's non-indexed queries
+- **Parallel cache-based scan** — unindexed queries use rayon parallel filter with partial-JSONB pre-filter (skip docs that obviously fail before paying full decode)
 - **Index-level sort+limit** — sort queries with limit use index iteration with cross-index membership checks
 - **Deferred index compaction** — bulk delete skips per-entry Vec shifts, compacts once at end (34x faster DeleteMany)
 - **Dirty-flag persistence** — background sync only writes to disk when data has changed
