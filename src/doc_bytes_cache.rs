@@ -185,6 +185,16 @@ impl SharedBytes {
 pub struct DocBytesCache {
     inner: Arc<SharedBytes>,
     ns: AtomicU64,
+    /// This collection's own hit/miss counts.
+    ///
+    /// The shared cache counts every collection's traffic in one pair of
+    /// atomics, which is what a *budget* wants but not what a caller asking
+    /// "how is my collection doing?" means — and under concurrency the shared
+    /// numbers move for reasons that have nothing to do with this collection.
+    /// These are incremented alongside the shared ones and are what
+    /// [`stats`](Self::stats) reports.
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl DocBytesCache {
@@ -192,6 +202,8 @@ impl DocBytesCache {
         Self {
             inner: global(),
             ns: AtomicU64::new(next_ns()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
     #[inline]
@@ -199,7 +211,13 @@ impl DocBytesCache {
         compose(self.ns.load(Ordering::Relaxed), id)
     }
     pub fn get(&self, id: DocumentId) -> Option<Arc<[u8]>> {
-        self.inner.get(self.key(id))
+        let found = self.inner.get(self.key(id));
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        found
     }
     pub fn put(&self, id: DocumentId, bytes: Arc<[u8]>) {
         self.inner.put(self.key(id), bytes);
@@ -214,7 +232,18 @@ impl DocBytesCache {
     pub fn resize(&self, capacity: usize) {
         self.inner.resize(capacity);
     }
+    /// **This collection's** hits and misses — not the shared cache's, which
+    /// every other collection in the process also moves.
     pub fn stats(&self) -> BytesCacheStats {
+        BytesCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The shared cache's totals across every collection — the budget-wide
+    /// view, for memory reporting rather than per-collection behaviour.
+    pub fn shared_stats(&self) -> BytesCacheStats {
         self.inner.stats()
     }
 }
@@ -236,6 +265,41 @@ mod tests {
         cache.put(42, Arc::clone(&bytes));
         let got = cache.get(42).expect("hit");
         assert_eq!(&*got, &[1u8, 2, 3]);
+    }
+
+    /// One collection's counters must not move when another collection reads.
+    ///
+    /// The cache itself is process-global, so its own atomics count everyone —
+    /// which made any "this read caused exactly one miss" assertion a race
+    /// against every other collection in the process. `stats()` is per
+    /// collection precisely so that measurement means something.
+    #[test]
+    fn stats_are_per_collection_not_process_wide() {
+        let a = DocBytesCache::new(32);
+        let b = DocBytesCache::new(32);
+
+        let before = a.stats();
+        // Traffic on `b`: one miss, then one hit.
+        assert!(b.get(1).is_none());
+        b.put(1, Arc::from(vec![9u8]));
+        assert!(b.get(1).is_some());
+
+        let after = a.stats();
+        assert_eq!(after.hits, before.hits, "another collection moved our hits");
+        assert_eq!(
+            after.misses, before.misses,
+            "another collection moved our misses"
+        );
+
+        // And `a` counts its own traffic exactly.
+        assert!(a.get(1).is_none());
+        assert_eq!(a.stats().misses, before.misses + 1);
+        a.put(1, Arc::from(vec![7u8]));
+        assert!(a.get(1).is_some());
+        assert_eq!(a.stats().hits, before.hits + 1);
+
+        // The shared view still sees everything — that is what it is for.
+        assert!(a.shared_stats().total() >= 5);
     }
 
     #[test]

@@ -314,6 +314,11 @@ impl Shared {
 pub struct DocCache {
     inner: std::sync::Arc<Shared>,
     ns: AtomicU64,
+    /// This collection's own hit/miss counts — see [`DocCache::stats`]. The
+    /// shared cache's atomics count every collection at once, which is the
+    /// budget's view, not this collection's.
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl DocCache {
@@ -322,7 +327,20 @@ impl DocCache {
         Self {
             inner: global(),
             ns: AtomicU64::new(next_ns()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// Count one lookup against this collection.
+    #[inline]
+    fn record<T>(&self, found: Option<T>) -> Option<T> {
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        found
     }
 
     #[inline]
@@ -331,10 +349,12 @@ impl DocCache {
     }
 
     pub fn get(&self, id: DocumentId) -> Option<Arc<Value>> {
-        self.inner.get(self.key(id))
+        let found = self.inner.get(self.key(id));
+        self.record(found)
     }
     pub fn peek(&self, id: DocumentId) -> Option<Arc<Value>> {
-        self.inner.peek(self.key(id))
+        let found = self.inner.peek(self.key(id));
+        self.record(found)
     }
     pub fn put(&self, id: DocumentId, doc: Arc<Value>) {
         self.inner.put(self.key(id), doc);
@@ -344,7 +364,12 @@ impl DocCache {
     }
     pub fn get_many(&self, ids: &[DocumentId]) -> Vec<Option<Arc<Value>>> {
         let keys: Vec<CacheKey> = ids.iter().map(|&id| self.key(id)).collect();
-        self.inner.get_many(&keys)
+        let found = self.inner.get_many(&keys);
+        let hits = found.iter().filter(|f| f.is_some()).count() as u64;
+        self.hits.fetch_add(hits, Ordering::Relaxed);
+        self.misses
+            .fetch_add(found.len() as u64 - hits, Ordering::Relaxed);
+        found
     }
     pub fn put_many(&self, entries: impl IntoIterator<Item = (DocumentId, Arc<Value>)>) {
         let ns = self.ns.load(Ordering::Relaxed);
@@ -369,11 +394,21 @@ impl DocCache {
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }
+    /// **This collection's** hits and misses — not the shared cache's, which
+    /// every other collection in the process also moves.
     pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+    /// The shared cache's totals across every collection.
+    pub fn shared_stats(&self) -> CacheStats {
         self.inner.stats()
     }
     pub fn reset_stats(&self) {
-        self.inner.reset_stats();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 }
 
