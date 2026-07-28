@@ -51,3 +51,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0019](0019-postgrest-rest-surface.md) | PostgREST-compatible auto-REST surface (document + SQL + TSDB engines) | Accepted (all phases landed) |
 | [0020](0020-oxibase-control-plane.md) | OxiBase — a control plane for multi-tenant provisioning | Proposed (skeleton landed in-server) |
 | [0021](0021-oxibase-separate-service.md) | OxiBase as a separate control-plane service (data plane keeps only the secret hook) | Accepted |
+| [0022](0022-oxibase-dedicated-isolation.md) | Dedicated tenant isolation for OxiBase (one process per project) | Proposed |
