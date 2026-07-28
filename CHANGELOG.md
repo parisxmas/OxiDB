@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.40.0 — 2026-07-28
 
 ### Licensing: OxiDB is source-available from v0.40.0
 
@@ -22,6 +22,45 @@ distributed product remains a commercial arrangement here. It carries no
 conversion date: it does not become an open-source licence later.
 
 The MIT client libraries are untouched, redistribution included.
+
+### Durability: a transaction spanning two collections could recover half-applied
+
+Found by running the crash half of the suite (`cargo test -- --ignored`), which
+the normal run skips. Three tests failed on one bug: the Jepsen-style bank, the
+multi-collection atomicity drill, and exactly-once retry.
+
+In disk-first mode — the default since 0.38 — a record reached the data file
+when a transaction *applied* it, before its commit mark was durable, and the
+index is rebuilt on open by scanning for active records. A crash between apply
+and commit therefore resurrected one collection's half of a transaction while
+the other half, correctly, was discarded by WAL replay. Deletes had the mirror
+of it: an uncommitted delete could remove a document permanently.
+
+Records written by an uncommitted transaction are now written *pending* and are
+invisible to a rebuild; the record each one displaces stays live. At the commit
+point both are settled. A crash between the mark and the settle costs nothing —
+replay restores the write, gated on the same commit log. Compaction and
+checkpointing stand off while any transaction has work outstanding, since either
+would undo the guarantee.
+
+The in-RAM mode had the same hole by a different route — a snapshot taken
+between apply and commit — and is covered by the same counter.
+
+### The .NET TCP client could not survive a server restart
+
+It connected once and stayed connected, so a deploy left every request failing
+with "Connection closed by server" until the client process itself was
+restarted. It now redials and re-authenticates, and retries only where that is
+safe: a failure while writing (the server never got a whole frame), or a read
+that changes nothing. Inside a transaction it never retries — the connection
+*is* the transaction — and says so instead of being an anonymous broken pipe.
+
+### Reading with the wrong encryption key panicked
+
+`decode_doc` handed anything that was not JSON text to the JSONB parser, which
+trusts a length it reads from the header and slices by it. Opening an encrypted
+database without the key therefore took the process down rather than returning
+an error — reachable from a REST request. The shape is checked first now.
 
 ### Durability fix: fsync failure poisons in-memory state (fsyncgate)
 

@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-embedded-ffi"
-version = "0.39.15"
+version = "0.40.0"
 edition = "2024"
 description = "C-compatible FFI for embedded (in-process) OxiDB — no server required"
 license-file = "../LICENSE"

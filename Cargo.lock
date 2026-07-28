@@ -2484,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "aes-gcm",
  "bytemuck",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-cli"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "base64",
  "clap",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-client-ffi"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "serde_json",
 ]
@@ -2566,7 +2566,7 @@ version = "0.1.0"
 
 [[package]]
 name = "oxidb-embedded-ffi"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "base64",
  "jni",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-sql"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "base64",
  "crc32fast",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-wasm"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "js-sys",
  "oxidb",
@@ -2677,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "oxipool"
-version = "0.39.15"
+version = "0.40.0"
 dependencies = [
  "crc32fast",
  "oxidb",
