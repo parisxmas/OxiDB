@@ -53,6 +53,8 @@ with OxiDbClient() as db:
 
 - **[Protocol Reference](protocol-reference.md)** -- Complete TCP protocol command reference with all fields, return values, and RBAC role requirements.
 
+- **[PostgreSQL Wire Protocol](postgres-wire.md)** -- Serving the SQL engine to unmodified PostgreSQL clients (`psql`, `psycopg`) on `OXIDB_PG_PORT`: SCRAM auth, type and SQLSTATE mapping, and what a v1 deliberately does not implement.
+
 ### 1.0 release policy
 
 These four documents define what the 1.0 stability promise covers and how it

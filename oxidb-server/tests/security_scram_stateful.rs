@@ -93,15 +93,19 @@ fn scram_happy_path_completes() {
 // process_client_first — pre-state attacks
 // ─────────────────────────────────────────────────────────────────────
 
-/// Client-first MUST begin with `n,,` (GS2 header for no-channel-
-/// binding). Anything else → reject.
+/// Client-first MUST begin with a GS2 header this server can honour:
+/// `n,,` (client does not support channel binding) or `y,,` (client
+/// supports it but saw no `-PLUS` mechanism offered — which is true,
+/// this server never offers one). Anything else → reject.
+///
+/// `p=...` demands channel binding, which this server cannot do, so it
+/// stays rejected rather than being silently downgraded.
 #[test]
 fn scram_client_first_missing_gs2_header_rejected() {
     let (_dir, store) = make_user_store();
     for bad in &[
-        "n=alice,r=xyz",              // missing n,,
-        "y,,n=alice,r=xyz",           // y instead of n
-        "p=tls-unique,n=alice,r=xyz", // wrong gs2 form
+        "n=alice,r=xyz",              // missing gs2 header
+        "p=tls-unique,n=alice,r=xyz", // demands channel binding
         "",                           // empty
         "garbage",                    // not even close
     ] {
@@ -112,6 +116,56 @@ fn scram_client_first_missing_gs2_header_rejected() {
             r.as_ref().err()
         );
     }
+}
+
+/// `y,,` is a conforming opening (RFC 5802 §5) and PostgreSQL clients
+/// that support channel binding send it when the server offers only
+/// `SCRAM-SHA-256`. Accepting it is required for interop — but the
+/// header is part of the signed auth message, so a proof computed for
+/// one header MUST NOT verify against the other. That binding is what
+/// makes accepting `y,,` safe: nothing in the middle can flip the flag.
+#[test]
+fn scram_y_gs2_header_is_accepted_and_bound_into_the_proof() {
+    let (_dir, store) = make_user_store();
+
+    // A `y,,` opening is accepted...
+    let (server_first, state) =
+        ScramState::process_client_first(&format!("y,,n={TEST_USER},r=nonce-y"), &store)
+            .expect("y,, is a conforming GS2 header");
+    let (combined_nonce, salt_b64, iterations) = parse_server_first(&server_first);
+
+    // ...and a proof that says `c=biws` ("n,,") does not verify against it,
+    // because the server signed the header the client actually sent.
+    let n_proof = compute_client_proof(
+        TEST_USER,
+        TEST_PASSWORD,
+        "nonce-y",
+        &combined_nonce,
+        &salt_b64,
+        iterations,
+    );
+    assert!(
+        state
+            .process_client_final(&format!("c=biws,r={combined_nonce},p={n_proof}"), &store)
+            .is_err(),
+        "GS2 DOWNGRADE: a proof bound to 'n,,' verified against a 'y,,' opening"
+    );
+
+    // The matching proof — same math, `c=eSws` = base64("y,,") — does verify.
+    let y_proof = compute_client_proof_with_binding(
+        TEST_USER,
+        TEST_PASSWORD,
+        "nonce-y",
+        &combined_nonce,
+        &salt_b64,
+        iterations,
+        "eSws",
+    );
+    let (server_final, role) = state
+        .process_client_final(&format!("c=eSws,r={combined_nonce},p={y_proof}"), &store)
+        .expect("a proof bound to 'y,,' must verify against a 'y,,' opening");
+    assert!(server_final.starts_with("v="));
+    assert_eq!(role, Role::ReadWrite);
 }
 
 /// User-not-found MUST reject and MUST NOT leak the distinction
@@ -371,6 +425,29 @@ fn compute_client_proof(
     salt_b64: &str,
     iterations: u32,
 ) -> String {
+    // "biws" is base64("n,,") — channel-binding-not-supported.
+    compute_client_proof_with_binding(
+        username,
+        password,
+        client_nonce,
+        combined_nonce,
+        salt_b64,
+        iterations,
+        "biws",
+    )
+}
+
+/// [`compute_client_proof`] with an explicit `c=` channel-binding field, so a
+/// test can prove the GS2 header is signed rather than assumed.
+fn compute_client_proof_with_binding(
+    username: &str,
+    password: &str,
+    client_nonce: &str,
+    combined_nonce: &str,
+    salt_b64: &str,
+    iterations: u32,
+    channel_binding: &str,
+) -> String {
     use oxidb_server::scram::{
         base64_decode_simple_pub, base64_encode_simple_pub, hmac_sha256_pub, pbkdf2_sha256_pub,
         sha256_hash_pub,
@@ -382,8 +459,7 @@ fn compute_client_proof(
     let stored_key = sha256_hash_pub(&client_key);
 
     let client_first_bare = format!("n={username},r={client_nonce}");
-    // "c=biws" is base64("n,,") — channel-binding-not-supported.
-    let client_final_no_proof = format!("c=biws,r={combined_nonce}");
+    let client_final_no_proof = format!("c={channel_binding},r={combined_nonce}");
     let server_first = format!("r={combined_nonce},s={salt_b64},i={iterations}");
     let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
 

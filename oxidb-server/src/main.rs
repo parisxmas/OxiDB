@@ -1139,6 +1139,10 @@ PROTOCOLS (off unless set):
                            the two protocols ('/' <-> '.')
     OXIDB_AMQP_USER        require PLAIN auth with this user (with _PASSWORD)
     OXIDB_AMQP_PASSWORD    the password for OXIDB_AMQP_USER
+    OXIDB_PG_PORT          PostgreSQL wire protocol listener (psql, psycopg);
+                           serves the SQL engine, so it needs OXIDB_SQL=1.
+                           Uses the same accounts and SCRAM-SHA-256 verifiers
+                           as the native port, and TLS when OXIDB_TLS_CERT is set
     OXIDB_S3_PORT          S3-compatible HTTP listener
     OXIDB_HTTP_PORT        REST listener (also serves GET /metrics)
     OXIDB_WS_PORT          WebSocket listener
@@ -1746,6 +1750,58 @@ fn main() {
                         });
                     }
                     Err(e) => eprintln!("[amqp] accept error: {e}"),
+                }
+            }
+        });
+    }
+
+    // PostgreSQL wire protocol listener (optional, enabled via OXIDB_PG_PORT).
+    // Serves the SQL engine to unmodified PostgreSQL clients; the OxiWire port
+    // is untouched by it.
+    let pg_port: u16 = env::var("OXIDB_PG_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_PG_PORT must be a valid u16");
+    if pg_port > 0 {
+        let pg_addr = format!("0.0.0.0:{pg_port}");
+        let pg_listener = TcpListener::bind(&pg_addr).expect("failed to bind PostgreSQL listener");
+        let pg_cfg = oxidb_server::pg::PgConfig {
+            user_store: state.user_store.clone(),
+            auth_enabled: state.auth_enabled,
+            // This listener is only started in standalone mode (like every
+            // other optional listener), so nothing here is replicated.
+            cluster: false,
+            tls: tls_config.clone(),
+        };
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("PostgreSQL wire protocol listening on {pg_addr}")
+        );
+        std::thread::spawn(move || {
+            for stream in pg_listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        let cfg = pg_cfg.clone();
+                        std::thread::spawn(move || {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    oxidb_server::pg::handle_client(s, cfg);
+                                }));
+                            if let Err(e) = result {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[pg] connection handler panicked: {msg}");
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("[pg] accept error: {e}"),
                 }
             }
         });

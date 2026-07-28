@@ -15,6 +15,7 @@ pub mod mqtt;
 pub mod mqtt_session;
 pub mod oximem;
 pub mod oxiwire;
+pub mod pg;
 pub mod protocol;
 pub mod rbac;
 pub mod remote_client;

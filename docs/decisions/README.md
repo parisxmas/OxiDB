@@ -52,3 +52,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0020](0020-oxibase-control-plane.md) | OxiBase — a control plane for multi-tenant provisioning | Proposed (skeleton landed in-server) |
 | [0021](0021-oxibase-separate-service.md) | OxiBase as a separate control-plane service (data plane keeps only the secret hook) | Accepted |
 | [0022](0022-oxibase-dedicated-isolation.md) | Dedicated tenant isolation for OxiBase (one process per project) | Proposed |
+| [0023](0023-postgres-wire-protocol.md) | PostgreSQL wire protocol as a separate listener (psql, psycopg) | Accepted (v1) |

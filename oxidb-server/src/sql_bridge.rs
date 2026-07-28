@@ -95,6 +95,16 @@ fn normalize(db_name: &str) -> &str {
 }
 
 /// The lazily-opened SQL engine for one database.
+/// The SQL engine backing `db_name`, opening it if this is its first use.
+///
+/// The PostgreSQL wire listener (`crate::pg`) works in typed `QueryResult`s
+/// rather than the JSON envelope [`handle_sql`] produces, so it takes the
+/// engine directly — through this one accessor, so both ports still resolve a
+/// database name exactly the same way and see the same engine instance.
+pub fn engine(db_name: &str) -> Result<Arc<SqlEngine>, String> {
+    engine_for(db_name)
+}
+
 fn engine_for(db_name: &str) -> Result<Arc<SqlEngine>, String> {
     let Some(reg) = registry() else {
         return Err("SQL engine is not enabled (set OXIDB_SQL=1)".to_string());

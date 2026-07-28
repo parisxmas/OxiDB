@@ -561,6 +561,8 @@ error rather than being skipped or updated — check first, or `UPDATE` then
 
 ## See Also
 
+- [PostgreSQL Wire Protocol](postgres-wire.md) — reach this engine with `psql`
+  and `psycopg`, unmodified (`OXIDB_PG_PORT`)
 - [Server Configuration](server.md) — environment variables
 - [Protocol Reference](protocol-reference.md) — wire command reference
 - [Transactions](transactions.md) — document engine transactions (separate mechanism)

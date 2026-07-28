@@ -1899,6 +1899,15 @@ impl SqlEngine {
         Ok(parsed)
     }
 
+    /// Classify each statement in `sql` — one [`CommandKind`] per statement, in
+    /// order, aligned with the `QueryResult`s `execute` returns.
+    ///
+    /// Served from the same statement cache execution uses, so a caller that
+    /// classifies and then executes the same text parses it once.
+    pub fn command_kinds(&self, sql: &str) -> Result<Vec<CommandKind>> {
+        Ok(self.cached_parse(sql)?.iter().map(command_kind).collect())
+    }
+
     /// EF Core's HiLo value generation emits `CREATE SEQUENCE`, `DROP
     /// SEQUENCE`, and `SELECT NEXT VALUE FOR seq` — none of which sqlparser's
     /// GenericDialect parses. Handle those three shapes directly (EF sends one
@@ -2582,6 +2591,74 @@ fn collect_table_ref(t: &ast::TableRef, out: &mut Vec<String>) {
         // A derived table reads whatever is inside it; its alias is not a table.
         Some(inner) => collect_query_tables(inner, out),
         None => push_table(&t.name, out),
+    }
+}
+
+/// What kind of statement produced a result — the PostgreSQL wire protocol's
+/// `CommandComplete` has to name it (`INSERT 0 3`, `UPDATE 2`, `CREATE TABLE`),
+/// and [`QueryResult`] deliberately does not: `Mutation` and `Ddl` say what
+/// happened, not which verb asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint,
+    Release,
+    Call,
+    Show,
+    /// DDL, carrying the tag PostgreSQL would use (`CREATE TABLE`, `DROP VIEW`).
+    Ddl(&'static str),
+}
+
+impl CommandKind {
+    /// The `CommandComplete` tag, given the row count the statement produced.
+    /// `INSERT` alone carries an OID field (always 0 since PostgreSQL 12).
+    pub fn tag(self, rows: usize) -> String {
+        match self {
+            CommandKind::Select => format!("SELECT {rows}"),
+            CommandKind::Insert => format!("INSERT 0 {rows}"),
+            CommandKind::Update => format!("UPDATE {rows}"),
+            CommandKind::Delete => format!("DELETE {rows}"),
+            CommandKind::Begin => "BEGIN".into(),
+            CommandKind::Commit => "COMMIT".into(),
+            CommandKind::Rollback => "ROLLBACK".into(),
+            CommandKind::Savepoint => "SAVEPOINT".into(),
+            CommandKind::Release => "RELEASE".into(),
+            CommandKind::Call => "CALL".into(),
+            CommandKind::Show => format!("SELECT {rows}"),
+            CommandKind::Ddl(tag) => tag.into(),
+        }
+    }
+}
+
+fn command_kind(s: &ast::Statement) -> CommandKind {
+    use ast::Statement as S;
+    match s {
+        S::Select(_) => CommandKind::Select,
+        S::Insert { .. } => CommandKind::Insert,
+        S::Update { .. } => CommandKind::Update,
+        S::Delete { .. } => CommandKind::Delete,
+        S::Begin => CommandKind::Begin,
+        S::Commit => CommandKind::Commit,
+        S::Rollback => CommandKind::Rollback,
+        S::Savepoint(_) | S::RollbackToSavepoint(_) => CommandKind::Savepoint,
+        S::ReleaseSavepoint(_) => CommandKind::Release,
+        S::Call { .. } => CommandKind::Call,
+        S::Show(_) => CommandKind::Show,
+        S::CreateTable { .. } => CommandKind::Ddl("CREATE TABLE"),
+        S::DropTable { .. } => CommandKind::Ddl("DROP TABLE"),
+        S::AlterTable { .. } => CommandKind::Ddl("ALTER TABLE"),
+        S::CreateIndex { .. } => CommandKind::Ddl("CREATE INDEX"),
+        S::DropIndex { .. } => CommandKind::Ddl("DROP INDEX"),
+        S::CreateView { .. } => CommandKind::Ddl("CREATE VIEW"),
+        S::DropView { .. } => CommandKind::Ddl("DROP VIEW"),
+        S::CreateProcedure { .. } => CommandKind::Ddl("CREATE PROCEDURE"),
+        S::DropProcedure { .. } => CommandKind::Ddl("DROP PROCEDURE"),
     }
 }
 

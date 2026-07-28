@@ -67,11 +67,20 @@ impl ScramState {
         client_msg: &str,
         user_store: &UserStore,
     ) -> Result<(String, Self), String> {
-        // Parse: n,,n=<user>,r=<nonce>
-        let msg = if let Some(stripped) = client_msg.strip_prefix("n,,") {
-            stripped
+        // Parse: <gs2-header>n=<user>,r=<nonce>
+        //
+        // `n,,` = the client does not support channel binding; `y,,` = it does
+        // but sees no -PLUS mechanism offered. Both are conforming openings and
+        // a PostgreSQL client picks between them on its own, so both are
+        // accepted — but which one was sent changes the `c=` field of
+        // client-final, and therefore the auth message, so it is remembered
+        // rather than assumed.
+        let (gs2_header, msg) = if let Some(stripped) = client_msg.strip_prefix("n,,") {
+            ("n,,", stripped)
+        } else if let Some(stripped) = client_msg.strip_prefix("y,,") {
+            ("y,,", stripped)
         } else {
-            return Err("invalid client-first: must start with 'n,,'".into());
+            return Err("invalid client-first: must start with 'n,,' or 'y,,'".into());
         };
 
         let mut username = None;
@@ -129,9 +138,13 @@ impl ScramState {
 
         let server_first = format!("r={},s={},i={}", combined_nonce, salt_b64, iter_count);
 
+        // The `c=` of client-final is base64(gs2-header) — "biws" for `n,,`,
+        // "eSws" for `y,,`. It is part of the signed auth message, so it has to
+        // reflect what the client actually sent.
+        let channel_binding = base64_encode_simple(gs2_header.as_bytes());
         let auth_message = format!(
-            "{},{},c=biws,r={}",
-            client_first_bare, server_first, combined_nonce
+            "{},{},c={},r={}",
+            client_first_bare, server_first, channel_binding, combined_nonce
         );
 
         Ok((
