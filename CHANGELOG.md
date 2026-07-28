@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Licensing: OxiDB is source-available from v0.40.0
+
+The engine's source is public, and running it in production for your own
+applications and business is free — any scale, any number of instances,
+no registration. Two things still need a commercial licence: offering
+OxiDB to third parties as a service, and distributing it, alone or
+embedded in a product. See [`LICENSE`](LICENSE) and
+[`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
+
+This opens up the v0.33–v0.39 line rather than closing it further: those
+versions required a licence for *any* use, including running it
+yourself. Each prior release keeps the licence it shipped under, and an
+existing commercial licence is unaffected.
+
+The licence is modelled on the Elastic License 2.0, with one limitation
+added — ELv2 permits redistribution, and embedding OxiDB in a
+distributed product remains a commercial arrangement here. It carries no
+conversion date: it does not become an open-source licence later.
+
+The MIT client libraries are untouched, redistribution included.
+
 ### Durability fix: fsync failure poisons in-memory state (fsyncgate)
 
 - A new fsync-EIO test (`tests/fsync_fault.rs`, via a zero-cost WAL
