@@ -2,13 +2,13 @@
 """Emit the benchmark dataset as multi-row INSERT statements on stdout.
 
 Deterministic (fixed seed), so both engines load byte-identical data and a
-re-run compares against the same numbers. Row counts sum to exactly 1,000,000:
+re-run compares against the same numbers. Row counts sum to 1,200,000:
 
     customers      200,000   surrogate PK, UNIQUE email, 2 indexes
     products        50,000   surrogate PK, UNIQUE sku, 2 indexes
     orders         400,000   surrogate PK, FK -> customers, 2 indexes
     order_items    300,000   COMPOSITE PK, FK -> orders, 1 index
-    inventory       50,000   COMPOSITE PK, FK -> products, 1 index
+    inventory      250,000   COMPOSITE PK (product x warehouse), FK -> products
 
 Parents are emitted before children so foreign keys resolve on an engine that
 enforces them row by row (both do).
@@ -21,7 +21,6 @@ CUSTOMERS = 200_000
 PRODUCTS = 50_000
 ORDERS = 400_000
 ORDER_ITEMS = 300_000
-INVENTORY = 50_000
 
 COUNTRIES = ["TR", "US", "DE", "FR", "GB", "NL", "ES", "IT", "PL", "SE"]
 CATEGORIES = ["tools", "garden", "kitchen", "office", "outdoor", "audio", "pets"]

@@ -145,6 +145,11 @@ impl RowIds {
     }
 }
 
+/// File name a table's primary key is materialized under, alongside its
+/// secondary indexes. `$` is not legal in an identifier, so this can never
+/// collide with a user-created index on the same table.
+const PK_INDEX_NAME: &str = "$pk";
+
 /// PRIMARY KEY tuple -> `row_id`, in whichever representation the key shape
 /// allows.
 ///
@@ -318,7 +323,18 @@ struct TableState {
     /// single-column key is simply a one-element tuple, so composite and
     /// simple primary keys take one code path.
     pk_cols: Vec<usize>,
+    /// PRIMARY KEY -> row id for rows written since the last checkpoint. With
+    /// `pk_base` present this is an *overlay*, not the whole key set.
     pk_map: PkMap,
+    /// The last checkpoint's primary-key file, mapped. Same hint contract as a
+    /// secondary index's base: it is the key set as of that checkpoint, and
+    /// every hit is verified against the live row.
+    ///
+    /// This is what stops a primary key costing 34 bytes of RAM per row for the
+    /// life of the process. PostgreSQL does not hold one either — a unique
+    /// insert there descends the on-disk index and binary-searches a locked
+    /// leaf page (`_bt_check_unique`, `src/backend/access/nbtree/nbtinsert.c`).
+    pk_base: Option<index_file::MappedIndex>,
     /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
     /// NULLs are exempt (per SQL).
     uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
@@ -360,6 +376,7 @@ impl TableState {
             indexes: BTreeMap::new(),
             pk_cols,
             pk_map,
+            pk_base: None,
             uniques,
             has_dropped: false,
             scan_cache: None,
@@ -440,6 +457,12 @@ impl TableState {
             .map(|(i, _)| (i, BTreeMap::new()))
             .collect();
         self.pk_map.clear();
+        // The mapped base was built at the *old* physical layout, so after an
+        // ALTER shifts positions its keys describe different columns. Drop it
+        // and rebuild the whole key set in memory below; the next checkpoint
+        // writes a fresh file at the new layout. Keeping it would be worse than
+        // slow — a lookup would miss a genuine duplicate.
+        self.pk_base = None;
         self.next_auto = 1;
         // Constraint maps key on physical cell positions, so seed from the
         // physical rows (tombstoned slots present, narrow rows padded).
@@ -593,7 +616,7 @@ impl TableState {
         if let Some(key) = self.pk_key(cells) {
             // Only remove the mapping if it still points at this row (an
             // idempotent WAL replay can re-insert before the old delete).
-            if self.pk_map.get(&key) == Some(row_id) {
+            if self.pk_owner_of(&key) == Some(row_id) {
                 self.pk_map.remove(&key);
             }
         }
@@ -605,12 +628,34 @@ impl TableState {
         }
     }
 
+    /// The live row owning PRIMARY KEY `key`, consulting the overlay first and
+    /// then the mapped base.
+    ///
+    /// Both are hints and both are verified: the overlay can name a row a later
+    /// statement deleted, and the base can name one deleted or re-keyed since
+    /// the checkpoint. A stale hit that were *not* rejected would be a phantom
+    /// duplicate-key error on a key that is actually free, so this check is the
+    /// difference between a correct constraint and a broken one.
+    fn pk_owner_of(&self, key: &[IndexKey]) -> Option<u64> {
+        let verify = |rid: u64| -> Option<u64> {
+            let phys = self.rows.get_physical(rid)?;
+            (self.pk_key(&phys)?.as_slice() == key).then_some(rid)
+        };
+        if let Some(rid) = self.pk_map.get(key)
+            && let Some(rid) = verify(rid)
+        {
+            return Some(rid);
+        }
+        let base = self.pk_base.as_ref()?;
+        base.get(key).ok()?.into_iter().find_map(verify)
+    }
+
     /// Error if `cells`' PRIMARY KEY value already belongs to a row other
     /// than `exclude_row`. A composite key collides only when *every* member
     /// matches.
     fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
         if let Some(key) = self.pk_key(cells)
-            && let Some(existing) = self.pk_map.get(&key)
+            && let Some(existing) = self.pk_owner_of(&key)
             && Some(existing) != exclude_row
         {
             return Err(SqlError::DuplicateKey(format!(
@@ -695,7 +740,7 @@ impl<'a> BatchSim<'a> {
             }
             let key: KeyTuple = k.cols.iter().map(|&p| IndexKey(cells[p].clone())).collect();
             let committed = match k.unique_idx {
-                None => self.state.pk_map.get(&key),
+                None => self.state.pk_owner_of(&key),
                 Some(i) => self.state.uniques[i].1.get(&key[0]).copied(),
             };
             let taken = committed
@@ -926,11 +971,17 @@ impl SqlEngine {
         for (name, def) in &catalog.tables {
             let mut state = TableState::empty(def.clone(), opts.disk_first);
             if opts.disk_first {
+                // A materialized primary key means the map does not have to be
+                // rebuilt at all — the pass below still runs, because
+                // `next_row_id` and AUTO_INCREMENT have to be recovered from
+                // the rows, but it stops retaining a key per row.
+                state.pk_base = index_file::MappedIndex::open(&load_dir, name, PK_INDEX_NAME)?;
+                let seed_pk = state.pk_base.is_none();
                 if let Some(snap) = storage::MappedSnapshot::open(&load_dir, name, def.arity())? {
                     for (row_id, cells) in snap.entries() {
                         state.observe_row_id(row_id);
                         state.observe_auto(&cells);
-                        if let Some(key) = state.pk_key(&cells) {
+                        if seed_pk && let Some(key) = state.pk_key(&cells) {
                             state.pk_map.insert(key, row_id);
                         }
                         for (pos, map) in state.uniques.iter_mut() {
@@ -1731,7 +1782,7 @@ impl SqlEngine {
     /// must be built from the table's `pk_cols` in order.
     pub(crate) fn pk_owner(&self, table: &str, key: &[IndexKey]) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
-        inner.tables.get(table)?.pk_map.get(key)
+        inner.tables.get(table)?.pk_owner_of(key)
     }
 
     /// Look up rows using a secondary index whose columns are all present in
@@ -1760,8 +1811,7 @@ impl SqlEngine {
                 .collect();
             if let Some(key) = key {
                 let rows: store::Rows = state
-                    .pk_map
-                    .get(&key)
+                    .pk_owner_of(&key)
                     .and_then(|id| state.rows.get(id).map(|c| (id, c)))
                     .into_iter()
                     .collect();
@@ -2098,6 +2148,24 @@ impl SqlEngine {
         for (name, state) in tables.iter() {
             storage::write_snapshot(&new_dir, name, state.rows.iter_physical())?;
         }
+        // The primary key is materialized the same way, from the rows — with a
+        // base present the map is only an overlay, so the rows are the one
+        // source that reflects both.
+        for (name, state) in tables.iter() {
+            if state.pk_cols.is_empty() {
+                continue;
+            }
+            let mut entries: BTreeMap<KeyTuple, Vec<u64>> = BTreeMap::new();
+            for (rid, cells) in state.rows.iter_physical() {
+                if let Some(key) = state.pk_key(&cells) {
+                    entries.entry(key).or_default().push(rid);
+                }
+            }
+            let refs: Vec<(&KeyTuple, &[u64])> =
+                entries.iter().map(|(k, v)| (k, v.as_slice())).collect();
+            index_file::write_index(&new_dir, name, PK_INDEX_NAME, state.pk_cols.len(), refs)?;
+        }
+
         // Every declared index is materialized into the generation, whether or
         // not it is currently in memory — that is what lets the next open serve
         // it from a mapping instead of rebuilding it into RAM. The sort is
@@ -2146,6 +2214,13 @@ impl SqlEngine {
                     storage::MappedSnapshot::open(&new_dir, name, state.def.arity())?
                 {
                     state.rows.attach_base(snap);
+                }
+                if !state.pk_cols.is_empty()
+                    && let Some(base) =
+                        index_file::MappedIndex::open(&new_dir, name, PK_INDEX_NAME)?
+                {
+                    state.pk_base = Some(base);
+                    state.pk_map.clear();
                 }
                 // Same for the indexes: adopt the files just written and drop
                 // the in-RAM maps they now contain. The overlay restarts empty
@@ -3833,6 +3908,162 @@ mod disk_index_tests {
             !found.contains(&2),
             "refolded base kept a delete: {found:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_pk_tests {
+    //! The primary key served from a mapped file. Uniqueness is a *constraint*,
+    //! so a stale hint here is worse than a slow lookup: accepting a duplicate
+    //! corrupts the table, and rejecting a free key fails a valid write. Every
+    //! way the base can go stale gets a test.
+    use super::*;
+
+    fn open(dir: &std::path::Path) -> SqlEngine {
+        SqlEngine::open_with_options(
+            dir,
+            SqlOptions {
+                disk_first: true,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn has_pk_base(db: &SqlEngine, table: &str) -> bool {
+        db.inner.lock().unwrap().tables[table].pk_base.is_some()
+    }
+
+    /// 20 rows, checkpointed so a `$pk` file exists, then reopened.
+    fn seeded() -> (tempfile::TempDir, SqlEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+            for i in 1..=20 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let db = open(dir.path());
+        assert!(
+            has_pk_base(&db, "t"),
+            "the checkpoint must write a $pk file"
+        );
+        (dir, db)
+    }
+
+    #[test]
+    fn the_key_set_is_not_rebuilt_in_memory() {
+        let (_d, db) = seeded();
+        let resident = match &db.inner.lock().unwrap().tables["t"].pk_map {
+            PkMap::Int(m) => m.len(),
+            PkMap::Tuple(m) => m.len(),
+        };
+        assert_eq!(resident, 0, "opening must not rebuild the key map");
+        // ...and the key still resolves.
+        assert_eq!(db.pk_owner("t", &[IndexKey(Value::Int(7))]), Some(7));
+    }
+
+    /// The constraint still holds for a key that exists only in the file.
+    #[test]
+    fn a_duplicate_of_a_checkpointed_key_is_refused() {
+        let (_d, db) = seeded();
+        let err = db.execute("INSERT INTO t VALUES (7, 'dup')").unwrap_err();
+        assert!(
+            matches!(err, SqlError::DuplicateKey(_)),
+            "expected a duplicate-key error, got {err:?}"
+        );
+        // The failed insert changed nothing.
+        assert_eq!(db.row_count("t").unwrap(), 20);
+    }
+
+    /// A deleted row leaves its key in the base. The key must be reusable —
+    /// rejecting it would fail a perfectly valid insert.
+    #[test]
+    fn a_deleted_keys_slot_can_be_reused() {
+        let (_d, db) = seeded();
+        db.execute("DELETE FROM t WHERE id = 7").unwrap();
+        db.execute("INSERT INTO t VALUES (7, 'again')").unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 20);
+        // And it is now a duplicate again.
+        assert!(db.execute("INSERT INTO t VALUES (7, 'no')").is_err());
+    }
+
+    /// Moving a row's key frees the old one and claims the new one, while the
+    /// base still says otherwise about both.
+    #[test]
+    fn a_moved_key_frees_the_old_and_claims_the_new() {
+        let (_d, db) = seeded();
+        db.execute("UPDATE t SET id = 100 WHERE id = 7").unwrap();
+        // Old key is free.
+        db.execute("INSERT INTO t VALUES (7, 'reused')").unwrap();
+        // New key is taken.
+        assert!(db.execute("INSERT INTO t VALUES (100, 'no')").is_err());
+        assert_eq!(db.row_count("t").unwrap(), 21);
+    }
+
+    /// Rows written after the checkpoint are enforced from the overlay, and
+    /// survive a restart through the WAL replay.
+    #[test]
+    fn keys_written_after_the_checkpoint_are_enforced_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+            db.checkpoint().unwrap();
+            db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+            assert!(db.execute("INSERT INTO t VALUES (2, 'dup')").is_err());
+        }
+        let db = open(dir.path());
+        assert!(has_pk_base(&db, "t"));
+        // Both the checkpointed key and the WAL-tail key are still taken.
+        assert!(db.execute("INSERT INTO t VALUES (1, 'dup')").is_err());
+        assert!(db.execute("INSERT INTO t VALUES (2, 'dup')").is_err());
+        db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 3);
+    }
+
+    /// Composite keys take the same path.
+    #[test]
+    fn composite_keys_work_from_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE t (a INT NOT NULL, b TEXT NOT NULL, v TEXT, CONSTRAINT pk PRIMARY KEY (a, b))")
+                .unwrap();
+            for i in 1..=10 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'w{}', 'v')", i % 3))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let db = open(dir.path());
+        assert!(has_pk_base(&db, "t"));
+        assert!(
+            db.execute("INSERT INTO t VALUES (1, 'w1', 'dup')").is_err(),
+            "a checkpointed composite key must still collide"
+        );
+        // Same first member, different second: not a collision.
+        db.execute("INSERT INTO t VALUES (1, 'other', 'ok')")
+            .unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 11);
+    }
+
+    /// `ALTER` shifts physical positions, so the base's keys stop describing
+    /// the key columns. It must be dropped, not consulted.
+    #[test]
+    fn an_alter_that_shifts_positions_drops_the_base() {
+        let (_d, db) = seeded();
+        db.execute("ALTER TABLE t RENAME COLUMN v TO w").unwrap();
+        // Still enforced, from whatever representation the rebuild produced.
+        assert!(db.execute("INSERT INTO t VALUES (7, 'dup')").is_err());
+        db.execute("INSERT INTO t VALUES (21, 'ok')").unwrap();
+        assert_eq!(db.row_count("t").unwrap(), 21);
     }
 }
 

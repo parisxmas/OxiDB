@@ -122,12 +122,6 @@ where
     Ok(())
 }
 
-/// Remove an index's file, if it has one. Best-effort: a leftover only wastes
-/// disk, and the next checkpoint overwrites it.
-pub fn remove_index(dir: &Path, table: &str, index: &str) {
-    let _ = fs::remove_file(sidx_path(dir, table, index));
-}
-
 /// A `.sidx` mapped into the address space.
 ///
 /// Holds no per-entry Rust structure — the entry table is read straight out of
@@ -188,6 +182,9 @@ impl MappedIndex {
         }))
     }
 
+    /// Entry count — distinct keys, not row ids. Used by the format's own
+    /// tests; the engine only ever asks for a key.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries
     }
