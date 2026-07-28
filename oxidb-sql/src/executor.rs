@@ -3021,6 +3021,12 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     //    from `small` so the big table is reached by an index probe, not a
     //    full materialization. Safe only across all-INNER base-table joins.
     choose_driver(store, &mut select, params);
+    // 0b. Aggregates over a single table are folded during the scan, without
+    //     materializing the rows at all. Returns `None` for anything it does
+    //     not handle, which then takes the general path below unchanged.
+    if let Some(result) = streamed_aggregate(store, &select, params)? {
+        return Ok(result);
+    }
     // 1. Build the source: base table, then joins (the join ON is bound inside).
     let (schema, src, mut tuples) = build_source(store, &select, params)?;
 
@@ -4580,6 +4586,351 @@ fn base_chunk<S: Store>(
         return Ok(chunk);
     }
     store.scan_pruned(&from.name, keep)
+}
+
+/// One accumulator, folding values as a scan produces them.
+enum Acc {
+    /// `COUNT(*)` — no argument to evaluate.
+    CountStar(i64),
+    Count(i64),
+    Sum(Option<f64>, bool),
+    Avg(f64, i64),
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+impl Acc {
+    /// `func` is one of the shapes `streamed_aggregate`'s guard admits;
+    /// anything else (`MODE`, ordered-set aggregates) is rejected there so this
+    /// never sees it.
+    fn new(func: AggFunc, star: bool) -> Acc {
+        match (func, star) {
+            (AggFunc::Mode, _) => unreachable!("rejected by the guard"),
+            (AggFunc::Count, true) => Acc::CountStar(0),
+            (AggFunc::Count, false) => Acc::Count(0),
+            // `is_int` tracks whether every folded value was an integer, so
+            // SUM over an integer column returns an integer as it does on the
+            // general path rather than silently becoming a float.
+            (AggFunc::Sum, _) => Acc::Sum(None, true),
+            (AggFunc::Avg, _) => Acc::Avg(0.0, 0),
+            (AggFunc::Min, _) => Acc::Min(None),
+            (AggFunc::Max, _) => Acc::Max(None),
+        }
+    }
+
+    fn fold(&mut self, v: &Value) {
+        if let Acc::CountStar(n) = self {
+            *n += 1;
+            return;
+        }
+        if matches!(v, Value::Null) {
+            return; // SQL: aggregates other than COUNT(*) skip NULLs
+        }
+        match self {
+            Acc::CountStar(_) => unreachable!("handled above"),
+            Acc::Count(n) => *n += 1,
+            Acc::Sum(acc, is_int) => {
+                if !matches!(v, Value::Int(_)) {
+                    *is_int = false;
+                }
+                if let Some(f) = num(v) {
+                    *acc = Some(acc.unwrap_or(0.0) + f);
+                }
+            }
+            Acc::Avg(total, n) => {
+                if let Some(f) = num(v) {
+                    *total += f;
+                    *n += 1;
+                }
+            }
+            Acc::Min(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|c| Value::total_order(v, c) == Ordering::Less)
+                {
+                    *best = Some(v.clone());
+                }
+            }
+            Acc::Max(best) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|c| Value::total_order(v, c) == Ordering::Greater)
+                {
+                    *best = Some(v.clone());
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Value {
+        match self {
+            Acc::CountStar(n) | Acc::Count(n) => Value::Int(n),
+            Acc::Sum(None, _) => Value::Null,
+            Acc::Sum(Some(f), true) => Value::Int(f as i64),
+            Acc::Sum(Some(f), false) => Value::Double(f),
+            Acc::Avg(_, 0) => Value::Null,
+            Acc::Avg(total, n) => Value::Double(total / n as f64),
+            Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Value::Null),
+        }
+    }
+}
+
+fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Double(f) => Some(*f),
+        Value::Decimal(d) => Some(d.to_f64()),
+        Value::Timestamp(t) => Some(*t as f64),
+        _ => None,
+    }
+}
+
+/// Fold a single-table aggregate during the scan instead of materializing the
+/// rows and aggregating over them.
+///
+/// The general path builds every source row into a `Chunk`, then indexes into
+/// it per group. For `SELECT sum(total) FROM orders WHERE id > 100` that is two
+/// passes over 400,000 rows and a 400,000-element vector, to produce one row.
+/// This makes it one pass and no vector, which is what closes most of the gap
+/// to PostgreSQL on aggregates.
+///
+/// `Ok(None)` for anything outside the narrow shape it handles, so the general
+/// path stays authoritative — the guard below is deliberately conservative and
+/// every rejection is a query that still runs, just the old way.
+fn streamed_aggregate<S: Store>(
+    store: &S,
+    select: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<QueryResult>> {
+    // Shape: one base table, no joins, no ordering/limiting/distinct, no
+    // windows. HAVING is allowed — it is applied to finished groups.
+    let Some(from) = &select.from else {
+        return Ok(None);
+    };
+    if from.subquery.is_some()
+        || !select.joins.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.distinct
+    {
+        return Ok(None);
+    }
+    let Some(base_def) = store.table_def(&from.name) else {
+        return Ok(None);
+    };
+    let full = qualified_schema(from.key(), &base_def);
+
+    // Every projection item must be a group key or an aggregate over a
+    // streamable expression; nothing nested (`sum(x) + 1`) and no DISTINCT.
+    let proj = expand_projection(&select.projection, &full)?;
+    if proj.is_empty() {
+        return Ok(None);
+    }
+    let group: Vec<Expr> = select
+        .group_by
+        .iter()
+        .map(|e| bind_expr(e, &full))
+        .collect::<Result<_>>()?;
+    // Per projection item: fold an aggregate, or echo group key `i`.
+    enum Item {
+        Agg(AggFunc, Option<Expr>),
+        Key(usize),
+    }
+    let mut plan: Vec<Item> = Vec::new();
+    for (_, e) in &proj {
+        let bound = bind_expr(e, &full)?;
+        match &bound {
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct: false,
+            } => {
+                // MODE is an ordered-set aggregate; it needs the values, not
+                // a fold, so it stays on the general path.
+                if *func == AggFunc::Mode {
+                    return Ok(None);
+                }
+                let arg = match arg.as_deref() {
+                    None => None,
+                    Some(a) if streamable(a, params) && !has_aggregate(a) => Some(a.clone()),
+                    Some(_) => return Ok(None),
+                };
+                // SUM and AVG fold through `f64` here, which is exact for
+                // integers and doubles and *not* for DECIMAL — the general
+                // path adds decimals exactly, and a fast path that quietly
+                // rounded them would be a wrong answer, not a slower one. So
+                // only stream arithmetic over types where the fold is exact,
+                // and only when the type is actually known.
+                if matches!(func, AggFunc::Sum | AggFunc::Avg) {
+                    let ty = arg.as_ref().and_then(|a| expr_type(a, &full));
+                    if !matches!(
+                        ty,
+                        Some(SqlType::Int) | Some(SqlType::Double) | Some(SqlType::Timestamp)
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                plan.push(Item::Agg(*func, arg));
+            }
+            other if !has_aggregate(other) => {
+                // A plain expression is only legal here if it is a group key.
+                match group.iter().position(|g| g == other) {
+                    Some(i) => plan.push(Item::Key(i)),
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    if group.iter().any(|g| !streamable(g, params)) {
+        return Ok(None);
+    }
+    // Nothing to stream if there are no aggregates at all.
+    if !plan.iter().any(|p| matches!(p, Item::Agg(..))) {
+        return Ok(None);
+    }
+    let filter = match &select.filter {
+        None => None,
+        Some(f) => {
+            let b = bind_expr(f, &full)?;
+            if !streamable(&b, params) || has_aggregate(&b) {
+                return Ok(None);
+            }
+            Some(b)
+        }
+    };
+    let having = match &select.having {
+        None => None,
+        Some(h) => Some(bind_expr(h, &full)?),
+    };
+
+    // Fold. One entry per group; `None` key for the no-GROUP-BY case, which
+    // still produces exactly one row even over an empty table.
+    let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
+    let mut index: std::collections::BTreeMap<Vec<IndexKey>, usize> =
+        std::collections::BTreeMap::new();
+    let fresh = || -> Vec<Acc> {
+        plan.iter()
+            .map(|p| match p {
+                Item::Agg(f, a) => Acc::new(*f, a.is_none()),
+                Item::Key(_) => Acc::CountStar(0), // unused for key positions
+            })
+            .collect()
+    };
+    if group.is_empty() {
+        groups.push((Vec::new(), fresh()));
+    }
+    // An equality filter an index can serve must still go through the index —
+    // folding is about avoiding materialization, not about giving up index
+    // access. Bypassing this turned `count(*) WHERE customer_id = ?` from a
+    // 25µs probe into a 4ms full scan, which the benchmark caught immediately.
+    let indexed = match &select.filter {
+        Some(e) => {
+            let eqs = eq_conjuncts(e, from.key(), params);
+            match eqs.is_empty() {
+                true => None,
+                false => store.index_lookup_eq(&from.name, &eqs)?,
+            }
+        }
+        None => None,
+    };
+
+    let mut key: Vec<IndexKey> = Vec::with_capacity(group.len());
+    let mut fold_row = |row: &[Value]| -> Result<()> {
+        if let Some(f) = &filter
+            && !truthy(&eval_scalar(f, &full, row, params)?)
+        {
+            return Ok(());
+        }
+        let at = if group.is_empty() {
+            0
+        } else {
+            key.clear();
+            for g in &group {
+                key.push(IndexKey(eval_scalar(g, &full, row, params)?));
+            }
+            // `IndexKey` orders values but does not hash them, so groups live
+            // in a BTreeMap. The lookup borrows the reused buffer — `Vec<K>`
+            // borrows as `[K]` — so a row that lands in an existing group
+            // allocates nothing. Building a fresh key vector per row cost more
+            // than the grouping itself on a table with few distinct keys.
+            match index.get(key.as_slice()) {
+                Some(i) => *i,
+                None => {
+                    groups.push((key.iter().map(|k| k.0.clone()).collect(), fresh()));
+                    index.insert(key.clone(), groups.len() - 1);
+                    groups.len() - 1
+                }
+            }
+        };
+        for (i, p) in plan.iter().enumerate() {
+            if let Item::Agg(_, arg) = p {
+                match arg {
+                    None => groups[at].1[i].fold(&Value::Null), // COUNT(*)
+                    Some(a) => {
+                        let v = eval_scalar(a, &full, row, params)?;
+                        groups[at].1[i].fold(&v);
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    match indexed {
+        // Already narrowed by the index: fold those rows and nothing else.
+        Some(rows) => {
+            for (_, cells) in rows {
+                fold_row(&cells)?;
+            }
+        }
+        None => {
+            store.scan_visit(&from.name, &mut |row| {
+                fold_row(row)?;
+                Ok(true)
+            })?;
+        }
+    }
+
+    // Emit.
+    let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<Option<SqlType>> = proj.iter().map(|(_, e)| expr_type(e, &full)).collect();
+    let mut rows = Vec::with_capacity(groups.len());
+    for (key, accs) in groups {
+        let out: Vec<Value> = accs
+            .into_iter()
+            .zip(&plan)
+            .map(|(acc, p)| match p {
+                Item::Agg(..) => acc.finish(),
+                Item::Key(i) => key[*i].clone(),
+            })
+            .collect();
+        if let Some(h) = &having {
+            // HAVING sees the finished group: its columns are the projection.
+            let names: Vec<ColRef> = columns
+                .iter()
+                .zip(&types)
+                .map(|(c, t)| ColRef {
+                    table: String::new(),
+                    name: c.clone(),
+                    ty: *t,
+                })
+                .collect();
+            let bound = match bind_expr(h, &names) {
+                Ok(b) => b,
+                Err(_) => return Ok(None), // HAVING over something not projected
+            };
+            if !truthy(&eval_scalar(&bound, &names, out.as_slice(), params)?) {
+                continue;
+            }
+        }
+        rows.push(out);
+    }
+    Ok(Some(QueryResult::Select {
+        columns,
+        types,
+        rows,
+    }))
 }
 
 /// Whether an expression may be evaluated inside a streamed scan: no

@@ -190,11 +190,14 @@ pub struct WalReplay {
 }
 
 impl WalReplay {
-    /// How many records are still to be replayed.
+    /// How many records are still to be replayed. The engine replays by
+    /// iterating and never asks; the WAL's own recovery tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.locations.len() - self.at
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

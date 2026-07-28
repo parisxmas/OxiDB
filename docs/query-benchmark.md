@@ -34,43 +34,53 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 
 | Workload | OxiDB /s | p50 | PostgreSQL /s | p50 | Ratio |
 |---|---:|---:|---:|---:|---:|
-| Point `SELECT` by primary key | 37.2k | 26µs | 38.4k | 26µs | **0.97×** |
-| Composite primary key lookup | 36.3k | 27µs | 37.4k | 27µs | **0.97×** |
-| Secondary index equality | 40.4k | 25µs | 37.3k | 27µs | **1.08×** |
-| Range scan + `ORDER BY` + `LIMIT` | 35.1k | 28µs | 31.8k | 30µs | **1.10×** |
-| Index, low selectivity | 176 | 5.6ms | 605 | 1.6ms | **0.29×** |
-| Full-scan aggregate | 61 | 16.4ms | 128 | 7.8ms | **0.48×** |
-| `GROUP BY` | 34 | 29.1ms | 82 | 12.1ms | **0.42×** |
-| Join + filter | 53 | 18.9ms | 95 | 10.5ms | **0.56×** |
+| Point `SELECT` by primary key | 37.0k | 27µs | 38.7k | 26µs | **0.96×** |
+| Composite primary key lookup | 35.8k | 28µs | 37.4k | 27µs | **0.96×** |
+| Secondary index equality | 42.4k | 24µs | 37.7k | 27µs | **1.13×** |
+| Range scan + `ORDER BY` + `LIMIT` | 35.8k | 27µs | 33.2k | 30µs | **1.08×** |
+| **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
+| `GROUP BY` | 54 | 18.4ms | 84 | 12.0ms | **0.65×** |
+| Join + filter | 54 | 18.4ms | 96 | 10.3ms | **0.56×** |
+| Index, low selectivity | 182 | 5.4ms | 593 | 1.7ms | **0.31×** |
 
-## What it says
+### What changed
 
-**Point access is a dead heat.** Primary key, composite key, secondary index
-equality and a small indexed range with `ORDER BY … LIMIT` all land within 10%
-either way, some ahead and some behind. For the request-per-key workload most
-applications actually run, OxiDB is competitive with PostgreSQL.
+The first run of this benchmark had every scanning workload at 0.24-0.48×.
+Aggregates are now folded **during** the scan rather than after it
+(`streamed_aggregate` in `executor.rs`):
 
-**Anything that scans is 2-3.5× slower.** Aggregates, `GROUP BY` and joins are
-where PostgreSQL's executor shows its decades: tight per-tuple loops, a planner
-that picks between scan strategies, and aggregate paths that avoid materializing
-rows. OxiDB's disadvantage grows with the number of rows a query has to walk.
-
-**Disk-first mode costs another chunk of scan speed**, because rows are decoded
-out of the mmap'd snapshot instead of being read as live values:
-
-| Workload | resident | disk-first |
+| Workload | before | after |
 |---|---:|---:|
-| Full-scan aggregate | 0.48× | 0.26× |
-| `GROUP BY` | 0.42× | 0.29× |
-| Join + filter | 0.56× | 0.24× |
+| Full-scan aggregate | 0.48× | **1.02×** |
+| `GROUP BY` | 0.42× | **0.65×** |
+| Secondary index equality | 1.08× | **1.13×** |
 
-Point lookups are unaffected — they touch one row either way. So the memory
-benchmarks' disk-first figures and this one's resident figures describe two
-different trades, and a deployment picks one: disk-first for footprint, resident
-for scan throughput.
+The general path builds every source row into a `Chunk` and then indexes into
+it per group — two passes over 400,000 rows and a 400,000-element vector, to
+produce one row. Folding accumulators as the scan produces rows makes it one
+pass and no vector.
 
-**Loading is slower too**: 21 s against 5.5 s for the same 1.2M rows through the
-same client.
+Two things that mattered more than the idea:
+
+- **It must not bypass the index.** The first version intercepted before the
+  index probe, so `count(*) WHERE customer_id = ?` went from a 25µs lookup to a
+  4ms full scan — 0.01×. The benchmark caught it immediately. Folding now runs
+  *over* the index result when one applies.
+- **It must not fold DECIMAL through `f64`.** The general path adds decimals
+  exactly. A fast path that quietly rounded them would be a wrong answer rather
+  than a slow one, so `SUM`/`AVG` stream only over types where the fold is
+  exact and the type is known.
+
+### What still loses, and why
+
+**Joins (0.56×)** do not use this path at all — join execution materializes both
+sides and is untouched.
+
+**Low-selectivity index scans (0.31×)** are the sharpest remaining gap.
+`index_lookup_eq` returns `Vec<(u64, Vec<Value>)>` — it *materializes* every
+matching row, cloning all its columns, before anything folds them. For a
+predicate matching 20,000 rows that is 20,000 row clones to answer a `count(*)`.
+A streaming index lookup would close it, and is the obvious next piece.
 
 ## What this does not measure
 
