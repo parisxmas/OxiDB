@@ -53,6 +53,7 @@ with OxiDbClient() as db:
 
 - **[Protocol Reference](protocol-reference.md)** -- Complete TCP protocol command reference with all fields, return values, and RBAC role requirements.
 
+- **[Memory vs PostgreSQL](pg-memory-benchmark.md)** -- the same 1,000,000 rows in both engines: OxiDB's startup floor and on-disk size against PostgreSQL's bounded buffer pool, and why the flattering startup number is an artifact.
 - **[Wire Benchmark](wire-benchmark.md)** -- OxiWire vs the PostgreSQL wire over the same SQL engine: where each wins, and the server-side buffering bug the comparison uncovered.
 
 - **[PostgreSQL Wire Protocol](postgres-wire.md)** -- Serving the SQL engine to unmodified PostgreSQL clients (`psql`, `psycopg`) on `OXIDB_PG_PORT`: SCRAM auth, type and SQLSTATE mapping, and what a v1 deliberately does not implement.
