@@ -7,7 +7,7 @@ export const metadata: Metadata = {
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
-    <p class="hero-kicker"><span class="hero-pulse"></span>v0.39 &middot; OxiBase multi-tenant backend &mdash; per-project auth, RLS &amp; quotas &middot; row-level security &middot; one shared cache (RSS bounded across tenants)</p>
+    <p class="hero-kicker"><span class="hero-pulse"></span>v0.40 &middot; <a href="/license/">now source-available</a> &mdash; free to run in production for your own applications, at any scale &middot; crash-atomic across collections &middot; OxiBase multi-tenant backend</p>
     <div class="hero-lockup">
       <img src="/oxidb-logo.svg" class="hero-logo" alt="OxiDB logo" width="96" height="96" />
       <h1>OxiDB</h1>
@@ -190,14 +190,14 @@ Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
 
     <h3>1. Download the server</h3>
     <pre><code class="lang-bash"><span class="co"># Linux (x86_64)</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.39.15/oxidb-server-v0.39.15-linux-amd64.tar.gz
-tar xzf oxidb-server-v0.39.15-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.40.0/oxidb-server-v0.40.0-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.40.0-linux-amd64.tar.gz
 
 <span class="co"># macOS (Apple Silicon)</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.39.15/oxidb-server-v0.39.15-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.39.15-darwin-arm64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.40.0/oxidb-server-v0.40.0-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.40.0-darwin-arm64.tar.gz
 
-<span class="co"># Windows: download oxidb-server-v0.39.15-windows-amd64.zip from /downloads/</span></code></pre>
+<span class="co"># Windows: download oxidb-server-v0.40.0-windows-amd64.zip from /downloads/</span></code></pre>
 
     <h3>2. Start the server</h3>
     <pre><code class="lang-bash"><span class="co"># Listens on 127.0.0.1:4444 by default; data goes to ./oxidb_data</span>
@@ -208,8 +208,8 @@ OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb ./oxidb-server</code></pre>
 
     <h3>3. Connect and run your first query</h3>
     <pre><code class="lang-bash"><span class="co"># Download the CLI</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.39.15/oxidb-v0.39.15-linux-amd64.tar.gz
-tar xzf oxidb-v0.39.15-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.40.0/oxidb-v0.40.0-linux-amd64.tar.gz
+tar xzf oxidb-v0.40.0-linux-amd64.tar.gz
 
 <span class="co"># Open the REPL against the running server</span>
 ./oxidb --host 127.0.0.1 --port 4444

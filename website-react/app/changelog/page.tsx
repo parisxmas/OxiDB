@@ -11,12 +11,42 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.40.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.40.0</h3>
+        <span class="version-date">2026-07-28</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Changed &mdash; OxiDB is source-available</h4>
+        <ul>
+          <li><strong>Read the source, modify it, and run it in production for your own applications and business &mdash; free, at any scale, with no registration.</strong> A commercial licence covers two things and only two: offering OxiDB to third parties as a service, and distributing it, alone or embedded in a product. See the <a href="/license/">licence page</a>.</li>
+          <li>This <em>opens up</em> the v0.33&ndash;v0.39 line rather than closing it further: those versions required a licence for any use at all, including running it yourself. Every prior release keeps the licence it was published with, and the MIT client libraries are unchanged &mdash; redistribution included.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; a transaction spanning two collections could recover half-applied</h4>
+        <ul>
+          <li><strong>The reason this release matters more than its licence change.</strong> In disk-first mode &mdash; the default since 0.38 &mdash; a record reached the data file when a transaction <em>applied</em> it, before its commit mark was durable, and the index is rebuilt on open by scanning for active records. A crash between apply and commit therefore resurrected one collection's half of a transaction while the other half, correctly, was discarded by WAL replay. Deletes had the mirror of it: an uncommitted delete could remove a document permanently.</li>
+          <li>Found by running the crash half of the suite (<code>cargo test -- --ignored</code>), which the normal run skips: three tests failed on one bug &mdash; the Jepsen-style bank that kills the process mid-commit, the multi-collection atomicity drill, and exactly-once retry.</li>
+          <li>Records written by an uncommitted transaction are now written <em>pending</em> and are invisible to a rebuild; the record each one displaces stays live. Both are settled at the commit point, so a crash between the mark and the settle costs nothing &mdash; replay restores the write, gated on the same commit log. Compaction and checkpointing stand off while any transaction has work outstanding. The in-RAM mode had the same hole by a different route and is covered by the same guard.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>The .NET TCP client could not survive a server restart.</strong> It connected once and stayed connected, so a deploy left every request failing until the client process restarted. It now redials and re-authenticates &mdash; retrying only where it is safe, and never inside a transaction, where the connection <em>is</em> the transaction.</li>
+          <li><strong>Reading with the wrong encryption key panicked</strong> instead of returning an error, reachable from a REST request: non-document bytes went straight to a parser that trusts a length in their header.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.39.15 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.39.15</h3>
         <span class="version-date">2026-07-24</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type fixed">Fixed &mdash; WebSocket handshake</h4>
