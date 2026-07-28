@@ -6,8 +6,10 @@ so `psql` loads both from one file over one protocol — nothing about the load
 path differs.
 
 ```bash
-bench/pg-memory/run.sh [workdir]     # process memory, both engines, all phases
-bench/pg-memory/fair.sh [workdir]    # total physical, incl. page cache
+bench/pg-memory/run.sh [workdir]      # process memory, both engines, all phases
+bench/pg-memory/fair.sh [workdir]     # total physical, incl. page cache
+bench/pg-memory/pressure.sh [workdir] # cgroup memory limits: where each stops
+bench/pg-memory/tenants.sh [workdir]  # many small tenants — the OxiBase shape
 ```
 
 ## The dataset
@@ -249,6 +251,47 @@ is where this stops for now.
 The practical shape of the trap is unchanged: a server sized for its steady
 state cannot restart immediately after a bulk load. The margin needed is now
 about 3.5× steady state rather than 4.5×.
+
+## Many small tenants: the shape OxiBase actually runs
+
+Everything above compares one large database against one PostgreSQL. That is
+the wrong shape for OxiBase, where a project *is* a database and every project
+on a host shares one engine process — while Supabase's model gives each project
+its own Postgres instance, so its fixed costs are paid per tenant rather than
+per host.
+
+[`tenants.sh`](../bench/pg-memory/tenants.sh) measures that: 10 tenants, each a
+small SaaS schema (5k customers, 20k orders with a foreign key, 40k order lines
+under a composite key, four indexes), same data both sides, loaded through the
+same client. Memory is each container's own `memory.current`, which charges
+page cache to whoever faulted it, summed across every container the engine
+needs. PostgreSQL is tuned to `shared_buffers=32MB` — the setting that won the
+pressure test, not the stock 128MB.
+
+| | OxiDB | PostgreSQL |
+|---|---:|---:|
+| Processes / containers | **1** | 10 |
+| Total, 10 tenants warmed | **201 MB** | 960 MB |
+| Per tenant | **20 MB** | 96 MB |
+| Marginal, per extra tenant | **~16 MB** | 96 MB |
+
+**4.8× less memory for the same ten tenants**, and the gap widens with the
+count: PostgreSQL's 96 MB was identical for every instance, because a postmaster
+plus eight background processes plus `shared_buffers` is a fixed cost paid once
+per project. OxiDB pays its ~37 MB baseline once for the host and about 16 MB
+per additional tenant. At 50 tenants that projects to ~0.8 GB against ~4.8 GB.
+
+This is the comparison that favours OxiDB most, and it is also the one that
+matches the deployment — which is exactly why it is worth stating separately
+from the single-database numbers rather than instead of them. On one big
+database with every index used, OxiDB is *not* three times lighter (see above);
+across many small ones it genuinely is.
+
+**A gap this found:** `OXIDB_DOC=0` implies a single database today.
+Provisioning a tenant goes through the document manager, which is in-memory when
+documents are off, so it never creates the on-disk directory the SQL registry
+looks for. A SQL-only multi-tenant host is therefore not yet possible; this
+benchmark runs with the document engine on, as OxiBase does.
 
 ## What OxiDB does win
 
