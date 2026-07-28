@@ -53,6 +53,8 @@ with OxiDbClient() as db:
 
 - **[Protocol Reference](protocol-reference.md)** -- Complete TCP protocol command reference with all fields, return values, and RBAC role requirements.
 
+- **[Wire Benchmark](wire-benchmark.md)** -- OxiWire vs the PostgreSQL wire over the same SQL engine: where each wins, and the server-side buffering bug the comparison uncovered.
+
 - **[PostgreSQL Wire Protocol](postgres-wire.md)** -- Serving the SQL engine to unmodified PostgreSQL clients (`psql`, `psycopg`) on `OXIDB_PG_PORT`: SCRAM auth, type and SQLSTATE mapping, and what a v1 deliberately does not implement.
 
 ### 1.0 release policy

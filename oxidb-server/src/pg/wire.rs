@@ -21,22 +21,39 @@ use std::io::{self, BufReader, Read, Write};
 /// they are called as `wire::ready_for_query(conn.w(), ..)`.
 pub struct Conn<S: Read + Write> {
     r: BufReader<S>,
+    out: Vec<u8>,
 }
 
 impl<S: Read + Write> Conn<S> {
     pub fn new(io: S) -> Self {
         Conn {
             r: BufReader::new(io),
+            out: Vec::with_capacity(16 * 1024),
         }
     }
 
-    /// The write half. Nothing is buffered on this side, so a caller that
-    /// writes several messages should [`flush`](Self::flush) once at the end.
-    pub fn w(&mut self) -> &mut S {
-        self.r.get_mut()
+    /// The write half — an in-memory buffer, drained by [`flush`](Self::flush).
+    ///
+    /// Buffering is not an optimization detail here, it is how the protocol is
+    /// meant to be written: a result set is one `DataRow` message **per row**,
+    /// so writing straight to the socket costs a syscall (and, with
+    /// `TCP_NODELAY`, a packet) per row. A thousand-row result went out as a
+    /// thousand writes before this, and reading it back took twice as long as
+    /// the same rows over OxiWire.
+    ///
+    /// Callers already flush where the protocol says to — after
+    /// `ReadyForQuery`, on `Flush`, and before waiting on the client — so
+    /// nothing is held back longer than PostgreSQL holds it.
+    pub fn w(&mut self) -> &mut Vec<u8> {
+        &mut self.out
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
+        if !self.out.is_empty() {
+            let io = self.r.get_mut();
+            io.write_all(&self.out)?;
+            self.out.clear();
+        }
         self.r.get_mut().flush()
     }
 
@@ -49,7 +66,11 @@ impl<S: Read + Write> Conn<S> {
     }
 
     /// Hand back the stream (used to hand a plaintext socket to TLS).
-    pub fn into_inner(self) -> S {
+    pub fn into_inner(mut self) -> S {
+        // Drain first: handing back a stream while bytes sit in the buffer
+        // would silently drop a reply (the TLS handoff writes `S` and then
+        // takes the socket).
+        let _ = self.flush();
         self.r.into_inner()
     }
 }

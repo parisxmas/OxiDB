@@ -146,7 +146,14 @@ error naming it — never answered with a plausible-looking empty result.
   listener). The write path refuses writes if Raft is ever active, because they
   would not replicate.
 
+## Performance
+
+Against OxiWire over the same engine, this port is level on round trips and
+**faster on large result sets** (1.5× at a thousand rows) despite sending more
+bytes — see [the wire benchmark](wire-benchmark.md).
+
 ## See also
 
 - [SQL Reference](sql.md) — the dialect this port speaks
+- [Wire benchmark](wire-benchmark.md) — OxiWire vs this port, same engine
 - [Server Configuration](server.md) — all environment variables
