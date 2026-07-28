@@ -85,13 +85,14 @@ throttled by a pool the other does not have. 10 cores, 2 s per cell.
 | OxiWire | 5.1k | 6.4k | 8.3k | 7.9k | 7.9k | 7.9k |
 | PG extended | 5.9k | 7.1k | 8.3k | 8.2k | 7.9k | 8.0k |
 
-**Single-row `INSERT`:**
+**Single-row `INSERT`** (after group commit — see below for the before):
 
 | Connections | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| OxiWire ops/sec | 268 | 271 | 267 | 266 | 266 | 271 |
-| PG extended ops/sec | 264 | 266 | 264 | 266 | 265 | 266 |
-| p50 latency | 4 ms | 7.2 ms | 15 ms | 28 ms | 47 ms | 91 ms |
+| OxiWire ops/sec | 260 | 262 | 522 | 1005 | 1257 | 1156 |
+| PG extended ops/sec | 261 | 263 | 517 | 1000 | 1236 | 1345 |
+| scaling | 1.00× | 1.01× | 2.0× | 3.9× | **4.8×** | 4.4× |
+| p50 latency | 4.0 ms | 7.9 ms | 8.0 ms | 7.9 ms | 12 ms | 25 ms |
 
 ### What concurrency shows
 
@@ -106,18 +107,47 @@ connections. The SQL engine serializes on one mutex (`SqlEngine.inner`), so
 past that point extra connections buy latency, not throughput: p99 on the point
 read goes from 22 µs at one connection to ~800 µs at 32.
 
-**Writes do not scale at all — and that is a finding about the engine, not the
-wires.** Throughput is flat at ~266/s from 1 to 32 connections while p50 grows
-almost exactly linearly (4 ms → 91 ms ≈ 32 × 2.8 ms). That is textbook pure
-serialization: `Wal::append` fsyncs per record and is called with the engine
-mutex held, so concurrent commits queue rather than batch.
+**Writes scale to ~4.5×, and both wires scale identically** — because what they
+are scaling against is the WAL flush, not the protocol. Past 8 connections p50
+stops tracking `N × 4 ms` and settles near two flush times: writers that arrive
+while one flush is in progress are made durable by the next one, together.
 
-PostgreSQL would show the opposite shape here — its **group commit** lets
-concurrent writers share one fsync, so throughput climbs with concurrency while
-latency stays near a single flush. OxiDB's *document* engine does group-commit;
-its SQL engine does not. This benchmark makes that gap measurable: at 32
-connections a group-committing engine would be doing thousands of writes a
-second on the same hardware, not 266.
+## The gap this found: no group commit
+
+The first version of this benchmark showed writes **flat at ~266/s from 1 to 32
+connections**, with p50 growing almost exactly linearly (4 ms → 91 ms ≈ 32 ×
+2.8 ms) — textbook pure serialization. `Wal::append` fsynced per record and was
+called with the engine mutex held, so concurrent commits queued rather than
+batched. The document engine had group commit; the SQL engine did not, and
+nothing had made that measurable before.
+
+The fix splits the write in two: append and apply under the engine lock, then
+**flush after releasing it**, through a duplicated WAL descriptor held by a
+`CommitGate`. One writer is elected to fsync; everyone whose record was already
+on disk when that fsync began is covered by it and returns without flushing
+again. Throughput went from flat to 4-5× (~1.2k/s at 16 connections).
+
+Two things the table above shows honestly:
+
+- **One and two connections gain nothing.** A flush may only claim what was
+  written *before it started* — a record appended mid-fsync may or may not be
+  included, so it is not credited. With two closed-loop writers the second one
+  always appends after the first one's flush began, so it flushes on its own.
+  Batching needs a group to accumulate during the previous flush, which is why
+  the curve turns on at four.
+- **The durability contract is unchanged.** A write still returns only after a
+  flush covering its own sequence. What is newly observable is that another
+  connection can read a write between its apply and its flush — the same window
+  PostgreSQL has, and the one the document engine already accepts.
+
+The measurement also caught a bug in the fix. The watermark published under the
+lock was the sequence the *next* append would use rather than the last one
+written, so every second write found itself already "durable" and skipped its
+fsync — which showed up as single-connection throughput nearly doubling, to
+495/s, where batching cannot possibly help. No functional test could have caught
+it (a clean shutdown flushes the OS cache anyway; only power loss would tell),
+so the arithmetic is pinned directly by an invariant test instead: the gate may
+never claim a sequence the WAL has not written.
 
 ## The bug this found
 

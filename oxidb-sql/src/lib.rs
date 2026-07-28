@@ -530,6 +530,75 @@ pub struct SqlEngine {
     /// Max number of tables this engine may hold. `0` = unlimited (the default).
     /// Set per-instance by the data plane for OxiBase tenant databases.
     max_tables: std::sync::atomic::AtomicUsize,
+    /// Group commit. Deliberately **outside** `inner`, because its whole
+    /// purpose is to be reachable while another writer holds the engine lock.
+    commit: CommitGate,
+}
+
+/// Shared durability point for writes: many appends, one fsync.
+///
+/// A write appends to the WAL under the engine lock and applies its effect,
+/// then flushes here *after* releasing it. Concurrent writers therefore
+/// overlap — while one flushes, the others append — and a single physical
+/// fsync makes all of their records durable.
+///
+/// Without this the engine paid one fsync per statement with the lock held, so
+/// concurrent writers could not batch at all: throughput stayed flat at
+/// ~1/fsync no matter how many connections were writing, and latency grew
+/// linearly with them.
+///
+/// The acknowledgement rule is unchanged: a write returns to its caller only
+/// after a flush that covers its own sequence. What *is* newly observable is
+/// that another connection can read a write between its apply and its flush;
+/// a crash in that window loses it, and the writer never got an ack. This is
+/// the same window PostgreSQL has, and the same one the document engine's
+/// group commit already accepts.
+struct CommitGate {
+    /// Elects one flusher at a time; the rest wait and are covered by it.
+    leader: Mutex<()>,
+    /// Highest WAL sequence known to be on disk.
+    synced_seq: std::sync::atomic::AtomicU64,
+    /// Highest WAL sequence written (not necessarily flushed). Published under
+    /// the engine lock, read by a flusher to learn what its fsync will cover.
+    appended_seq: std::sync::atomic::AtomicU64,
+    /// A duplicate of the WAL's descriptor, taken once at open. This is what
+    /// lets a writer flush after releasing the engine lock: the `Wal` itself
+    /// lives behind that lock, but an fsync on a duplicate flushes the same
+    /// file. Only ever fsynced here — never read, written or seeked — so
+    /// sharing the file offset with the writer side is immaterial.
+    file: std::fs::File,
+    mode: wal::SyncMode,
+}
+
+impl CommitGate {
+    /// Make everything up to `target` durable, sharing the flush with any
+    /// concurrent caller.
+    fn sync_upto(&self, target: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.synced_seq.load(Ordering::SeqCst) >= target {
+            // A concurrent flush already covered us — the group-commit win.
+            return Ok(());
+        }
+        let _lead = self.leader.lock().unwrap();
+        if self.synced_seq.load(Ordering::SeqCst) >= target {
+            // Covered while we waited for the leader slot.
+            return Ok(());
+        }
+        // Read what is written *before* flushing: appends that land during the
+        // flush may or may not be included, so they are not claimed.
+        let covered = self.appended_seq.load(Ordering::SeqCst);
+        wal::sync_file(&self.file, self.mode)?;
+        self.synced_seq.fetch_max(covered, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Declare everything up to `seq` durable without flushing — used after a
+    /// checkpoint, which has already made the same data durable by fsyncing
+    /// the snapshot it folded the records into.
+    fn mark_durable(&self, seq: u64) {
+        use std::sync::atomic::Ordering;
+        self.synced_seq.fetch_max(seq, Ordering::SeqCst);
+    }
 }
 
 thread_local! {
@@ -643,6 +712,16 @@ impl SqlEngine {
             }
         }
 
+        // Everything already in the WAL at open is on disk (it was read from
+        // there), so the gate starts with that sequence durable.
+        let commit = CommitGate {
+            leader: Mutex::new(()),
+            synced_seq: std::sync::atomic::AtomicU64::new(wal.last_seq()),
+            appended_seq: std::sync::atomic::AtomicU64::new(wal.last_seq()),
+            file: wal.dup_handle()?,
+            mode: wal.sync_mode(),
+        };
+
         Ok(SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
@@ -650,6 +729,7 @@ impl SqlEngine {
             row_locks: row_locks::RowLocks::default(),
             lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
             max_tables: std::sync::atomic::AtomicUsize::new(0),
+            commit,
             inner: Mutex::new(Inner {
                 dir,
                 generation,
@@ -678,6 +758,28 @@ impl SqlEngine {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
+    }
+
+    /// Append `rec` to the WAL **without flushing** and apply it to live
+    /// state, returning what the caller must flush once it drops the engine
+    /// lock. Every write path goes through here, so the append/flush split —
+    /// and therefore group commit — is uniform.
+    ///
+    /// Call [`SqlEngine::commit_pending`] after releasing the lock; the write
+    /// is not acknowledged until that returns.
+    fn log_and_apply(inner: &mut Inner, gate: &CommitGate, rec: &WalRecord) -> Result<u64> {
+        let seq = inner.wal.append_no_sync(rec)?;
+        gate.appended_seq
+            .fetch_max(inner.wal.last_seq(), std::sync::atomic::Ordering::SeqCst);
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, rec, inner.disk_first);
+        Ok(seq)
+    }
+
+    /// Complete the durability a logged write owes: flush until `seq` is on
+    /// disk. Must be called with the engine lock **released** — holding it here
+    /// would serialize the flushes and give back everything group commit buys.
+    fn commit_pending(&self, seq: u64) -> Result<()> {
+        self.commit.sync_upto(seq)
     }
 
     /// Apply a WAL record to the in-memory catalog + tables, maintaining
@@ -902,14 +1004,9 @@ impl SqlEngine {
             return Err(SqlError::TableLimitExceeded(max));
         }
         let rec = WalRecord::CreateTable(def);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -920,14 +1017,9 @@ impl SqlEngine {
             return Err(SqlError::NoSuchTable(name.to_string()));
         }
         let rec = WalRecord::DropTable(name.to_string());
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -957,14 +1049,9 @@ impl SqlEngine {
             table: table.to_string(),
             columns: columns.to_vec(),
         });
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -994,14 +1081,9 @@ impl SqlEngine {
             name: name.to_string(),
             sql: query_sql.to_string(),
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1012,14 +1094,9 @@ impl SqlEngine {
             return Err(SqlError::NoSuchView(name.to_string()));
         }
         let rec = WalRecord::DropView(name.to_string());
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1051,14 +1128,9 @@ impl SqlEngine {
             name: name.to_string(),
             def,
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1069,14 +1141,9 @@ impl SqlEngine {
             return Err(SqlError::NoSuchProcedure(name.to_string()));
         }
         let rec = WalRecord::DropProcedure(name.to_string());
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1109,14 +1176,9 @@ impl SqlEngine {
             return Err(SqlError::NoSuchIndex(name.to_string()));
         }
         let rec = WalRecord::DropIndex(name.to_string());
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1138,14 +1200,9 @@ impl SqlEngine {
             row_id,
             cells,
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(row_id)
     }
 
@@ -1190,14 +1247,9 @@ impl SqlEngine {
             })
             .collect();
         let rec = WalRecord::Batch(ops);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(n)
     }
 
@@ -1227,14 +1279,9 @@ impl SqlEngine {
             row_id,
             cells,
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1256,14 +1303,9 @@ impl SqlEngine {
             table: table.to_string(),
             row_id,
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(true)
     }
 
@@ -1296,14 +1338,9 @@ impl SqlEngine {
             .collect();
         let n = ops.len();
         let rec = WalRecord::Batch(ops);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(n)
     }
 
@@ -1337,14 +1374,9 @@ impl SqlEngine {
         }
         let n = ops.len();
         let rec = WalRecord::Batch(ops);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(n)
     }
 
@@ -1562,14 +1594,9 @@ impl SqlEngine {
         }
         let mut inner = self.inner.lock().unwrap();
         let rec = WalRecord::Batch(ops);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1588,14 +1615,9 @@ impl SqlEngine {
         let mut inner = self.inner.lock().unwrap();
         Self::validate_batch(&inner.tables, &ops)?;
         let rec = WalRecord::Batch(ops);
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         Ok(())
     }
 
@@ -1664,10 +1686,15 @@ impl SqlEngine {
     /// before it leaves the previous generation whole and in force.
     pub fn checkpoint(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        Self::checkpoint_locked(&mut inner)
+        Self::checkpoint_locked(&mut inner, &self.commit)
     }
 
-    fn checkpoint_locked(inner: &mut Inner) -> Result<()> {
+    /// `gate` is told what the checkpoint made durable: the snapshot it wrote
+    /// (and fsynced, and committed by MANIFEST rename) covers every record
+    /// applied so far, including any whose WAL append has not been flushed. A
+    /// writer still waiting to flush is then already satisfied — and must be,
+    /// since the WAL it would have flushed may have just been truncated.
+    fn checkpoint_locked(inner: &mut Inner, gate: &CommitGate) -> Result<()> {
         let Inner {
             dir,
             generation,
@@ -1762,6 +1789,7 @@ impl SqlEngine {
         if pinned_gens.is_empty() {
             let _ = wal.truncate();
         }
+        gate.mark_durable(wal.last_seq());
         Ok(())
     }
 
@@ -1791,7 +1819,7 @@ impl SqlEngine {
         let mut inner = self.inner.lock().unwrap();
         if inner.checkpoint_bytes > 0
             && inner.wal.bytes() >= inner.checkpoint_bytes
-            && let Err(e) = Self::checkpoint_locked(&mut inner)
+            && let Err(e) = Self::checkpoint_locked(&mut inner, &self.commit)
         {
             eprintln!("[oxidb-sql] auto-checkpoint failed (will retry): {e}");
         }
@@ -2271,14 +2299,9 @@ impl SqlEngine {
             table: table.to_string(),
             op: op.clone(),
         };
-        let inner = &mut *inner;
-        inner.wal.append(&rec)?;
-        Self::apply_live(
-            &mut inner.catalog,
-            &mut inner.tables,
-            &rec,
-            inner.disk_first,
-        );
+        let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
+        drop(inner);
+        self.commit_pending(seq)?;
         // Metadata-only ADD/DROP COLUMN are O(1): the WAL record is durable on
         // its own and the stored rows are untouched (read back padded for ADD,
         // projected for DROP), so skip the checkpoint — which would write the
@@ -2287,7 +2310,10 @@ impl SqlEngine {
         if matches!(op, AlterOp::AddColumn(_) | AlterOp::DropColumn(_)) {
             return Ok(());
         }
-        Self::checkpoint_locked(inner)
+        // RENAME / TYPE rewrite the stored rows, so they checkpoint eagerly —
+        // which needs the lock back, now that the record is durable.
+        let mut inner = self.inner.lock().unwrap();
+        Self::checkpoint_locked(&mut inner, &self.commit)
     }
 
     /// Take a parked session transaction's buffered operations as JSON,
@@ -2380,7 +2406,7 @@ impl SqlEngine {
         let (generation, watermark, wal_len, dir) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.generation == 0 {
-                Self::checkpoint_locked(&mut inner)?;
+                Self::checkpoint_locked(&mut inner, &self.commit)?;
             }
             let generation = inner.generation;
             *inner.pinned_gens.entry(generation).or_insert(0) += 1;
@@ -3205,5 +3231,61 @@ mod tests {
                 .is_err()
         );
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod commit_gate_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The gate may never claim durability for a sequence that has not been
+    /// written: a flush covers what is *on disk when it starts*, nothing after.
+    ///
+    /// This is the invariant that catches an over-claiming watermark. Getting
+    /// it wrong by one — publishing the sequence the next append *will* use
+    /// rather than the last one written — makes every second write skip its
+    /// fsync, and no functional test notices, because a clean shutdown flushes
+    /// the OS cache anyway. Only power loss would tell, so the arithmetic is
+    /// pinned here instead.
+    #[test]
+    fn a_flush_never_claims_a_record_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.create_table(Table::new(
+            "t",
+            vec![Column::new("id", SqlType::Int).primary_key()],
+        ))
+        .unwrap();
+
+        for id in 1..=8 {
+            db.insert("t", vec![Value::Int(id)]).unwrap();
+            let last = db.inner.lock().unwrap().wal.last_seq();
+            let synced = db.commit.synced_seq.load(Ordering::SeqCst);
+            assert!(
+                synced <= last,
+                "gate claims seq {synced} durable but only {last} has been written"
+            );
+            // And the write that just returned really is covered.
+            assert_eq!(synced, last, "an acknowledged write was left unflushed");
+        }
+    }
+
+    /// A checkpoint publishes durability it actually established — again, never
+    /// past the end of the log.
+    #[test]
+    fn a_checkpoint_publishes_exactly_what_it_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.create_table(Table::new(
+            "t",
+            vec![Column::new("id", SqlType::Int).primary_key()],
+        ))
+        .unwrap();
+        db.insert("t", vec![Value::Int(1)]).unwrap();
+        db.checkpoint().unwrap();
+
+        let last = db.inner.lock().unwrap().wal.last_seq();
+        assert_eq!(db.commit.synced_seq.load(Ordering::SeqCst), last);
     }
 }

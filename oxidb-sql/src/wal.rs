@@ -85,7 +85,7 @@ pub enum WalRecord {
 /// commit but not power-loss-proof on hardware with volatile write caches.
 /// Selected via `OXIDB_SQL_SYNC` = `full` (default) | `data`.
 #[derive(Clone, Copy, PartialEq)]
-enum SyncMode {
+pub enum SyncMode {
     Full,
     Data,
 }
@@ -99,6 +99,17 @@ fn sync_mode_from_env() -> SyncMode {
         "data" | "datasync" | "barrier" => SyncMode::Data,
         _ => SyncMode::Full,
     }
+}
+
+/// Flush `file` at the durability class `mode` asks for. Public because group
+/// commit performs the flush outside the lock that owns the [`Wal`], through a
+/// duplicated handle.
+pub fn sync_file(file: &File, mode: SyncMode) -> Result<()> {
+    match mode {
+        SyncMode::Full => file.sync_all()?,
+        SyncMode::Data => sync_data_fast(file)?,
+    }
+    Ok(())
 }
 
 /// The `Data` sync: `File::sync_data` everywhere except macOS, where Rust's
@@ -240,9 +251,10 @@ impl Wal {
         self.bytes
     }
 
-    /// The highest sequence appended so far (0 if none). A checkpoint records
-    /// this as the manifest watermark: its snapshots reflect every record up to
-    /// and including it.
+    /// The highest sequence appended so far (0 if none) — written, though not
+    /// necessarily flushed. A checkpoint records this as the manifest
+    /// watermark: its snapshots reflect every record up to and including it.
+    /// Group commit uses it as the ceiling a flush may claim.
     pub fn last_seq(&self) -> u64 {
         self.next_seq.saturating_sub(1)
     }
@@ -322,7 +334,17 @@ impl Wal {
     }
 
     /// Append a record and fsync. Returns the sequence number assigned.
+    ///
+    /// The engine no longer calls this: it appends with [`Wal::append_no_sync`]
+    /// under its lock and flushes outside it, so concurrent commits share one
+    /// fsync. Kept as the straightforward reference behaviour the WAL's own
+    /// framing and recovery tests are written against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn append(&mut self, rec: &WalRecord) -> Result<u64> {
+        self.append_inner(rec, true)
+    }
+
+    fn append_inner(&mut self, rec: &WalRecord, sync: bool) -> Result<u64> {
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -351,12 +373,37 @@ impl Wal {
             self.file.seek(SeekFrom::Start(self.bytes))?;
         }
         self.file.write_all(&frame)?;
-        match self.sync {
-            SyncMode::Full => self.file.sync_all()?,
-            SyncMode::Data => sync_data_fast(&self.file)?,
+        if sync {
+            self.sync_now()?;
         }
         self.bytes += frame_len;
         Ok(seq)
+    }
+
+    /// Append **without** the fsync, returning the record's sequence.
+    ///
+    /// The caller owes a [`sync_upto`](Wal::sync_upto) before it acknowledges
+    /// the write. Splitting the two is what allows group commit: the append
+    /// happens under the engine lock, the flush outside it, so concurrent
+    /// writers pile into one physical fsync instead of queueing for their own.
+    pub fn append_no_sync(&mut self, rec: &WalRecord) -> Result<u64> {
+        self.append_inner(rec, false)
+    }
+
+    /// The fsync this WAL's [`SyncMode`] calls for.
+    fn sync_now(&self) -> Result<()> {
+        sync_file(&self.file, self.sync)
+    }
+
+    /// An independent handle on the same file, for fsyncing outside the lock
+    /// that owns this `Wal`. Flushing through a duplicate flushes the same
+    /// file: `try_clone` shares the underlying file description.
+    pub fn dup_handle(&self) -> Result<File> {
+        Ok(self.file.try_clone()?)
+    }
+
+    pub fn sync_mode(&self) -> SyncMode {
+        self.sync
     }
 
     /// Reset the WAL to an empty (header-only) state after a checkpoint has

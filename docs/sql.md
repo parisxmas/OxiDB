@@ -524,6 +524,33 @@ writes to those rows until commit/rollback (`OXIDB_SQL_LOCK_TIMEOUT_MS`,
 default 5000, bounds the wait and turns a deadlock into an error); plain
 `UPDATE`s exclude each other the same way.
 
+### Group commit
+
+Concurrent writers **share their WAL flush**. A write appends its record and
+applies it under the engine lock, releases the lock, and only then fsyncs; one
+writer is elected to perform the flush and everyone whose record was already on
+disk when it began is covered by it. The engine lock is therefore never held
+across an fsync, so writers overlap instead of queueing behind each other.
+
+The acknowledgement rule is unchanged: a statement returns to its caller only
+after a flush that covers its own WAL sequence — nothing is acknowledged before
+it is durable. What *is* newly observable is that another connection can read a
+write in the window between its apply and its flush; a crash there loses it, and
+the writer never got an acknowledgement. This is the same window PostgreSQL has,
+and the same one the document engine's group commit already accepts.
+
+The gain starts at about four concurrent writers. A flush may only claim records
+that were on disk when it started — one appended midway through may or may not
+have been included, so it is not credited — and with one or two writers no group
+accumulates during the previous flush. Measured on the
+[wire benchmark](wire-benchmark.md): flat ~266 writes/sec at every concurrency
+before, ~1.2k/sec at 16 connections after, with p50 settling near two flush times
+instead of growing linearly with the connection count.
+
+A checkpoint also satisfies waiting writers: it fsyncs the snapshot it folded
+those records into, which is the same data made durable a different way — and it
+must, since the WAL they would otherwise flush may have just been truncated.
+
 **Cluster mode**: interactive transactions work — statements run on the
 leader and a lone `COMMIT` replicates the buffered writes through Raft as
 one atomic entry applied on every node. Self-contained `BEGIN..COMMIT`
