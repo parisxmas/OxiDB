@@ -154,7 +154,8 @@ SELECT name FROM p WHERE EXISTS (SELECT 1 FROM orders o WHERE o.p_id = p.id);
 
 String functions are character-based and NULL-propagating (`CONCAT`/`||`
 return NULL if any input is NULL); `LIKE` is case-sensitive. `EXISTS`
-supports correlation; aggregated EXISTS bodies are rejected.
+supports correlation, including an aggregated body
+(`EXISTS (SELECT SUM(x) ... HAVING ...)`).
 
 ## DDL
 
@@ -312,7 +313,7 @@ ORDER BY age DESC, n ASC LIMIT 10 OFFSET 20;
 - Derived tables: `FROM (SELECT ...) AS x`, also as a JOIN side; the alias
   is required, and the subquery may use bind parameters
 
-### UNION
+### Set operations
 
 ```sql
 SELECT name FROM customers
@@ -321,9 +322,10 @@ SELECT name FROM suppliers
 ORDER BY 1 LIMIT 10 OFFSET 5;   -- outer clauses apply to the combined result
 ```
 
-`UNION` arms must have the same column count; the output takes the left arm's
-column names. The outer `ORDER BY` uses output column names or 1-based
-positions. (`EXCEPT` / `INTERSECT` are not supported.)
+`UNION`, `EXCEPT` and `INTERSECT`, each with an `ALL` (bag-semantics) form,
+and standard precedence — `INTERSECT` binds tighter than the other two. Arms
+must have the same column count; the output takes the left arm's column
+names. The outer `ORDER BY` uses output column names or 1-based positions.
 
 ### Subqueries
 
@@ -339,10 +341,11 @@ WHERE salary = (SELECT MAX(salary) FROM emp x WHERE x.dept = e.dept);
 ```
 
 A scalar subquery must return one column and at most one row (zero rows =
-`NULL`); `IN (SELECT ...)` takes a one-column result. Correlation reaches one
-level up and also works in UPDATE/DELETE (the target table is the outer
-scope); correlated subqueries are not allowed inside aggregated queries or
-window functions.
+`NULL`); `IN (SELECT ...)` takes a one-column result. Correlation reaches any
+depth of nesting (through subqueries, derived tables and `VALUES`), works in
+UPDATE/DELETE (the target table is the outer scope), and is allowed inside
+aggregate arguments, grouped queries (correlating on the group key), `HAVING`,
+and window-function arguments.
 
 ### Views
 
@@ -380,7 +383,10 @@ supported.
 
 ### Joins
 
-`INNER`, `LEFT`, `RIGHT`, and `FULL` joins, chained to any depth:
+`INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, chained to any depth,
+plus `[LEFT] JOIN LATERAL (SELECT ...) x ON ...` — a derived table that may
+reference the rows to its left, re-executed per left row (`RIGHT`/`FULL`
+LATERAL are rejected):
 
 ```sql
 SELECT r.name, SUM(it.qty * p.price) AS rev
@@ -403,7 +409,10 @@ against PostgreSQL 15.
 ### Aggregates
 
 `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, with `GROUP BY`
-(expressions allowed) and `HAVING`.
+(expressions allowed) and `HAVING`. `DISTINCT` inside an aggregate
+(`COUNT(DISTINCT x)`), `mode() WITHIN GROUP (ORDER BY x)`, and
+`SELECT DISTINCT ON (key) ...` (first row per key, by the `ORDER BY`) are
+supported.
 
 ## Stored Procedures
 
@@ -477,8 +486,17 @@ COMMIT;                    -- one atomic WAL batch, single fsync
 A statement error aborts the transaction (auto-rollback, PostgreSQL-style
 strictness without the "must ROLLBACK first" limbo); disconnecting rolls an
 open transaction back; a transaction is bound to the database it began on.
+
 Embedded/one-shot callers using `execute()` keep the old batch-scoped
 contract: an unmatched `BEGIN` at the end of the request is rolled back.
+
+While a transaction is inserting into a table, **no other writer may insert
+into that table** — its rows can be overwritten by the commit (see
+Limitations). `SELECT ... FOR UPDATE` takes real row locks that exclude other
+transactions' writes to those rows until commit/rollback
+(`OXIDB_SQL_LOCK_TIMEOUT_MS`, default 5000, bounds the wait and turns a
+deadlock into an error), and plain `UPDATE`s exclude each other the same way —
+but neither covers the insert case above.
 
 **Cluster mode**: interactive transactions work — statements run on the
 leader and a lone `COMMIT` replicates the buffered writes through Raft as
@@ -488,18 +506,45 @@ statement in their request in cluster mode.
 
 ## Limitations
 
-- `EXCEPT`, `INTERSECT`, `DISTINCT ON`, aggregate `DISTINCT`, and explicit
-  window frames are not supported; `LATERAL` derived tables are not either
-- Table-level `UNIQUE` constraints take a single column (`PRIMARY KEY` may
-  be composite). A single-column `FOREIGN KEY` cannot reference a table
-  whose primary key is composite
-- Correlated subqueries reach one level up and are not allowed inside
-  aggregated queries or window functions
-- `FOREIGN KEY` clauses parse but referential integrity is not enforced
-- Transactions are single-writer and their reads are not index-accelerated;
-  `CREATE/DROP VIEW` are not allowed inside a transaction
-- No cross-engine transactions (document + SQL) — see ADR-0011 for the
-  proposed design
+**Constraints.** Some constraint syntax is accepted and then *not* enforced —
+those cases are called out here because a silently-ignored constraint is worse
+than a rejected one:
+
+- `CREATE UNIQUE INDEX` creates an ordinary index: the `UNIQUE` is **not
+  enforced**. Use a column-level `UNIQUE` (or `PRIMARY KEY`) to enforce it
+- A table-level `UNIQUE` naming several columns is accepted and **not
+  enforced**; single-column `UNIQUE` is enforced (NULLs exempt, SQL-standard).
+  `PRIMARY KEY` may be composite and is fully enforced
+- `FOREIGN KEY` is enforced for single-column keys — a child INSERT/UPDATE
+  must find its parent, and a parent DELETE honours `ON DELETE NO ACTION` /
+  `RESTRICT` / `CASCADE` / `SET NULL`. Multi-column FKs and `ON UPDATE`
+  actions are accepted and **not enforced**, and a single-column FK cannot
+  reference a table whose primary key is composite
+- `CHECK` constraints are rejected at parse time
+- A primary key or unique constraint can only be declared with the table:
+  `ALTER TABLE ... ADD/DROP CONSTRAINT` is not supported
+
+**Queries.** Not supported: explicit window frames (`ROWS`/`RANGE BETWEEN
+...`; the standard default frame is what you get), `GROUPING SETS` / `ROLLUP`
+/ `CUBE`, `MERGE`, and `TRUNCATE`. `INSERT ... ON CONFLICT` parses but the
+conflict clause is **ignored**, so a conflicting row raises a duplicate-key
+error rather than being skipped or updated — check first, or `UPDATE` then
+`INSERT`.
+
+**Transactions.**
+
+- Transactions are **single-writer for INSERTs**. A transaction seeds its
+  row-id allocator when it first inserts into a table and does not reserve
+  those ids, so any other writer inserting into the *same table* before it
+  commits — another transaction, or a plain autocommit `INSERT` — can be
+  overwritten by that commit, and the row simply disappears. Serialize
+  writers per table for the lifetime of a transaction that inserts.
+  `UPDATE`/`DELETE` of existing rows are not affected (row locks serialize
+  them), and inserts into different tables are independent
+- `ALTER TABLE`, `CREATE/DROP VIEW` and `CREATE/DROP PROCEDURE` are not
+  allowed inside a transaction
+- No cross-engine transactions: a document-engine write and a SQL write are
+  each durable on their own, never one atomic unit
 
 ## See Also
 
