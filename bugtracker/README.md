@@ -75,7 +75,7 @@ npm run dev
 # open http://localhost:3000/bugs
 ```
 
-## Deploy ([redacted-host], like ColdChain)
+## Deploy (same host as ColdChain)
 
 ```bash
 # On the build machine — cross-compile the musl server binary and copy it in:
