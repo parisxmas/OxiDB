@@ -116,13 +116,34 @@ run with `OXIDB_SQL=1`.
 
 | SQL type (aliases) | Stored as |
 |--------------------|-----------|
-| `INT` (`INTEGER`, `BIGINT`, `SMALLINT`, `TINYINT`) | 64-bit integer |
+| `BIGINT` (`INT8`, or a bare integer type) | 64-bit integer |
+| `INT` (`INTEGER`, `INT4`) | 64-bit integer, **range-checked to 32 bits** |
+| `SMALLINT` (`INT2`) | 64-bit integer, **range-checked to 16 bits** |
+| `TINYINT` | 64-bit integer, **range-checked to 8 bits** |
 | `DOUBLE` (`DOUBLE PRECISION`, `FLOAT`, `REAL`) | 64-bit float |
 | `TEXT` (`VARCHAR`, `CHAR`, `STRING`, `NVARCHAR`) | UTF-8 string |
 | `BOOL` (`BOOLEAN`) | boolean |
 | `TIMESTAMP` (`DATETIME`) | epoch milliseconds (64-bit integer) |
 | `DECIMAL` (`NUMERIC`) | 64-bit float (precision/scale accepted, ignored) |
 | `BLOB` (`BYTEA`, `BINARY`, `VARBINARY`) | raw bytes (base64 on the JSON wire) |
+
+**Integer widths are a constraint, not a storage format.** Every integer is
+stored as a 64-bit value whatever it was declared, so `SMALLINT` saves no
+space — but a value outside the declared range is *refused* on write rather
+than silently widened, so a column's declared type stays true of its contents:
+
+```sql
+CREATE TABLE t (small SMALLINT);
+INSERT INTO t VALUES (32767);   -- ok
+INSERT INTO t VALUES (32768);   -- ERROR: value 32768 is out of range for
+                                -- column "small" declared SMALLINT (-32768..=32767)
+```
+
+`ALTER TABLE ... ALTER COLUMN ... TYPE SMALLINT` checks every stored value
+before it changes anything, so narrowing either succeeds completely or leaves
+the column untouched. A column declared `BIGINT` — or with no width, including
+one from a database created before widths were recorded — keeps the full
+64-bit range.
 
 Integer values implicitly widen into `DOUBLE` columns (`INSERT ... VALUES (5)`
 stores `5.0`) and into `TIMESTAMP` columns (taken as epoch milliseconds).

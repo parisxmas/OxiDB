@@ -63,6 +63,7 @@ pub const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
 pub const SQLSTATE_DUPLICATE_OBJECT: &str = "42710";
 pub const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
 pub const SQLSTATE_STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+pub const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 pub const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
 pub const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 pub const SQLSTATE_READ_ONLY_SQL_TRANSACTION: &str = "25006";
@@ -89,6 +90,7 @@ impl From<SqlError> for PgError {
             SqlError::Unsupported(_) => SQLSTATE_FEATURE_NOT_SUPPORTED,
             SqlError::LockTimeout { .. } => SQLSTATE_LOCK_NOT_AVAILABLE,
             SqlError::ValueTooLong { .. } => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
+            SqlError::IntegerOutOfRange { .. } => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             // The engine reports a NOT NULL breach through SchemaMismatch, so
             // the message is the only thing that distinguishes it. Clients key
             // recovery off 23502 specifically, which is worth the sniff.

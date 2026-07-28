@@ -700,6 +700,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                     column: column_name.value.clone(),
                     ty: map_data_type(data_type)?,
                     max_len: char_max_len(data_type),
+                    int_width: int_width(data_type),
                 },
                 // MySQL: `MODIFY [COLUMN] c ty` (bare type only — constraint
                 // changes stay unsupported).
@@ -712,6 +713,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                     column: col_name.value.clone(),
                     ty: map_data_type(data_type)?,
                     max_len: char_max_len(data_type),
+                    int_width: int_width(data_type),
                 },
                 other => {
                     return Err(SqlError::Unsupported(format!(
@@ -1132,6 +1134,7 @@ fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
     let ty = map_data_type(&col.data_type)?;
     let mut column = Column::new(col.name.value.clone(), ty);
     column.max_len = char_max_len(&col.data_type);
+    column.int_width = int_width(&col.data_type);
     for opt in &col.options {
         match &opt.option {
             sp::ColumnOption::NotNull => column = column.not_null(),
@@ -1210,6 +1213,21 @@ fn char_max_len(dt: &sp::DataType) -> Option<u32> {
     match len {
         sp::CharacterLength::IntegerLength { length, .. } => u32::try_from(*length).ok(),
         sp::CharacterLength::Max => None,
+    }
+}
+
+/// The declared width of an integer type, in bytes — `None` for `BIGINT` and
+/// for anything that is not an integer, both of which get the full i64 range.
+///
+/// The `(n)` in `INT(11)` is MySQL's display width, not a range, so it is
+/// ignored exactly as MySQL 8 ignores it.
+fn int_width(dt: &sp::DataType) -> Option<u8> {
+    use sp::DataType as D;
+    match dt {
+        D::TinyInt(_) => Some(1),
+        D::SmallInt(_) | D::Int2(_) => Some(2),
+        D::Int(_) | D::Integer(_) | D::Int4(_) => Some(4),
+        _ => None,
     }
 }
 

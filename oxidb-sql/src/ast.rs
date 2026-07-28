@@ -122,6 +122,9 @@ pub enum AlterOp {
         ty: crate::types::SqlType,
         /// Declared `VARCHAR(n)` length of the new type (chars), when any.
         max_len: Option<u32>,
+        /// Declared width of the new integer type in bytes (`SMALLINT` = 2,
+        /// `INT` = 4), when any. Narrowing checks every stored value first.
+        int_width: Option<u8>,
     },
 }
 

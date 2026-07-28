@@ -43,6 +43,16 @@ pub struct Column {
     /// non-string columns) deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_len: Option<u32>,
+    /// Declared width of an integer column, in bytes: `2` for `SMALLINT`, `4`
+    /// for `INT`/`INTEGER`, `None` for `BIGINT` and for a bare integer.
+    ///
+    /// Every integer is *stored* as an i64 whatever it was declared; this
+    /// records what the user asked for so a value outside that range is
+    /// rejected on write ([`SqlError::IntegerOutOfRange`]) rather than
+    /// silently widened. Old catalogs deserialize as `None`, which keeps their
+    /// columns exactly as permissive as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub int_width: Option<u8>,
     /// Set by a metadata-only `ALTER TABLE DROP COLUMN`: the column keeps its
     /// physical slot in every stored row (so the drop rewrites nothing) but is
     /// invisible to queries — filtered out of the schema the executor sees.
@@ -66,7 +76,38 @@ impl Column {
             default_value: None,
             unique: false,
             max_len: None,
+            int_width: None,
             dropped: false,
+        }
+    }
+
+    /// The inclusive range an integer of this column's declared width may hold.
+    /// `None` for a column that is not a width-restricted integer.
+    pub fn int_range(&self) -> Option<(i64, i64)> {
+        if self.ty != SqlType::Int {
+            return None;
+        }
+        match self.int_width? {
+            1 => Some((i64::from(i8::MIN), i64::from(i8::MAX))),
+            2 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+            4 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            _ => None,
+        }
+    }
+
+    /// How this column's type is spelled in an error message.
+    pub fn type_name(&self) -> &'static str {
+        match (self.ty, self.int_width) {
+            (SqlType::Int, Some(1)) => "TINYINT",
+            (SqlType::Int, Some(2)) => "SMALLINT",
+            (SqlType::Int, Some(4)) => "INT",
+            (SqlType::Int, _) => "BIGINT",
+            (SqlType::Double, _) => "DOUBLE",
+            (SqlType::Text, _) => "TEXT",
+            (SqlType::Bool, _) => "BOOL",
+            (SqlType::Timestamp, _) => "TIMESTAMP",
+            (SqlType::Blob, _) => "BLOB",
+            (SqlType::Decimal, _) => "DECIMAL",
         }
     }
 
@@ -271,6 +312,16 @@ impl Table {
                         got,
                     });
                 }
+            } else if let (Some((min, max)), Value::Int(v)) = (col.int_range(), cell)
+                && (*v < min || *v > max)
+            {
+                return Err(SqlError::IntegerOutOfRange {
+                    column: col.name.clone(),
+                    type_name: col.type_name(),
+                    value: *v,
+                    min,
+                    max,
+                });
             }
         }
         Ok(())

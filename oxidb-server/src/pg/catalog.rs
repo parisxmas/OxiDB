@@ -935,13 +935,8 @@ fn jdbc_columns(session: &PgSession, sql: &str) -> Reply {
             if !like_match(&column_pattern, &col.name) {
                 continue;
             }
-            // A declared length makes it `varchar(n)` rather than unbounded
-            // `text` — a schema tool shows the length, and a code generator
-            // emits the right column type.
-            let oid = match col.max_len {
-                Some(_) => types::OID_VARCHAR,
-                None => types::oid_of(Some(col.ty)),
-            };
+            // Reported at its *declared* width, which enforcement makes safe.
+            let oid = types::oid_of_column(col);
             rows.push(vec![
                 text("public"),
                 text(&t.name),

@@ -405,10 +405,8 @@ pub fn pg_attribute_rows(engine: &SqlEngine) -> Vec<Vec<Value>> {
             continue;
         };
         for (i, col) in def.columns.iter().filter(|c| !c.dropped).enumerate() {
-            let oid = match col.max_len {
-                Some(_) => types::OID_VARCHAR,
-                None => types::oid_of(Some(col.ty)),
-            };
+            // Reported at its *declared* width, which enforcement makes safe.
+            let oid = types::oid_of_column(col);
             out.push(vec![
                 Value::Int(rel.oid),
                 text(col.name.clone()),

@@ -56,6 +56,21 @@ pub enum SqlError {
         got: usize,
     },
 
+    /// An integer is outside the range its column's declared width can hold —
+    /// `SMALLINT`, `INT` (Postgres SQLSTATE 22003). Every integer is stored as
+    /// an i64; this is the declared width being enforced rather than the value
+    /// being silently widened.
+    #[error(
+        "value {value} is out of range for column {column:?} declared {type_name} ({min}..={max})"
+    )]
+    IntegerOutOfRange {
+        column: String,
+        type_name: &'static str,
+        value: i64,
+        min: i64,
+        max: i64,
+    },
+
     /// The SQL text could not be parsed.
     #[error("sql parse error: {0}")]
     Parse(String),

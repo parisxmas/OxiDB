@@ -755,6 +755,7 @@ impl SqlEngine {
                         column,
                         ty,
                         max_len,
+                        int_width,
                     } => {
                         let Some(pos) = def
                             .columns
@@ -772,6 +773,7 @@ impl SqlEngine {
                         };
                         def.columns[pos].ty = *ty;
                         def.columns[pos].max_len = *max_len;
+                        def.columns[pos].int_width = *int_width;
                         if let Some(dv) = def.columns[pos].default_value.take() {
                             def.columns[pos].default_value = Some(cast(&dv));
                         }
@@ -2188,6 +2190,7 @@ impl SqlEngine {
                 column,
                 ty,
                 max_len,
+                int_width,
             } => {
                 let Some(pos) = def
                     .columns
@@ -2217,8 +2220,14 @@ impl SqlEngine {
                         "changing the type of a FOREIGN KEY column".into(),
                     ));
                 }
-                // Dry-run: every stored value (and the default) must cast — and
-                // fit a shrunk VARCHAR(n) — before anything is written.
+                // Dry-run: every stored value (and the default) must cast, fit
+                // a shrunk VARCHAR(n), and fit a narrowed integer width, before
+                // anything is written.
+                let mut probe = Column::new(column.clone(), *ty);
+                probe.max_len = *max_len;
+                probe.int_width = *int_width;
+                let int_range = probe.int_range();
+                let type_name = probe.type_name();
                 let check_len = |v: &Value| -> Result<()> {
                     if let (Some(max), Value::Text(s)) = (max_len, v) {
                         let got = s.chars().count();
@@ -2229,6 +2238,17 @@ impl SqlEngine {
                                 got,
                             });
                         }
+                    }
+                    if let (Some((min, max)), Value::Int(n)) = (int_range, v)
+                        && (*n < min || *n > max)
+                    {
+                        return Err(SqlError::IntegerOutOfRange {
+                            column: column.clone(),
+                            type_name,
+                            value: *n,
+                            min,
+                            max,
+                        });
                     }
                     Ok(())
                 };

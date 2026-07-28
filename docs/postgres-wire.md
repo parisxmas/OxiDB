@@ -67,9 +67,10 @@ applies.
   answers `ROLLBACK` — PostgreSQL's behaviour, which is what makes psycopg's
   `with conn.transaction():` recover correctly.
 - **Errors as SQLSTATEs**, so drivers raise the right exception class:
-  `23505` unique violation, `23503` foreign key, `23502` not-null, `42P01`
-  undefined table, `42703` undefined column, `42601` syntax, `0A000`
-  unsupported, `55P03` lock timeout, `42501` permission denied.
+  `23505` unique violation, `23503` foreign key, `23502` not-null, `22001`
+  value too long, `22003` numeric value out of range, `42P01` undefined table,
+  `42703` undefined column, `42601` syntax, `0A000` unsupported, `55P03` lock
+  timeout, `42501` permission denied.
 - **Row limits** — `fetchmany` suspends and resumes the portal.
 - `SET`/`RESET`/`SHOW`/`DISCARD`, `SELECT version()`, `current_database()`,
   `current_user`, `current_schema()`.
@@ -95,7 +96,7 @@ applies.
 
 | SQL engine | PostgreSQL type (OID) | Notes |
 |---|---|---|
-| `INT` | `int8` (20) | The engine's integer is 64-bit; calling it `int4` would truncate. |
+| `INT` | `int8` (20) | Every integer is stored 64-bit, so a *result* is described as `int8`. Catalog metadata reports the **declared** width instead (`SMALLINT` → `int2`, `INT` → `int4`), which is safe because those widths are enforced on write — a client generating a 16- or 32-bit field from the metadata cannot be handed something bigger. |
 | `DOUBLE` | `float8` (701) | `NaN`/`Infinity` use PostgreSQL's spelling. |
 | `TEXT` | `text` (25) | |
 | `BOOL` | `bool` (16) | `t`/`f` in text format. |

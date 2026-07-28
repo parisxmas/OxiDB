@@ -798,7 +798,10 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
     let cols: Vec<String> = row_names(&msgs, "attname");
     assert_eq!(cols, vec!["id", "pid", "note"]);
     let first = row_map(&msgs, 0);
-    assert_eq!(first["atttypid"].as_deref(), Some("20"), "INT is int8");
+    // Metadata reports the *declared* width, which enforcement makes safe: an
+    // INT column cannot hold a value that would not fit an int4, so a client
+    // generating a 32-bit field from this cannot be handed something bigger.
+    assert_eq!(first["atttypid"].as_deref(), Some("23"), "INT is int4");
     assert_eq!(first["attnotnull"].as_deref(), Some("t"), "PK is NOT NULL");
     assert_eq!(first["attnum"].as_deref(), Some("1"));
     // VARCHAR(50) is varchar with a length, not unbounded text.
@@ -809,6 +812,30 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
     let note = row_map(&msgs, 0);
     assert_eq!(note["atttypid"].as_deref(), Some("1043"), "varchar");
     assert_eq!(note["atttypmod"].as_deref(), Some("54"), "50 + varlena header");
+
+    // A `BIGINT` column keeps int8, and an out-of-range write is refused with
+    // the SQLSTATE a client recovers from.
+    c.query("CREATE TABLE widths (small SMALLINT, n INT, big BIGINT)");
+    let msgs = c.query(
+        "SELECT a.attname, nullif(a.attidentity, '') as attidentity \
+         FROM pg_catalog.pg_attribute a WHERE c.relname LIKE 'widths' AND attname LIKE '%'",
+    );
+    assert_eq!(
+        row_names(&msgs, "atttypid"),
+        vec!["21", "23", "20"],
+        "int2, int4, int8 — the declared widths"
+    );
+    let e = error(&c.query("INSERT INTO widths VALUES (40000, 1, 1)"));
+    assert_eq!(
+        e.field(b'C').as_deref(),
+        Some("22003"),
+        "numeric_value_out_of_range"
+    );
+    // ...while a query result still describes the storage type, which every
+    // client can read.
+    c.query("INSERT INTO widths VALUES (1, 2, 3)");
+    let msgs = c.query("SELECT small FROM widths");
+    assert_eq!(msgs[0].fields()[0].1, 20, "results report int8");
 
     // getPrimaryKeys — every part of a composite key, in order.
     let msgs = c.query(

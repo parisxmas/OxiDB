@@ -55,6 +55,30 @@ pub fn oid_of(ty: Option<SqlType>) -> i32 {
     }
 }
 
+/// The OID a *declared column* is reported as, which is narrower than what
+/// [`oid_of`] can say from the type alone: a `VARCHAR(n)` is `varchar` rather
+/// than unbounded `text`, and a `SMALLINT`/`INT` is `int2`/`int4` rather than
+/// the `int8` every integer is stored as.
+///
+/// Safe because those declarations are *enforced* — a value outside the
+/// declared range is refused on write — so a client that generates a 16- or
+/// 32-bit field from this metadata cannot be handed something too big for it.
+///
+/// Note the asymmetry with query results: a `RowDescription` is built from the
+/// engine's inferred column types, which carry no declared width, so a SELECT
+/// over a `SMALLINT` column still reports `int8`. Both are true; this one is
+/// more specific.
+pub fn oid_of_column(col: &oxidb_sql::Column) -> i32 {
+    if col.max_len.is_some() {
+        return OID_VARCHAR;
+    }
+    match col.int_range().map(|_| col.int_width) {
+        Some(Some(1 | 2)) => OID_INT2,
+        Some(Some(4)) => OID_INT4,
+        _ => oid_of(Some(col.ty)),
+    }
+}
+
 /// The fixed width of a type, or `-1` for variable-length ones.
 pub fn type_len(oid: i32) -> i16 {
     match oid {
