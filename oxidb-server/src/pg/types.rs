@@ -17,10 +17,16 @@ use oxidb_sql::{Decimal, SqlType, Value};
 // Type OIDs, from PostgreSQL's pg_type. These numbers are permanent.
 pub const OID_BOOL: i32 = 16;
 pub const OID_BYTEA: i32 = 17;
+/// Single byte. Only the catalog answers use it (`pg_type.typtype`), where a
+/// driver reads it as a char and would reject `text`.
+pub const OID_CHAR: i32 = 18;
 pub const OID_INT8: i32 = 20;
 pub const OID_INT2: i32 = 21;
 pub const OID_INT4: i32 = 23;
 pub const OID_TEXT: i32 = 25;
+/// Object identifier. Catalog answers only — a driver reading `pg_type.oid`
+/// expects this type and refuses a plain `int8`.
+pub const OID_OID: i32 = 26;
 pub const OID_FLOAT4: i32 = 700;
 pub const OID_FLOAT8: i32 = 701;
 pub const OID_VARCHAR: i32 = 1043;
@@ -52,9 +58,9 @@ pub fn oid_of(ty: Option<SqlType>) -> i32 {
 /// The fixed width of a type, or `-1` for variable-length ones.
 pub fn type_len(oid: i32) -> i16 {
     match oid {
-        OID_BOOL => 1,
+        OID_BOOL | OID_CHAR => 1,
         OID_INT2 => 2,
-        OID_INT4 | OID_FLOAT4 => 4,
+        OID_INT4 | OID_FLOAT4 | OID_OID => 4,
         OID_INT8 | OID_FLOAT8 | OID_TIMESTAMP | OID_TIMESTAMPTZ => 8,
         _ => -1,
     }
@@ -167,6 +173,8 @@ pub fn oid_name(oid: i32) -> &'static str {
     match oid {
         OID_BOOL => "bool",
         OID_BYTEA => "bytea",
+        OID_CHAR => "char",
+        OID_OID => "oid",
         OID_INT2 => "int2",
         OID_INT4 => "int4",
         OID_INT8 => "int8",

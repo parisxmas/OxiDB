@@ -2,7 +2,9 @@
 
 **Status:** Accepted — v1 (startup + SCRAM auth, simple and extended query,
 transactions, SQLSTATE mapping, session/catalog interception) landed & tested
-2026-07-28, verified against real `psql` 18 and `psycopg` 3.3.
+2026-07-28, verified against real `psql` 18, `psycopg` 3.3, **Npgsql 8.0 and
+pgjdbc 42.7** (the last two after the type-catalog and mixed-batch work below;
+pgjdbc's `DatabaseMetaData` remains unimplemented).
 **Supersedes:** —
 **Related:** [ADR-0010](0010-sql-engine.md) (the engine this exposes),
 [ADR-0012](0012-multi-database.md) (the `database` startup parameter resolves
@@ -93,16 +95,33 @@ back on a statement error; PostgreSQL keeps it poisoned until `ROLLBACK` and
 answers `COMMIT` with `ROLLBACK`. The session emulates that, because psycopg's
 `with conn.transaction():` recovery depends on it.
 
-### v1 targets psql and psycopg, and says so
+### The type catalog is answered; per-table introspection is not
 
-The system catalogs are the whole difference between "works with psql" and
-"works with everything". npgsql reads the type catalog on every connect;
-pgjdbc's metadata surface is deep catalog SQL. Emulating enough of `pg_type`,
-`pg_class`, `pg_attribute` and `pg_namespace` to satisfy them is a project in
-itself, and doing it badly is worse than not doing it.
+The original scope stopped at psql + psycopg on the assumption that npgsql and
+pgjdbc needed a queryable `pg_catalog`. Probing the real drivers showed that
+was wrong in a useful way:
 
-So v1 stops at psql + psycopg, and every gap is refused by name rather than
-half-answered.
+- **pgjdbc already worked** for queries, prepared statements, transactions and
+  SQLSTATEs. Only `DatabaseMetaData` failed.
+- **Npgsql already worked** in full, given a connection-string flag
+  (`Server Compatibility Mode=NoTypeLoading`) — and what it wanted without the
+  flag was the **type** catalog, not the table catalog.
+
+That distinction is the decision. The type catalog's content is *static*: the
+fixed list of types this server can produce, with their real PostgreSQL OIDs so
+each driver's existing handler applies unchanged. It is answered from a
+constant, and the two follow-up queries (composite fields, enum labels) are
+answered **empty — which is true**: this server has no composite types and no
+enums. Per-table metadata is not static and is still refused, so nothing here
+invents an answer it does not have.
+
+Executing these queries for real would be the *harder* path, not the easier
+one: they use `~`, `::regclass`, `pg_get_expr()` and window functions the
+engine would have to grow first.
+
+The cost is that the match is per-driver and per-version text, and a driver
+upgrade can change it. That is why the fallback is a refusal rather than an
+empty result — a stale match fails loudly.
 
 ## Consequences
 
@@ -118,9 +137,19 @@ owns no state: every request is a call into machinery that already existed, so
 the failure modes are the engine's, not a second implementation's.
 
 **What is deliberately missing** (each refused with an error naming it):
-npgsql, pgjdbc, `pg_dump` and BI tools; `COPY`; `LISTEN`/`NOTIFY`; `DECLARE …
+per-table catalog introspection — so pgjdbc's `DatabaseMetaData`, psql's
+`\d <table>`, `pg_dump` and BI tools; `COPY`; `LISTEN`/`NOTIFY`; `DECLARE …
 CURSOR`; query cancellation; real schemas and `information_schema`;
 server-side parameter type inference.
+
+**A lesson about scoping from documentation.** Every prediction here about
+which drivers would work was wrong until the drivers were actually run: pgjdbc
+and Npgsql were both far closer to working than the protocol documentation
+suggested, and Npgsql's *observed* failure (`unsupported sql: function
+version()`) pointed at a statement that was already handled — the real cause
+was a multi-statement batch mixing intercepted and engine statements. A
+logging proxy that dumped the exact bytes found it in minutes; reasoning about
+it did not.
 
 **Cluster mode.** The listener is not started in cluster mode, as no optional
 listener is. The write path refuses writes when Raft is active anyway, because

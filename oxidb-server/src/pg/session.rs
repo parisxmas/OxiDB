@@ -131,10 +131,53 @@ impl PgSession {
         }
     }
 
-    /// Run one statement text (possibly several statements, in simple query
-    /// mode) with already-decoded parameters.
+    /// Run one simple-query text, which may carry several statements.
+    ///
+    /// A batch can mix statements this server answers itself with statements
+    /// the engine runs — Npgsql opens with exactly that, `SELECT version();`
+    /// followed by its type-catalog query in one message. So the text is split
+    /// and each statement dispatched on its own, with consecutive engine
+    /// statements kept together in one call so their transaction semantics and
+    /// parse caching are unchanged.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Reply>, PgError> {
-        self.run(sql, params, &[])
+        let statements = split_statements(sql);
+        // The extended protocol binds parameters and forbids multiple
+        // statements, so it stays one unit.
+        if !params.is_empty() || statements.len() <= 1 {
+            return self.run(sql, params, &[]);
+        }
+
+        let mut out = Vec::new();
+        let mut pending: Vec<&str> = Vec::new();
+        for stmt in statements {
+            // `intercept` mutates only when it answers, so a `None` here has
+            // left nothing behind.
+            match super::catalog::intercept(self, stmt)? {
+                Some(replies) => {
+                    self.flush_pending(&mut out, &mut pending)?;
+                    out.extend(replies);
+                }
+                None => pending.push(stmt),
+            }
+        }
+        self.flush_pending(&mut out, &mut pending)?;
+        Ok(out)
+    }
+
+    /// Hand the engine everything buffered since the last intercepted
+    /// statement, as one call.
+    fn flush_pending(
+        &mut self,
+        out: &mut Vec<Reply>,
+        pending: &mut Vec<&str>,
+    ) -> Result<(), PgError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let joined = pending.join("; ");
+        pending.clear();
+        out.extend(self.run(&joined, &[], &[])?);
+        Ok(())
     }
 
     fn run(
@@ -328,6 +371,87 @@ impl PgSession {
     }
 }
 
+/// Split a simple-query text into its statements.
+///
+/// Splitting on `;` alone would cut `INSERT INTO t VALUES ('a;b')` in half, so
+/// this tracks the places a semicolon is not a separator: single-quoted
+/// literals (with `''` escapes), double-quoted identifiers, dollar-quoted
+/// bodies, and both comment forms. Empty statements are dropped.
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped one, not the end.
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'$' => match dollar_tag(bytes, i) {
+                Some(tag_len) => {
+                    let tag = &bytes[i..i + tag_len];
+                    i += tag_len;
+                    while i < bytes.len() && !bytes[i..].starts_with(tag) {
+                        i += 1;
+                    }
+                    i += tag_len;
+                }
+                None => i += 1,
+            },
+            b';' => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    let tail = sql[start.min(sql.len())..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Length of a dollar-quote tag (`$$` or `$name$`) starting at `i`, if there
+/// is one.
+fn dollar_tag(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    (bytes.get(j) == Some(&b'$')).then_some(j - i + 1)
+}
+
 fn slice_end(from: usize, len: usize, max_rows: usize) -> usize {
     if max_rows == 0 {
         len
@@ -414,6 +538,67 @@ mod tests {
         let rows = vec![vec![Value::Int(1)]];
         let f = describe_columns(&cols, &[Some(SqlType::Decimal)], &rows, &[]);
         assert_eq!(f[0].type_oid, types::OID_NUMERIC);
+    }
+
+    #[test]
+    fn statements_split_on_real_separators_only() {
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
+        assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
+        assert_eq!(
+            split_statements("SELECT 1; SELECT 2"),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+        // Empty statements are dropped, not turned into empty queries.
+        assert_eq!(split_statements(";;  ;"), Vec::<&str>::new());
+        assert_eq!(split_statements(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_literal_is_not_a_separator() {
+        assert_eq!(
+            split_statements("INSERT INTO t VALUES ('a;b')"),
+            vec!["INSERT INTO t VALUES ('a;b')"]
+        );
+        // '' is an escaped quote, so the literal continues past it.
+        assert_eq!(
+            split_statements("SELECT 'it''s; fine'; SELECT 2"),
+            vec!["SELECT 'it''s; fine'", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements(r#"SELECT "we;ird" FROM t; SELECT 2"#),
+            vec![r#"SELECT "we;ird" FROM t"#, "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn comments_and_dollar_quotes_hide_semicolons() {
+        assert_eq!(
+            split_statements("SELECT 1 -- a; comment\n; SELECT 2"),
+            vec!["SELECT 1 -- a; comment", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 /* a; comment */; SELECT 2"),
+            vec!["SELECT 1 /* a; comment */", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $$a;b$$; SELECT 2"),
+            vec!["SELECT $$a;b$$", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $tag$a;b$tag$; SELECT 2"),
+            vec!["SELECT $tag$a;b$tag$", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn the_npgsql_opening_batch_splits_into_its_parts() {
+        // The shape that exposed this: an intercepted statement followed by a
+        // catalog query, in one simple-query message.
+        let batch = "SELECT version();\n\nSELECT ns.nspname FROM pg_type AS t\nJOIN pg_namespace AS ns ON (ns.oid = typnamespace);\n";
+        let parts = split_statements(batch);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "SELECT version()");
+        assert!(parts[1].starts_with("SELECT ns.nspname"));
     }
 
     #[test]

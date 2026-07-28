@@ -621,6 +621,122 @@ fn psql_dt_is_answered_from_the_engine_catalog() {
 }
 
 #[test]
+fn a_batch_may_mix_intercepted_and_engine_statements() {
+    // Npgsql opens with exactly this shape — an intercepted statement and a
+    // catalog query in ONE simple-query message. Giving up on the whole batch
+    // because one part was not interceptable is what broke its connect.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE t (id INT PRIMARY KEY)");
+
+    let msgs = c.query("SET application_name = 'x'; INSERT INTO t VALUES (1); SELECT id FROM t");
+    assert_eq!(
+        command_tags(&msgs),
+        vec!["SET", "INSERT 0 1", "SELECT 1"],
+        "each statement answers in order: {:?}",
+        tags(&msgs)
+    );
+    assert_eq!(rows(&msgs)[0][0].as_deref(), Some("1"));
+
+    // Engine statements around an intercepted one still reach the engine.
+    let msgs = c.query("INSERT INTO t VALUES (2); SET x = 1; INSERT INTO t VALUES (3)");
+    assert_eq!(command_tags(&msgs), vec!["INSERT 0 1", "SET", "INSERT 0 1"]);
+    assert_eq!(
+        rows(&c.query("SELECT COUNT(*) FROM t"))[0][0].as_deref(),
+        Some("3")
+    );
+}
+
+#[test]
+fn a_semicolon_inside_a_literal_does_not_split_a_batch() {
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    let msgs = c.query("INSERT INTO t VALUES (1, 'a;b')");
+    assert_eq!(command_tags(&msgs), vec!["INSERT 0 1"]);
+    assert_eq!(
+        rows(&c.query("SELECT v FROM t"))[0][0].as_deref(),
+        Some("a;b"),
+        "the literal survived intact"
+    );
+}
+
+#[test]
+fn the_type_catalog_answers_what_drivers_load_on_connect() {
+    // Npgsql will not connect without this (its escape hatch is a connection
+    // string flag users should not have to know about).
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+
+    let msgs = c.query(
+        "SELECT ns.nspname, t.oid, t.typname, t.typtype, t.typnotnull, t.elemtypoid \
+         FROM pg_type AS t JOIN pg_namespace AS ns ON (ns.oid = typnamespace)",
+    );
+    let fields = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .expect("RowDescription")
+        .fields();
+    // The oid columns must be described as `oid` (26), not int8 — a driver
+    // reading pg_type.oid refuses anything else.
+    assert_eq!(fields[1].0, "oid");
+    assert_eq!(fields[1].1, 26, "oid type");
+    assert_eq!(fields[3].1, 18, "typtype is char");
+    assert_eq!(fields[4].1, 16, "typnotnull is bool");
+
+    let names: Vec<String> = rows(&msgs)
+        .into_iter()
+        .filter_map(|r| r[2].clone())
+        .collect();
+    for expected in ["bool", "int8", "text", "timestamp", "numeric", "bytea"] {
+        assert!(names.contains(&expected.to_string()), "{names:?}");
+    }
+    // Every row claims pg_catalog, base type, no element type.
+    for r in rows(&msgs) {
+        assert_eq!(r[0].as_deref(), Some("pg_catalog"));
+        assert_eq!(r[3].as_deref(), Some("b"));
+        assert_eq!(r[5], None);
+    }
+
+    // The two follow-ups are answered empty, which is true: this server has no
+    // composite types and no enums.
+    let msgs = c.query(
+        "SELECT typ.oid, att.attname, att.atttypid FROM pg_type AS typ \
+         JOIN pg_attribute AS att ON (att.attrelid = typ.typrelid) \
+         WHERE (typ.typtype = 'c' AND cls.relkind='c')",
+    );
+    assert_eq!(rows(&msgs).len(), 0);
+    assert_eq!(command_tags(&msgs), vec!["SELECT 0"]);
+
+    let msgs = c.query("SELECT pg_type.oid, enumlabel FROM pg_enum JOIN pg_type ON pg_type.oid=enumtypid");
+    assert_eq!(rows(&msgs).len(), 0);
+}
+
+#[test]
+fn per_table_introspection_is_still_refused_not_answered_empty() {
+    // The type catalog is static and safe to answer from a constant; per-table
+    // metadata is not, and must keep saying so rather than reporting a table
+    // with no columns.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE jt (id INT PRIMARY KEY)");
+    // JDBC's getColumns: joins pg_attribute like Npgsql's composite query, but
+    // for relations rather than composite types.
+    let e = error(&c.query(
+        "SELECT * FROM (SELECT n.nspname,c.relname,a.attname,a.atttypid \
+         FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid) \
+         JOIN pg_catalog.pg_attribute a ON (a.attrelid=c.oid) \
+         WHERE c.relkind in ('r','p','v','f','m') AND c.relname LIKE 'jt') c",
+    ));
+    assert_eq!(e.field(b'C').as_deref(), Some("0A000"));
+    assert!(e.field(b'M').unwrap().contains("DESCRIBE"), "{:?}", e.field(b'M'));
+}
+
+#[test]
 fn psql_backslash_d_on_one_table_is_refused_rather_than_mis_shaped() {
     // Answering psql's `\d <table>` probe with the table list made psql fail on
     // a column it expected ("column number 4 is out of range"). A refusal that
@@ -640,14 +756,22 @@ fn psql_backslash_d_on_one_table_is_refused_rather_than_mis_shaped() {
 
 #[test]
 fn an_unimplemented_catalog_query_is_refused_by_name() {
-    // The alternative — an empty result — would be believed.
+    // The alternative — an empty result — would be believed. (The *type*
+    // catalog is answered, because its content is static and knowable; these
+    // are not.)
     let g = spawn();
     let mut c = Client::connect(g.port, &[("user", "admin")]);
     c.handshake();
-    let e = error(&c.query("SELECT typname FROM pg_catalog.pg_type WHERE oid = 23"));
-    assert_eq!(e.field(b'C').as_deref(), Some("0A000"));
-    let m = e.field(b'M').unwrap();
-    assert!(m.contains("system catalogs") && m.contains("SHOW TABLES"), "{m}");
+    for sql in [
+        "SELECT rolname FROM pg_catalog.pg_roles",
+        "SELECT indexname FROM pg_catalog.pg_index",
+        "SELECT table_name FROM information_schema.tables",
+    ] {
+        let e = error(&c.query(sql));
+        assert_eq!(e.field(b'C').as_deref(), Some("0A000"), "for {sql}");
+        let m = e.field(b'M').unwrap();
+        assert!(m.contains("system catalogs") && m.contains("SHOW TABLES"), "{m}");
+    }
 }
 
 // ── extended query ──────────────────────────────────────────────────────────

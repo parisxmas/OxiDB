@@ -1,9 +1,21 @@
 # PostgreSQL Wire Protocol
 
 OxiDB speaks the **PostgreSQL v3 frontend/backend protocol** on its own port, so
-`psql`, `psycopg`, and other PostgreSQL clients connect to it unmodified. The
-listener serves the [SQL engine](sql.md); it is a separate listener end to end
-and changes nothing about the native OxiWire port.
+PostgreSQL clients connect to it unmodified. The listener serves the
+[SQL engine](sql.md); it is a separate listener end to end and changes nothing
+about the native OxiWire port.
+
+## Client support
+
+Verified against the real drivers, not inferred:
+
+| Client | Status |
+|---|---|
+| **psql** 18 | Queries, DDL, transactions, `\dt`, `\l`. `\d <table>` is refused (see Limitations). |
+| **psycopg** 3.3 | Everything tested works: extended protocol, server-side parameters, `executemany`, typed exceptions, transaction recovery, `fetchmany`. |
+| **Npgsql** 8.0 | Everything tested works, including the type catalog it loads on connect — no `Server Compatibility Mode` flag needed. |
+| **pgjdbc** 42.7 | Queries, `PreparedStatement`, transactions, `SQLState`, `ResultSetMetaData`. **`DatabaseMetaData.getTables`/`getColumns` are refused** — they need per-table catalog introspection. |
+| pg_dump, BI tools | Not supported. |
 
 ## Enabling
 
@@ -60,6 +72,11 @@ applies.
 - **Row limits** — `fetchmany` suspends and resumes the portal.
 - `SET`/`RESET`/`SHOW`/`DISCARD`, `SELECT version()`, `current_database()`,
   `current_user`, `current_schema()`.
+- **Mixed batches** — one simple-query message may carry both statements this
+  server answers itself and statements the engine runs, in any order. (Npgsql
+  opens with exactly that.)
+- **The type catalog** a driver loads on connect (`pg_type` and friends),
+  answered from the fixed list of types this server has.
 - **psql `\dt` and `\l`**, answered from the engine's own catalog.
 
 ## Type mapping
@@ -86,11 +103,13 @@ supported for `bool`, `int2/4/8`, `float4/8`, `text` and `bytea`. Binary
 This is a v1 aimed at `psql` and `psycopg`. What is missing is refused with an
 error naming it — never answered with a plausible-looking empty result.
 
-- **The system catalogs are not implemented.** `\dt` and `\l` are answered
-  specially; any other `pg_catalog` or `information_schema` query — including
-  psql's `\d <table>` — is refused, pointing at `SHOW TABLES`, `SHOW INDEXES`
-  and `DESCRIBE <table>`. This is what npgsql and pgjdbc need (both read the
-  type catalog on connect), so **those drivers do not work yet**.
+- **Per-table catalog introspection is not implemented.** The *type* catalog is
+  answered, because its content is static — the list of types this server has.
+  Per-table metadata is not: psql's `\d <table>` and JDBC's
+  `DatabaseMetaData.getTables`/`getColumns` are refused with `0A000`, pointing
+  at `DESCRIBE <table>`, `SHOW TABLES` and `SHOW INDEXES`. Anything else under
+  `pg_catalog` or `information_schema` (`pg_roles`, `pg_index`, …) is refused
+  the same way — never answered with an empty result, which would be believed.
 - No `COPY`, `LISTEN`/`NOTIFY`, or `DECLARE ... CURSOR` (psycopg's *named*
   server-side cursors; unnamed cursors and `fetchmany` do work).
 - No query cancellation: `CancelRequest` is accepted and ignored.

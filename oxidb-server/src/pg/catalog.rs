@@ -17,6 +17,8 @@ use oxidb_sql::{CommandKind, SqlType, Value};
 
 use super::errors::{PgError, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
 use super::session::{describe_columns, PgSession, Reply};
+use super::types;
+use super::wire::FieldDesc;
 use crate::auth::Role;
 
 /// Lowercased, whitespace-collapsed, trailing-semicolon-free — the form every
@@ -38,11 +40,30 @@ fn normalize(sql: &str) -> String {
     out.trim_end_matches([' ', ';']).to_string()
 }
 
-/// Build a single-column-per-entry canned result.
+/// Build a canned all-text result.
 fn rows_reply(columns: &[&str], rows: Vec<Vec<Value>>) -> Reply {
     let names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
     let types = vec![Some(SqlType::Text); columns.len()];
     let fields = describe_columns(&names, &types, &rows, &[]);
+    let tag = Some(CommandKind::Select.tag(rows.len()));
+    Reply::Rows { fields, rows, tag }
+}
+
+/// Build a canned result whose columns carry **specific** type OIDs.
+///
+/// The catalog answers need this: a driver reading `pg_type.oid` expects the
+/// `oid` type and will refuse a plain `int8`, so these results have to be
+/// described with the same OIDs real PostgreSQL would use.
+fn typed_rows(columns: &[(&str, i32)], rows: Vec<Vec<Value>>) -> Reply {
+    let fields = columns
+        .iter()
+        .map(|(name, oid)| FieldDesc {
+            name: (*name).to_string(),
+            type_oid: *oid,
+            type_len: types::type_len(*oid),
+            format: types::FORMAT_TEXT,
+        })
+        .collect();
     let tag = Some(CommandKind::Select.tag(rows.len()));
     Reply::Rows { fields, rows, tag }
 }
@@ -145,22 +166,6 @@ pub fn intercept(session: &mut PgSession, sql: &str) -> Result<Option<Vec<Reply>
             return Ok(Some(vec![Reply::Tag("ROLLBACK".into())]));
         }
         return Ok(None); // the guard reports 25P02
-    }
-
-    // Several settings in one round trip (pgjdbc's opening volley). Only split
-    // when *every* part is interceptable: a semicolon inside a string literal
-    // then yields parts that match nothing, and the whole text falls through
-    // to the engine untouched.
-    if norm.contains(';') {
-        let parts: Vec<&str> = norm.split(';').map(str::trim).collect();
-        if parts.len() > 1 && parts.iter().all(|p| p.is_empty() || is_session_command(p)) {
-            let mut out = Vec::new();
-            for p in parts.iter().filter(|p| !p.is_empty()) {
-                out.extend(session_command(session, p)?);
-            }
-            return Ok(Some(out));
-        }
-        return Ok(None);
     }
 
     if is_session_command(&norm) {
@@ -285,6 +290,10 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
         return Ok(None);
     }
 
+    if let Some(reply) = type_catalog(norm) {
+        return Ok(Some(vec![reply]));
+    }
+
     // psql's \l — the SQL engine's databases are opened on demand and not
     // enumerable, so this reports the one this connection is attached to
     // rather than inventing a list.
@@ -310,16 +319,17 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
         )]));
     }
 
-    // psql's `\d <table>` opens by selecting the relation's oid, and then uses
-    // that oid in follow-up queries this server has no answer for. Refusing the
-    // first one tells the user why; answering it with the table list would make
-    // psql fail on a column it expected to be there ("column number 4 is out of
-    // range" — how this was found).
+    // Per-relation introspection — psql's `\d <table>`, and JDBC's
+    // `DatabaseMetaData.getTables`/`getColumns` — selects the relation's oid
+    // and joins onward from it. Refusing tells the caller why; answering with
+    // the table list instead made psql fail on a column it expected to be
+    // there ("column number 4 is out of range" — how this was found).
     if norm.contains("pg_class") && norm.contains("c.oid") {
         return Err(PgError::new(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
-            "psql's \\d needs the PostgreSQL system catalogs, which OxiDB does not \
-             implement — use DESCRIBE <table> (or \\dt for the table list)",
+            "per-table introspection reads the PostgreSQL system catalogs, which OxiDB \
+             does not implement — use DESCRIBE <table>, SHOW TABLES or SHOW INDEXES \
+             (this is what psql's \\d and JDBC's DatabaseMetaData need)",
         ));
     }
 
@@ -355,6 +365,90 @@ fn catalog_query(session: &PgSession, norm: &str) -> Result<Option<Vec<Reply>>, 
          use SHOW TABLES, SHOW INDEXES or DESCRIBE <table> instead",
     ))
 }
+
+/// The three queries a driver runs to learn the server's **type** system.
+///
+/// Npgsql sends all three in its opening batch and refuses to connect without
+/// them (its alternative is `Server Compatibility Mode=NoTypeLoading` in the
+/// connection string, which users should not have to know about).
+///
+/// Unlike the table catalog, the answer here is essentially static: it is the
+/// list of types this server has, which does not change. So it is answered
+/// from a constant rather than from the engine — and the two follow-up queries
+/// (composite fields, enum labels) are answered empty, which is *true*: this
+/// server has no composite types and no enums.
+fn type_catalog(norm: &str) -> Option<Reply> {
+    // Enum labels: none exist.
+    if norm.contains("pg_enum") {
+        return Some(typed_rows(
+            &[("oid", types::OID_OID), ("enumlabel", types::OID_TEXT)],
+            Vec::new(),
+        ));
+    }
+    // Fields of free-standing composite types: none exist. (Told apart from
+    // pgjdbc's getColumns, which also joins pg_attribute, by the composite
+    // predicate `typtype = 'c'`.)
+    if norm.contains("pg_attribute") && norm.contains("typtype = 'c'") {
+        return Some(typed_rows(
+            &[
+                ("oid", types::OID_OID),
+                ("attname", types::OID_TEXT),
+                ("atttypid", types::OID_OID),
+            ],
+            Vec::new(),
+        ));
+    }
+    // The type list itself.
+    if !norm.contains("pg_type") || !norm.contains("typname") {
+        return None;
+    }
+    let rows = SUPPORTED_TYPES
+        .iter()
+        .map(|(oid, name)| {
+            vec![
+                text("pg_catalog"),
+                Value::Int(*oid as i64),
+                text(*name),
+                // Every type this server has is a base type: not a range,
+                // enum, domain, composite or array.
+                text("b"),
+                Value::Bool(false),
+                // No element type — nothing here is an array or range.
+                Value::Null,
+            ]
+        })
+        .collect();
+    Some(typed_rows(
+        &[
+            ("nspname", types::OID_TEXT),
+            ("oid", types::OID_OID),
+            ("typname", types::OID_TEXT),
+            ("typtype", types::OID_CHAR),
+            ("typnotnull", types::OID_BOOL),
+            ("elemtypoid", types::OID_OID),
+        ],
+        rows,
+    ))
+}
+
+/// The types this server can produce, by their real PostgreSQL OIDs — so a
+/// driver's existing handler for each one applies unchanged.
+const SUPPORTED_TYPES: &[(i32, &str)] = &[
+    (types::OID_BOOL, "bool"),
+    (types::OID_BYTEA, "bytea"),
+    (types::OID_CHAR, "char"),
+    (types::OID_INT8, "int8"),
+    (types::OID_INT2, "int2"),
+    (types::OID_INT4, "int4"),
+    (types::OID_TEXT, "text"),
+    (types::OID_OID, "oid"),
+    (types::OID_FLOAT4, "float4"),
+    (types::OID_FLOAT8, "float8"),
+    (types::OID_VARCHAR, "varchar"),
+    (types::OID_TIMESTAMP, "timestamp"),
+    (types::OID_TIMESTAMPTZ, "timestamptz"),
+    (types::OID_NUMERIC, "numeric"),
+];
 
 fn mentions_catalog_table(norm: &str) -> bool {
     [
