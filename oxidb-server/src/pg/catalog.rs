@@ -11,8 +11,6 @@
 //! with a plausible-looking empty result is worse than an error, because the
 //! client believes the answer.
 
-use std::collections::BTreeMap;
-
 use oxidb_sql::{CommandKind, FkAction, SqlType, Value};
 
 use super::errors::{PgError, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
@@ -266,31 +264,12 @@ fn catalog_query(
     norm: &str,
     sql: &str,
 ) -> Result<Option<Vec<Reply>>, PgError> {
-    // The one-liners clients and REPLs open with.
-    let scalar: BTreeMap<&str, String> = BTreeMap::from([
-        ("select version()", server_version()),
-        ("select pg_catalog.version()", server_version()),
-        ("select current_schema()", "public".to_string()),
-        ("select current_schema", "public".to_string()),
-        ("select current_database()", session.database.clone()),
-        ("select current_user", session.user.clone()),
-        ("select user", session.user.clone()),
-        ("select session_user", session.user.clone()),
-        ("select current_catalog", session.database.clone()),
-    ]);
-    if let Some(v) = scalar.get(norm) {
-        let col = norm.trim_start_matches("select ").replace("pg_catalog.", "");
-        return Ok(Some(vec![rows_reply(
-            &[col.trim_end_matches("()")],
-            vec![vec![text(v.clone())]],
-        )]));
-    }
-    if norm == "select pg_backend_pid()" {
-        let rows = vec![vec![Value::Int(std::process::id() as i64)]];
-        let names = vec!["pg_backend_pid".to_string()];
-        let fields = describe_columns(&names, &[Some(SqlType::Int)], &rows, &[]);
-        let tag = Some(CommandKind::Select.tag(rows.len()));
-        return Ok(Some(vec![Reply::Rows { fields, rows, tag }]));
+    // A select made up entirely of session functions, in any combination —
+    // `SELECT version()`, `SELECT current_schema(),session_user`, and so on.
+    // Matching whole query strings meant every new combination a client
+    // invented was a miss; resolving item by item covers them all.
+    if let Some(reply) = session_functions(session, norm) {
+        return Ok(Some(vec![reply]));
     }
 
     if !norm.contains("pg_catalog.") && !mentions_catalog_table(norm) {
@@ -351,6 +330,30 @@ fn catalog_query(
             vec![vec![text("public"), Value::Null]],
         )]));
     }
+    // `pg_get_keywords()` — clients read it to decide what needs quoting. The
+    // usual shape aggregates it into one string; the raw set-returning form
+    // gives a row per word.
+    if norm.contains("pg_get_keywords") {
+        let words = super::pgcatalog::KEYWORDS;
+        return Ok(Some(vec![if norm.contains("string_agg") {
+            typed_rows(
+                &[("string_agg", types::OID_TEXT)],
+                vec![vec![text(words.join(","))]],
+            )
+        } else {
+            typed_rows(
+                &[
+                    ("word", types::OID_TEXT),
+                    ("catcode", types::OID_CHAR),
+                    ("catdesc", types::OID_TEXT),
+                ],
+                words
+                    .iter()
+                    .map(|w| vec![text(*w), text("R"), text("reserved")])
+                    .collect(),
+            )
+        }]));
+    }
     if norm.contains("pg_settings") && norm.contains("max_index_keys") {
         // Asked before the metadata calls above; the answer is PostgreSQL's
         // own compiled-in default and nothing here depends on it.
@@ -358,6 +361,18 @@ fn catalog_query(
             &[("setting", types::OID_TEXT)],
             vec![vec![text("32")]],
         )]));
+    }
+
+    // Whole-catalog-row queries (`SELECT t.oid, t.* FROM pg_type t`) — matched
+    // *after* every question-specific answer above, so a client asking a
+    // precise question still gets the precise answer, and only a client asking
+    // for the raw rows gets them.
+    // A shape probe (`WHERE 1<>1`) asks only what columns exist, so it is
+    // served here too even though it names them individually.
+    if (selects_whole_rows(norm) || is_shape_probe(norm))
+        && let Some(reply) = catalog_rows(session, norm, sql)
+    {
+        return Ok(Some(vec![reply]));
     }
 
     // psql's \l — the SQL engine's databases are opened on demand and not
@@ -392,7 +407,13 @@ fn catalog_query(
     // there ("column number 4 is out of range" — how this was found).
     // (A query that also reads `pg_type` is asking about types, not relations,
     // and gets the general message below instead of this one.)
-    if norm.contains("pg_class") && norm.contains("c.oid") && !norm.contains("pg_type") {
+    // Keyed on psql's regex-operator form (`relname OPERATOR(pg_catalog.~)
+    // '^(t)$'`) rather than on "reads pg_class", so ordinary catalog reads are
+    // answered above and only the `\d` walk — whose follow-ups need index
+    // definitions and attribute defaults this server does not have — is
+    // refused.
+    if norm.contains("pg_class") && norm.contains("pg_catalog.~") {
+        eprintln!("[pg] refused per-table introspection: {}", sql.trim());
         return Err(PgError::new(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             "per-table introspection reads the PostgreSQL system catalogs, which OxiDB \
@@ -443,6 +464,10 @@ fn catalog_query(
 
     // Anything else in the catalog: say so, and say what does work. An empty
     // result would be taken as truth.
+    //
+    // The refused text goes to the server log: this is the one error an
+    // operator can act on by reporting it, and the query is the whole report.
+    eprintln!("[pg] refused catalog query: {}", sql.trim());
     Err(PgError::new(
         SQLSTATE_FEATURE_NOT_SUPPORTED,
         "this query reads the PostgreSQL system catalogs, which OxiDB does not implement — \
@@ -516,6 +541,318 @@ fn type_catalog(norm: &str) -> Option<Reply> {
         ],
         rows,
     ))
+}
+
+/// Whole-catalog-row queries: `SELECT n.oid, n.* FROM pg_catalog.pg_namespace`
+/// and friends, the shape DBeaver uses to build its navigator.
+///
+/// These are answered from [`super::pgcatalog`], which holds PostgreSQL's
+/// column sets and fills them from OxiDB's schema. A `WHERE 1<>1` probe (used
+/// to learn a table's shape without reading it) is honoured by returning the
+/// header and no rows.
+///
+/// Filters are applied only where a client depends on them — a name equality
+/// on the row's identifying column. Anything else is ignored, which is safe
+/// because the caller re-reads the columns it cares about, and these catalogs
+/// are small enough that an unfiltered answer is still correct data.
+fn catalog_rows(session: &PgSession, norm: &str, sql: &str) -> Option<Reply> {
+    use super::pgcatalog as pgc;
+
+    // The owner of everything is the connected user; there is no role catalog.
+    let owner = pgc::PUBLIC_OID;
+    let empty_probe = is_shape_probe(norm);
+
+    // Dispatch on the table being selected *from*, not on any table the query
+    // mentions: these queries join `pg_description` and `pg_namespace` onto
+    // the one they are really asking about, and matching a joined table
+    // answers the wrong question (DBeaver's table list came back holding
+    // `pg_description`'s columns and no rows).
+    let target = from_table(norm)?;
+    let target = target.as_str();
+    let (columns, mut rows): (&[pgc::Col], Vec<Vec<Value>>) =
+        if target.contains("pg_namespace") {
+            (pgc::PG_NAMESPACE, pgc::pg_namespace_rows(owner))
+        } else if target.contains("pg_database") {
+            (
+                pgc::PG_DATABASE,
+                pgc::pg_database_rows(&session.database, owner),
+            )
+        } else if target.contains("pg_settings") {
+            let name = like_pattern(sql, "name")
+                .or_else(|| equals_literal(sql, "name"))
+                .unwrap_or_default();
+            let value = setting(session, &name).unwrap_or_default();
+            (pgc::PG_SETTINGS, vec![pgc::pg_settings_row(&name, &value)])
+        } else if target.contains("pg_enum") {
+            (pgc::PG_ENUM, Vec::new())
+        } else if target.contains("pg_description") && !norm.contains("pg_type") {
+            (pgc::PG_DESCRIPTION, Vec::new())
+        } else if target.contains("pg_type") {
+            (pgc::PG_TYPE, pgc::pg_type_rows(owner))
+        } else if target.contains("pg_attrdef") {
+            (pgc::PG_ATTRDEF, Vec::new())
+        } else if target.contains("pg_attribute") {
+            (pgc::PG_ATTRIBUTE, pgc::pg_attribute_rows(&session.engine))
+        } else if target.contains("pg_constraint") {
+            (
+                pgc::PG_CONSTRAINT,
+                pgc::pg_constraint_rows(&session.engine),
+            )
+        } else if target.contains("pg_index") && !norm.contains("pg_indexes") {
+            (pgc::PG_INDEX, pgc::pg_index_rows(&session.engine))
+        } else if target.contains("pg_proc") {
+            (pgc::PG_PROC, Vec::new())
+        } else if target.contains("pg_roles") || norm.contains("pg_authid") {
+            (
+                pgc::PG_ROLES,
+                pgc::pg_roles_rows(&session.user, session.role == Role::Admin),
+            )
+        } else if target.contains("pg_available_extensions") {
+            (pgc::PG_AVAILABLE_EXTENSIONS, Vec::new())
+        } else if target.contains("pg_extension") {
+            (pgc::PG_EXTENSION, Vec::new())
+        } else if target.contains("pg_trigger") && !norm.contains("pg_event_trigger") {
+            (pgc::PG_TRIGGER, Vec::new())
+        } else if target.contains("pg_event_trigger") {
+            (pgc::PG_EVENT_TRIGGER, Vec::new())
+        } else if target.contains("pg_tablespace") {
+            (pgc::PG_TABLESPACE, Vec::new())
+        } else if target.contains("pg_sequence") {
+            (pgc::PG_SEQUENCE, Vec::new())
+        } else if target.contains("pg_collation") {
+            (pgc::PG_COLLATION, Vec::new())
+        } else if target.contains("pg_publication") {
+            (pgc::PG_PUBLICATION, Vec::new())
+        } else if target.contains("pg_foreign_server") {
+            (pgc::PG_FOREIGN_SERVER, Vec::new())
+        } else if target.contains("pg_inherits") {
+            (pgc::PG_INHERITS, Vec::new())
+        } else if target.contains("pg_am") {
+            (pgc::PG_AM, Vec::new())
+        } else if target.contains("pg_class") {
+            (pgc::PG_CLASS, pgc::pg_class_rows(&session.engine, owner))
+        } else {
+            return None;
+        };
+
+    if empty_probe {
+        rows.clear();
+    }
+    filter_relkind(norm, columns, &mut rows);
+    let (columns, rows) = project(norm, columns, rows);
+    let cols: Vec<(&str, i32)> = columns.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    Some(typed_rows(&cols, rows))
+}
+
+/// The catalog table a query selects *from* — the one it is asking about, as
+/// opposed to the ones it joins on for descriptions and namespaces.
+fn from_table(norm: &str) -> Option<String> {
+    let after = norm.split(" from ").nth(1)?;
+    after
+        .split_whitespace()
+        .find_map(|word| {
+            let name = word.trim_start_matches("pg_catalog.").trim_matches(',');
+            name.starts_with("pg_").then(|| name.to_string())
+        })
+}
+
+/// Apply a `relkind` restriction, the one filter these queries genuinely
+/// depend on: a client asking for tables (`relkind not in ('i','I','c')`) must
+/// not be handed the indexes as well, or it lists them as tables.
+fn filter_relkind(norm: &str, columns: &[(&'static str, i32)], rows: &mut Vec<Vec<Value>>) {
+    let Some(pos) = columns.iter().position(|(n, _)| *n == "relkind") else {
+        return;
+    };
+    let Some(at) = norm.find("relkind") else {
+        return;
+    };
+    let rest = &norm[at + "relkind".len()..];
+    let negated = rest.trim_start().starts_with("not in") || rest.trim_start().starts_with("<>");
+    // The quoted letters that follow, e.g. `not in ('i','I','c')` or `= 'r'`.
+    let clause_end = rest.find(')').map_or(rest.len().min(40), |e| e + 1);
+    let listed: Vec<char> = rest[..clause_end]
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .filter_map(|s| s.chars().next())
+        .collect();
+    if listed.is_empty() {
+        return;
+    }
+    rows.retain(|row| {
+        let kind = match &row[pos] {
+            Value::Text(s) => s.chars().next().unwrap_or(' '),
+            _ => return true,
+        };
+        // `norm` is lowercased, so a relkind letter's case is not meaningful
+        // here; compare case-insensitively.
+        let listed_has = listed
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(&kind));
+        listed_has != negated
+    });
+}
+
+/// Project a catalog table down to the columns the query actually selected.
+///
+/// `SELECT t.oid, t.*` keeps the leading column and then everything; a probe
+/// like `SELECT reltype FROM pg_class WHERE 1<>1` keeps one. An item that is
+/// not a column of this table — a joined `d.description`, a `format_type(...)`
+/// call — becomes a NULL column under its own name, which is what PostgreSQL
+/// would return anyway for the joins these queries make against data OxiDB
+/// does not keep.
+fn project(
+    norm: &str,
+    columns: &[(&'static str, i32)],
+    rows: Vec<Vec<Value>>,
+) -> (Vec<(String, i32)>, Vec<Vec<Value>>) {
+    let all = || {
+        (
+            columns
+                .iter()
+                .map(|(n, o)| ((*n).to_string(), *o))
+                .collect::<Vec<_>>(),
+            rows.clone(),
+        )
+    };
+    let Some(list) = norm.strip_prefix("select ") else {
+        return all();
+    };
+    let list = list.split(" from ").next().unwrap_or(list);
+
+    // Which source column each output column comes from; `None` = not ours.
+    let mut picks: Vec<(String, i32, Option<usize>)> = Vec::new();
+    for item in split_top_level(list, ',') {
+        let item = item.trim();
+        let (expr, alias) = match item.split_once(" as ") {
+            Some((e, a)) => (e.trim(), Some(a.trim().trim_matches('"').to_string())),
+            None => (item, None),
+        };
+        if expr == "*" || expr.ends_with(".*") {
+            for (i, (n, o)) in columns.iter().enumerate() {
+                picks.push(((*n).to_string(), *o, Some(i)));
+            }
+            continue;
+        }
+        // Strip a table alias: `t.oid` -> `oid`.
+        let bare = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+        match columns.iter().position(|(n, _)| *n == bare) {
+            Some(i) => picks.push((
+                alias.unwrap_or_else(|| bare.to_string()),
+                columns[i].1,
+                Some(i),
+            )),
+            None => picks.push((
+                alias.unwrap_or_else(|| bare.to_string()),
+                types::OID_TEXT,
+                None,
+            )),
+        }
+    }
+    if picks.is_empty() {
+        return all();
+    }
+    let out_cols = picks.iter().map(|(n, o, _)| (n.clone(), *o)).collect();
+    let out_rows = rows
+        .into_iter()
+        .map(|row| {
+            picks
+                .iter()
+                .map(|(_, _, src)| src.map_or(Value::Null, |i| row[i].clone()))
+                .collect()
+        })
+        .collect();
+    (out_cols, out_rows)
+}
+
+/// A `WHERE 1<>1` probe: the client wants the column layout, not the data.
+fn is_shape_probe(norm: &str) -> bool {
+    norm.contains("1<>1") || norm.contains("1 <> 1")
+}
+
+/// Whether a query asks for whole rows (`SELECT *` / `SELECT x.*`) rather than
+/// named columns. This is what separates "give me the catalog" from "answer
+/// this specific question", and keeps the two from stealing each other's
+/// queries.
+fn selects_whole_rows(norm: &str) -> bool {
+    let Some(list) = norm.strip_prefix("select ") else {
+        return false;
+    };
+    let list = list.split(" from ").next().unwrap_or(list);
+    list.split(',')
+        .any(|item| item.trim() == "*" || item.trim().ends_with(".*"))
+}
+
+/// Resolve one select item to a session value, if it is one this server knows.
+/// `alias` is what the column should be called (PostgreSQL names it after the
+/// function, minus the parens).
+fn session_function(session: &PgSession, item: &str) -> Option<(String, Value)> {
+    // `expr AS name` / `expr name` — an explicit alias wins.
+    let (expr, alias) = match item.split_once(" as ") {
+        Some((e, a)) => (e.trim(), Some(a.trim().trim_matches('"').to_string())),
+        None => (item, None),
+    };
+    let expr = expr.trim().trim_start_matches("pg_catalog.");
+    let value = match expr {
+        "version()" => text(server_version()),
+        "current_schema()" | "current_schema" => text("public"),
+        "current_database()" | "current_catalog" => text(session.database.clone()),
+        "current_user" | "user" | "session_user" | "current_role" => text(session.user.clone()),
+        "pg_backend_pid()" => Value::Int(std::process::id() as i64),
+        "current_setting('server_version')" => text(server_version()),
+        _ => return None,
+    };
+    let name = alias.unwrap_or_else(|| expr.trim_end_matches("()").to_string());
+    Some((name, value))
+}
+
+/// A `SELECT` whose every item is a session function — answered here, since
+/// none of them mean anything to the engine.
+fn session_functions(session: &PgSession, norm: &str) -> Option<Reply> {
+    let list = norm.strip_prefix("select ")?;
+    // Only a bare select: a FROM/WHERE makes it a real query.
+    if list.contains(" from ") || list.contains(" where ") {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut row = Vec::new();
+    for item in split_top_level(list, ',') {
+        let (name, value) = session_function(session, item.trim())?;
+        names.push(name);
+        row.push(value);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let types: Vec<i32> = row.iter().map(types::oid_of_value).collect();
+    let cols: Vec<(&str, i32)> = names
+        .iter()
+        .zip(types.iter())
+        .map(|(n, t)| (n.as_str(), *t))
+        .collect();
+    Some(typed_rows(&cols, vec![row]))
+}
+
+/// Split on `sep`, ignoring separators inside quotes or parentheses.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut depth, mut quote) = (0, 0i32, None::<char>);
+    for (i, ch) in s.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'') | (None, '"') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, c) if c == sep && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 /// `DatabaseMetaData.getTables` — a pass-through query, so the result *is* the
@@ -959,8 +1296,17 @@ fn mentions_catalog_table(norm: &str) -> bool {
         "pg_index",
         "pg_proc",
         "pg_roles",
+        "pg_authid",
         "pg_settings",
         "pg_tablespace",
+        "pg_extension",
+        "pg_trigger",
+        "pg_sequence",
+        "pg_collation",
+        "pg_publication",
+        "pg_foreign_server",
+        "pg_inherits",
+        "pg_am",
         "information_schema.",
     ]
     .iter()

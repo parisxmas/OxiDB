@@ -15,7 +15,8 @@ Verified against the real drivers, not inferred:
 | **psycopg** 3.3 | Everything tested works: extended protocol, server-side parameters, `executemany`, typed exceptions, transaction recovery, `fetchmany`. |
 | **Npgsql** 8.0 | Everything tested works, including the type catalog it loads on connect — no `Server Compatibility Mode` flag needed. |
 | **pgjdbc** 42.7 | Everything tested works, including `DatabaseMetaData`: `getTables`, `getColumns`, `getPrimaryKeys` (composite keys included), `getIndexInfo`, `getImportedKeys`, `getTypeInfo`, `getSchemas`. |
-| pg_dump, BI tools | Not supported. |
+| **DBeaver** 25.3 | Connects and browses with its native PostgreSQL driver. |
+| pg_dump | Not supported. |
 
 ## Enabling
 
@@ -77,6 +78,14 @@ applies.
   opens with exactly that.)
 - **The type catalog** a driver loads on connect (`pg_type` and friends),
   answered from the fixed list of types this server has.
+- **Catalog rows** — `SELECT c.oid, c.* FROM pg_catalog.pg_class c` and the
+  same for `pg_type`, `pg_namespace`, `pg_attribute`, `pg_constraint`,
+  `pg_index`, `pg_database`, `pg_roles`, `pg_settings`. Column sets and type
+  OIDs are PostgreSQL's; the values describe OxiDB. Catalogs for things this
+  engine does not have (`pg_proc`, `pg_extension`, `pg_trigger`,
+  `pg_tablespace`, …) report their columns and **no rows**, which is the
+  truthful answer. `relkind` restrictions are honoured, and a `WHERE 1<>1`
+  shape probe returns the requested columns with no rows.
 - **JDBC `DatabaseMetaData`** — tables, columns (with `VARCHAR(n)` lengths),
   primary keys (every part of a composite one), indexes, foreign keys, types
   and schemas, all built from the engine's own catalog.
@@ -106,18 +115,24 @@ supported for `bool`, `int2/4/8`, `float4/8`, `text` and `bytea`. Binary
 This is a v1 aimed at `psql` and `psycopg`. What is missing is refused with an
 error naming it — never answered with a plausible-looking empty result.
 
-- **The system catalogs are not queryable.** What is answered is a fixed set of
-  *known questions* — the type catalog, JDBC's `DatabaseMetaData` calls, psql's
-  `\dt` and `\l` — each matched on a marker unique to it and answered from the
-  engine's own catalog. An arbitrary `pg_catalog` or `information_schema` query,
-  including psql's `\d <table>`, is refused with `0A000` pointing at
-  `DESCRIBE <table>`, `SHOW TABLES` and `SHOW INDEXES`. Nothing is answered
-  with an empty result, which would be believed.
+- **The system catalogs are answered, not executed.** There is no queryable
+  `pg_catalog`: a fixed set of *recognised shapes* is served from OxiDB's own
+  schema — the type catalog, JDBC's `DatabaseMetaData` calls, psql's `\dt` and
+  `\l`, and whole-row reads of the catalog tables listed above. Arbitrary SQL
+  over the catalog (aggregates, unusual joins, `information_schema`, psql's
+  `\d <table>`) is refused with `0A000` pointing at `DESCRIBE <table>`,
+  `SHOW TABLES` and `SHOW INDEXES`. Nothing is answered with an empty result
+  that would be mistaken for data.
 
-  The consequence to know: matching is **per-driver and per-version text**. A
-  driver upgrade that rewrites one of these queries loses the match and gets
-  the refusal — loudly, which is the intended failure. It will not quietly
-  return the wrong answer.
+  Two consequences to know. Matching is **per-client and per-version text**: a
+  client upgrade that rewrites one of these queries loses the match and gets
+  the refusal — loudly, which is the intended failure, not a wrong answer. And
+  **filters are only partly applied** — `relkind` restrictions and name
+  patterns are honoured, other predicates are not, so a query that leans on an
+  unusual `WHERE` may see more rows than it asked for.
+
+  Refused catalog queries are logged (`[pg] refused catalog query: …`), which
+  is what to send along if a client you need does not work.
 - No `COPY`, `LISTEN`/`NOTIFY`, or `DECLARE ... CURSOR` (psycopg's *named*
   server-side cursors; unnamed cursors and `fetchmany` do work).
 - No query cancellation: `CancelRequest` is accepted and ignored.

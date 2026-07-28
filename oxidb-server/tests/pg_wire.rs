@@ -31,7 +31,40 @@ impl Drop for Guard {
     }
 }
 
+/// Bounds how many servers boot at the same time.
+///
+/// Every test gets its own server for isolation, and `cargo test` runs them in
+/// parallel — so a whole file's worth can be starting at once, and on a busy
+/// machine one loses the race against its own startup deadline. Only the
+/// *boot* waits here, so tests still overlap; they just stop stampeding.
+static BOOT_GATE: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+const MAX_CONCURRENT_BOOTS: usize = 4;
+
+struct BootPermit;
+
+impl BootPermit {
+    fn acquire() -> BootPermit {
+        let (lock, cv) = &BOOT_GATE;
+        let mut in_flight = lock.lock().unwrap();
+        while *in_flight >= MAX_CONCURRENT_BOOTS {
+            in_flight = cv.wait(in_flight).unwrap();
+        }
+        *in_flight += 1;
+        BootPermit
+    }
+}
+
+impl Drop for BootPermit {
+    fn drop(&mut self) {
+        let (lock, cv) = &BOOT_GATE;
+        *lock.lock().unwrap() -= 1;
+        cv.notify_one();
+    }
+}
+
 fn spawn_with(envs: &[(&str, &str)]) -> Guard {
+    let _permit = BootPermit::acquire();
     let dir = tempfile::tempdir().unwrap();
     let doc = free_port();
     let pg = free_port();
@@ -325,6 +358,7 @@ fn the_pg_port_needs_the_sql_engine() {
     let dir = tempfile::tempdir().unwrap();
     let doc = free_port();
     let pg = free_port();
+    let _permit = BootPermit::acquire();
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
         .env("OXIDB_DATA", dir.path())
         .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
@@ -814,6 +848,144 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
 }
 
 #[test]
+fn catalog_rows_come_from_the_table_being_selected_from() {
+    // DBeaver's table list joins pg_description onto pg_class. Dispatching on
+    // "mentions pg_description" answered it with that table's columns and no
+    // rows — the table list, silently empty.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(80))");
+    c.query("CREATE INDEX idx_name ON customers (name)");
+
+    let msgs = c.query(
+        "SELECT c.oid,c.*,d.description FROM pg_catalog.pg_class c \
+         LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid \
+         WHERE c.relnamespace=2200 AND c.relkind not in ('i','I','c')",
+    );
+    let names = row_names(&msgs, "relname");
+    assert_eq!(
+        names,
+        vec!["customers"],
+        "the table, and not the index — relkind filters are honoured"
+    );
+    let m = row_map(&msgs, 0);
+    assert_eq!(m["relkind"].as_deref(), Some("r"));
+    assert_eq!(m["relnatts"].as_deref(), Some("2"));
+    assert_eq!(m["description"], None, "no comments, reported as NULL");
+}
+
+#[test]
+fn catalog_tables_report_the_engines_schema() {
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE parent (id INT PRIMARY KEY)");
+    c.query("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))");
+    c.query("CREATE INDEX idx_pid ON child (pid)");
+
+    // Constraints: the primary keys and the foreign key, by kind.
+    let msgs = c.query("SELECT c.oid,c.* FROM pg_catalog.pg_constraint c");
+    let kinds = row_names(&msgs, "contype");
+    assert_eq!(kinds.iter().filter(|k| *k == "p").count(), 2, "two PKs");
+    assert_eq!(kinds.iter().filter(|k| *k == "f").count(), 1, "one FK");
+    assert!(row_names(&msgs, "conname").contains(&"child_pid_fkey".to_string()));
+
+    // Indexes.
+    let msgs = c.query("SELECT i.* FROM pg_catalog.pg_index i");
+    assert_eq!(rows(&msgs).len(), 1);
+
+    // Attributes carry their real types and lengths.
+    let msgs = c.query("SELECT a.* FROM pg_catalog.pg_attribute a");
+    let names = row_names(&msgs, "attname");
+    assert!(names.contains(&"pid".to_string()), "{names:?}");
+
+    // Namespaces, and the one role there is.
+    let msgs = c.query("SELECT n.oid,n.* FROM pg_catalog.pg_namespace n");
+    let ns = row_names(&msgs, "nspname");
+    assert!(ns.contains(&"public".to_string()) && ns.contains(&"pg_catalog".to_string()));
+    let msgs = c.query("SELECT r.* FROM pg_catalog.pg_roles r");
+    assert_eq!(row_names(&msgs, "rolname"), vec!["admin"]);
+
+    // Catalogs for things this engine does not have report none — with the
+    // right columns, so a client reads "empty" rather than failing.
+    for (sql, column) in [
+        ("SELECT p.* FROM pg_catalog.pg_proc p", "proname"),
+        ("SELECT e.* FROM pg_catalog.pg_extension e", "extname"),
+        ("SELECT t.* FROM pg_catalog.pg_trigger t", "tgname"),
+    ] {
+        let msgs = c.query(sql);
+        assert_eq!(rows(&msgs).len(), 0, "{sql}");
+        let fields: Vec<String> = msgs
+            .iter()
+            .find(|m| m.tag == b'T')
+            .expect("RowDescription")
+            .fields()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(fields.contains(&column.to_string()), "{sql}: {fields:?}");
+    }
+}
+
+#[test]
+fn a_shape_probe_returns_the_columns_it_asked_for_and_no_rows() {
+    // `WHERE 1<>1` asks what columns exist. Answering it with a refusal is
+    // what stopped DBeaver connecting at all.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin")]);
+    c.handshake();
+    c.query("CREATE TABLE t (id INT PRIMARY KEY)");
+
+    let msgs = c.query("SELECT reltype FROM pg_catalog.pg_class WHERE 1<>1 LIMIT 1");
+    assert_eq!(rows(&msgs).len(), 0);
+    let fields: Vec<String> = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .expect("RowDescription")
+        .fields()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(fields, vec!["reltype"], "exactly what was selected");
+}
+
+#[test]
+fn session_functions_resolve_in_any_combination() {
+    // Matching whole query strings meant every combination a client invented
+    // was a miss — `SELECT current_schema(),session_user` is DBeaver's.
+    let g = spawn();
+    let mut c = Client::connect(g.port, &[("user", "admin"), ("database", "oxidb")]);
+    c.handshake();
+
+    let msgs = c.query("SELECT current_schema(),session_user");
+    assert_eq!(
+        rows(&msgs)[0],
+        vec![Some("public".into()), Some("admin".into())]
+    );
+    let msgs = c.query("SELECT current_database(), current_user, version()");
+    let r = rows(&msgs).remove(0);
+    assert_eq!(r[0].as_deref(), Some("oxidb"));
+    assert_eq!(r[1].as_deref(), Some("admin"));
+    assert!(r[2].as_ref().unwrap().contains("OxiDB"));
+    // An alias is honoured.
+    let msgs = c.query("SELECT current_schema() AS sch");
+    let fields = msgs
+        .iter()
+        .find(|m| m.tag == b'T')
+        .unwrap()
+        .fields();
+    assert_eq!(fields[0].0, "sch");
+    // A select that is not all session functions still reaches the engine.
+    c.query("CREATE TABLE t (id INT PRIMARY KEY)");
+    c.query("INSERT INTO t VALUES (7)");
+    assert_eq!(
+        rows(&c.query("SELECT id FROM t"))[0][0].as_deref(),
+        Some("7")
+    );
+}
+
+#[test]
 fn a_catalog_query_is_never_answered_in_another_ones_shape() {
     // Every one of these once matched a *different* answer and came back with
     // the wrong columns — or worse, the right columns holding the wrong rows
@@ -1148,6 +1320,7 @@ fn scram_is_offered_and_a_wrong_password_is_refused() {
             .unwrap();
     }
 
+    let _permit = BootPermit::acquire();
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
         .env("OXIDB_DATA", dir.path())
         .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
@@ -1268,6 +1441,7 @@ fn spawn_authenticated(users: &[(&str, &str, oxidb_server::auth::Role)]) -> (Chi
     }
     let doc = free_port();
     let pg = free_port();
+    let _permit = BootPermit::acquire();
     let child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
         .env("OXIDB_DATA", dir.path())
         .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))

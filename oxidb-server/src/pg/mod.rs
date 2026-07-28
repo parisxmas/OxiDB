@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod catalog;
 pub mod errors;
+pub mod pgcatalog;
 pub mod session;
 pub mod types;
 pub mod wire;

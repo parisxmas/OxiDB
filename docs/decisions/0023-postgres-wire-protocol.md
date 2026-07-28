@@ -2,8 +2,9 @@
 
 **Status:** Accepted — v1 (startup + SCRAM auth, simple and extended query,
 transactions, SQLSTATE mapping, session/catalog interception, the driver type
-catalog and JDBC's `DatabaseMetaData`) landed & tested 2026-07-28, verified
-against real `psql` 18, `psycopg` 3.3, **Npgsql 8.0** and **pgjdbc 42.7**.
+catalog, JDBC's `DatabaseMetaData`, and catalog-row reads) landed & tested
+2026-07-28, verified against real `psql` 18, `psycopg` 3.3, **Npgsql 8.0**,
+**pgjdbc 42.7** and **DBeaver 25.3**.
 **Supersedes:** —
 **Related:** [ADR-0010](0010-sql-engine.md) (the engine this exposes),
 [ADR-0012](0012-multi-database.md) (the `database` startup parameter resolves
@@ -129,6 +130,27 @@ The cost is that the match is per-driver and per-version text, and a driver
 upgrade can change it. That is why the fallback is a refusal rather than an
 empty result — a stale match fails loudly.
 
+### Answering catalog *rows*, once a client asks for them
+
+pgjdbc and Npgsql ask questions. DBeaver asks for the catalog itself:
+`SELECT c.oid, c.* FROM pg_catalog.pg_class c`, plus `WHERE 1<>1` probes to
+learn a table's column layout. There is no answering that without knowing what
+columns `pg_class` has, so `pg/pgcatalog.rs` holds PostgreSQL's column sets —
+in PostgreSQL's order, with PostgreSQL's type OIDs — and fills them from
+OxiDB's schema.
+
+The rule that keeps it honest: **column sets are PostgreSQL's, values describe
+OxiDB.** Where OxiDB has no equivalent — tablespaces, access methods, ACLs,
+freeze horizons — the column is NULL or a documented zero rather than an
+invented number, and catalogs for things OxiDB does not have (`pg_proc`,
+`pg_extension`, `pg_trigger`) report their columns and no rows. "None" is a
+true answer; a fabricated row is not.
+
+This is still answering shapes, not executing SQL. Executing these queries for
+real would need `~`, `::regclass`, `format_type()`, `pg_get_expr()` and
+set-returning functions the engine does not have — a much larger project than
+knowing what `pg_class` looks like.
+
 **Matching must be keyed on a marker unique to the query, not on the tables it
 reads.** Getting this wrong is the one way this design produces a *silently*
 wrong answer, and it did during development: `getIndexInfo` matched a broad
@@ -137,6 +159,18 @@ column names. A caller cannot tell that from a correct answer. Every matcher is
 now keyed on an alias only that call uses (`self_referencing_col_name`,
 `index_qualifier`, `elemtypoid`, `fkcolumn_name`), and `tests/pg_wire.rs` pins
 the property that no catalog query is ever answered in another one's shape.
+
+The catalog-row work produced the same class of bug twice more, both found by
+running DBeaver rather than by reading the code: dispatching on any *mentioned*
+table meant a query joining `pg_description` onto `pg_class` was answered as
+`pg_description` (an empty table list), so dispatch keys on the `FROM` target;
+and ignoring the `relkind` restriction listed indexes as tables. Both are the
+same lesson as before — a catalog answer is only useful if it answers the
+question that was asked.
+
+**Refused catalog queries are logged.** It is the one error an operator can act
+on by reporting it, and the query text is the whole report — which is how each
+of these gaps was closed in a single pass instead of by guessing.
 
 ## Consequences
 
