@@ -3320,6 +3320,7 @@ impl OxiDb {
     }
 
     /// Objects after a given key — keyset paging, stable across writes.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn list_objects_from(
         &self,
         bucket: &str,

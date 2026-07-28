@@ -462,19 +462,26 @@ impl ReverseCursor {
 /// a record it wrote, and retiring the record it displaced or deleted — held
 /// here and performed together once the commit is durable, or dropped if the
 /// transaction never gets there.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default, Debug)]
 pub struct PendingOps {
     /// Records written pending; flip to active on commit.
+    #[cfg(not(target_arch = "wasm32"))]
     pub activate: Vec<crate::storage::DocLocation>,
     /// Records displaced or deleted; mark deleted on commit.
+    #[cfg(not(target_arch = "wasm32"))]
     pub retire: Vec<crate::storage::DocLocation>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl PendingOps {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn is_empty(&self) -> bool {
         self.activate.is_empty() && self.retire.is_empty()
+    }
+
+    /// No data file to defer anything on in the browser build.
+    #[cfg(target_arch = "wasm32")]
+    pub fn is_empty(&self) -> bool {
+        true
     }
 }
 
