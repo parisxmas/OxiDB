@@ -22,6 +22,7 @@ OXIDB_SQL=1 oxidb-server
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OXIDB_SQL` | off | Set to `1`/`true`/`yes`/`on` to enable the SQL engine |
+| `OXIDB_DOC` | **on** | Set to `0` to run the server **without the document engine** — SQL/TSDB only. The one engine switch that is on by default. See below. |
 | `OXIDB_SQL_DATA` | `${OXIDB_DATA}/sql` | SQL engine data directory |
 | `OXIDB_SQL_SYNC` | `full` | WAL durability: `full` = true storage flush per commit (survives power loss); `data` = OS-cache-level sync (PostgreSQL's default class, several times faster) |
 | `OXIDB_SQL_DISK_FIRST` | off | Keep table data on disk (mmap'd last-checkpoint snapshot) with only post-checkpoint changes in RAM, instead of holding every row resident. Same on-disk format either way — a database can be reopened in either mode. Indexes and the PRIMARY KEY map stay in RAM. |
@@ -31,6 +32,35 @@ At 1M rows (4 columns, PK), disk-first cuts resident memory roughly in half
 (272 → 143 MB) and opens faster; full scans pay a decode cost (11 → 43 ms).
 Mapped snapshot pages are clean file pages the OS can evict under memory
 pressure, so the effective floor is lower than RSS suggests.
+
+### SQL-only servers (`OXIDB_DOC=0`)
+
+The document engine is the server's default and starts unconditionally. Setting
+`OXIDB_DOC=0` turns it off, leaving a SQL (and/or time-series) server:
+
+```bash
+OXIDB_DOC=0 OXIDB_SQL=1 OXIDB_PG_PORT=5432 oxidb-server
+```
+
+What changes: no document data directory is created (`$OXIDB_DATA` gets only
+`sql/`), no per-database TTL-eviction or alert threads run, no scheduler, and
+every document command is refused with an error naming the switch — rather than
+being served from a store the operator asked not to have. `ping` still answers,
+so health checks keep working. Measured on an idle server: **9.8 MB RSS and 8
+threads, against 14.2 MB and 23 threads** with the document engine on.
+
+Two configurations are refused at startup rather than half-served:
+
+- **No engine at all** — `OXIDB_DOC=0` without `OXIDB_SQL=1` or `OXIDB_TSDB=1`
+  would leave nothing to serve.
+- **A document-backed listener** — REST, WebSocket, S3, MQTT, AMQP, GELF,
+  MessagePack and OxiMem all store their state in document collections. The
+  error names each offending variable and why. `OXIDB_ADDR` (OxiWire, for SQL
+  and TSDB requests) and `OXIDB_PG_PORT` both work without documents.
+
+Cluster mode is not supported with `OXIDB_DOC=0` — Raft replicates document
+operations through the same log, so a SQL-only cluster is separate work, and the
+server says so instead of starting half-gated.
 
 ## Wire Protocol
 

@@ -4,6 +4,7 @@ pub mod amqp_wire;
 pub mod audit;
 pub mod auth;
 pub mod db_admin;
+pub mod doc_engine;
 pub mod disk_usage;
 pub mod fdw;
 pub mod gelf;

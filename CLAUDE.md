@@ -99,6 +99,7 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 - `OXIDB_ADDR` (default `127.0.0.1:4444`)
 - `OXIDB_DATA` (default `./oxidb_data`)
 - `OXIDB_DISK_FIRST` (default ON since 0.38-line: document bodies live in an mmap'd `.bdat` with only a ~24 B/doc offset index resident; `0` restores the always-resident `.btree` mode. Existing collections keep their created format — `.bopts`/on-disk format is authoritative over the env). Since 0.38.10 the `.bdat` is **uncompressed by default** (per-record zstd cost scans/aggregations 4-8x); `OXIDB_DISK_COMPRESSED=1` opts back into zstd. Composite indexes are disk-backed too (`.mcidx`, 0.38.9), and full-collection `$group` aggregations covered by a composite index are answered without reading documents (0.38.3-7).
+- `OXIDB_DOC` (default **ON** — the only engine switch that is; `0`/`false`/`no`/`off` runs the server **without the document engine**: no document data dir, no TTL/alert/scheduler threads, document commands refused by name (`ping` still answers). Idle server 9.8 MB RSS / 8 threads vs 14.2 MB / 23. Refuses to start with neither `OXIDB_SQL=1` nor `OXIDB_TSDB=1` (nothing to serve), with any document-backed listener configured (REST/WS/S3/MQTT/AMQP/GELF/MsgPack/OxiMem — named individually with the reason), or in cluster mode. `OXIDB_ADDR` and `OXIDB_PG_PORT` both work without it. `doc_engine.rs`, `tests/doc_disabled.rs`)
 - `OXIDB_POOL_SIZE` (default 4 worker threads)
 - `OXIDB_IDLE_TIMEOUT` (default 30s, 0 = never)
 - `OXIDB_AUDIT` (default off; set to `true`/`1` to enable audit log)

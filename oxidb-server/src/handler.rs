@@ -224,6 +224,14 @@ fn handle_request_session_inner(
         return crate::tsdb_bridge::handle_tsdb(&cmd, &request, sql_readonly, db_name);
     }
 
+    // Everything past this point is the document engine. With OXIDB_DOC=0 it was
+    // never opened on disk, so serving these would write into a store that does
+    // not persist — refuse by name instead. `ping` still answers, because health
+    // checks are about the process, not the engine.
+    if !crate::doc_engine::enabled() && cmd != "ping" {
+        return err_bytes(crate::doc_engine::REFUSAL);
+    }
+
     // FDW v1: if the targeted collection is registered as a linked
     // collection (see oxidb::links), route to the remote OxiDB
     // instead of the local engine. Read commands are proxied; write

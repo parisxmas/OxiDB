@@ -64,6 +64,82 @@ macro_rules! server_log {
     }};
 }
 
+/// Listeners that cannot work without the document engine, with the reason —
+/// each one either stores its state in document collections or serves document
+/// data directly. `OXIDB_PG_PORT` is deliberately absent: it serves the SQL
+/// engine only, which is the point of running without documents.
+const DOC_BACKED_LISTENERS: &[(&str, &str)] = &[
+    (
+        "OXIDB_HTTP_PORT",
+        "the REST API serves document collections",
+    ),
+    (
+        "OXIDB_WS_PORT",
+        "WebSocket subscriptions stream document changes",
+    ),
+    (
+        "OXIDB_S3_PORT",
+        "S3 buckets are stored as document-engine blobs",
+    ),
+    (
+        "OXIDB_MQTT_PORT",
+        "MQTT sessions and retained topics persist as documents",
+    ),
+    (
+        "OXIDB_AMQP_PORT",
+        "durable AMQP queues and messages persist as documents",
+    ),
+    ("OXIDB_UDP_PORT", "GELF log ingestion writes documents"),
+    (
+        "OXIDB_MSGPACK_PORT",
+        "MessagePack log ingestion writes documents",
+    ),
+    ("OXIDB_OXIMEM_PORT", "OxiMem persistence is document-backed"),
+];
+
+/// Validate `OXIDB_DOC=0` against the rest of the configuration and exit with a
+/// specific message if they contradict each other.
+///
+/// Both checks refuse a server that would otherwise start and then disappoint:
+/// one with no engine at all, and one advertising a protocol whose storage was
+/// just turned off. Naming the offending variable is the whole value — a
+/// listener that silently did not bind, or one that bound and then failed every
+/// request, would both cost an operator far more to diagnose.
+fn check_doc_disabled_config() {
+    fn on(key: &str) -> bool {
+        let v = env::var(key).unwrap_or_default().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    }
+    if !on("OXIDB_SQL") && !on("OXIDB_TSDB") {
+        eprintln!(
+            "OXIDB_DOC=0 turns the document engine off, but neither OXIDB_SQL=1 nor \
+             OXIDB_TSDB=1 is set — this server would have no engine to serve.\n\
+             Set OXIDB_SQL=1 (and/or OXIDB_TSDB=1), or unset OXIDB_DOC."
+        );
+        std::process::exit(1);
+    }
+    let configured: Vec<&(&str, &str)> = DOC_BACKED_LISTENERS
+        .iter()
+        .filter(|(var, _)| {
+            env::var(var)
+                .ok()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .is_some_and(|p| p > 0)
+        })
+        .collect();
+    if !configured.is_empty() {
+        eprintln!("OXIDB_DOC=0 is incompatible with these configured listeners:");
+        for (var, why) in configured {
+            eprintln!("  {var} — {why}");
+        }
+        eprintln!(
+            "Unset them to run SQL/TSDB-only (OXIDB_ADDR and OXIDB_PG_PORT both work \
+             without documents), or unset OXIDB_DOC to keep the document engine."
+        );
+        std::process::exit(1);
+    }
+}
+
 fn configure_stream(stream: &TcpStream, idle_timeout: Duration) {
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let _ = stream.set_nodelay(true);
@@ -1121,6 +1197,15 @@ CORE:
     OXIDB_IDLE_TIMEOUT     idle disconnect secs     (default 30, 0 = never)
 
 ENGINES (off unless set):
+    OXIDB_DOC=0            disable the document engine (it is ON by default —
+                           this is the only engine switch that works that way).
+                           No document data dir is created, no TTL/alert threads
+                           run, and document commands are refused by name.
+                           Requires OXIDB_SQL=1 and/or OXIDB_TSDB=1, and is
+                           incompatible with the document-backed listeners
+                           (REST, WS, S3, MQTT, AMQP, GELF, MsgPack, OxiMem)
+                           and with cluster mode. OXIDB_ADDR and OXIDB_PG_PORT
+                           both work without it
     OXIDB_SQL=1            enable the SQL engine
     OXIDB_SQL_DATA         SQL data dir             (default $OXIDB_DATA/sql)
     OXIDB_TSDB=1           enable the time-series engine
@@ -1180,6 +1265,17 @@ fn main() {
     // If OXIDB_NODE_ID is set and cluster feature is enabled, run in cluster mode.
     #[cfg(feature = "cluster")]
     if env::var("OXIDB_NODE_ID").is_ok() {
+        // The cluster path opens the document manager and its threads on its
+        // own, and Raft replicates document operations through the same log.
+        // Rather than half-gate it, say so: a SQL-only cluster is a separate
+        // piece of work, not a flag.
+        if !oxidb_server::doc_engine::enabled() {
+            eprintln!(
+                "OXIDB_DOC=0 is not supported in cluster mode (OXIDB_NODE_ID is set).\n\
+                 Run the node with the document engine enabled, or run standalone."
+            );
+            std::process::exit(1);
+        }
         run_cluster_mode();
         return;
     }
@@ -1252,11 +1348,26 @@ fn main() {
     let in_memory_mode = oxidb_mode == "memory" || oxidb_mode == "in-memory";
     let mqtt_only_mode = oxidb_mode == "mqtt";
 
-    let db_manager = if in_memory_mode {
-        eprintln!("mode: in-memory (all data in RAM, no persistence)");
-        if let Some(g) = &gelf {
-            g.send(GelfLevel::Informational, "mode: in-memory", &[]);
+    // OXIDB_DOC=0: run as a SQL/TSDB server only. Validated before anything is
+    // opened or bound, so an incompatible configuration fails at startup rather
+    // than half-serving.
+    let doc_enabled = oxidb_server::doc_engine::enabled();
+    if !doc_enabled {
+        check_doc_disabled_config();
+    }
+
+    let db_manager = if in_memory_mode || !doc_enabled {
+        if in_memory_mode {
+            eprintln!("mode: in-memory (all data in RAM, no persistence)");
+            if let Some(g) = &gelf {
+                g.send(GelfLevel::Informational, "mode: in-memory", &[]);
+            }
         }
+        // With documents off this manager is a placeholder that no request can
+        // reach (`handler` refuses document commands): opening it in memory is
+        // what keeps the document layout — `oxidb/`, `_schedules`, `_fts`,
+        // `_blobs` — off disk entirely. The SQL and TSDB engines have their own
+        // directories and are unaffected.
         DatabaseManager::open_in_memory().expect("failed to open in-memory database manager")
     } else {
         DatabaseManager::open(Path::new(&data_dir), encryption_key, verbose, log_callback)
@@ -1272,9 +1383,12 @@ fn main() {
         );
     }
     let db_manager = Arc::new(db_manager);
-    db_manager
-        .start_scheduler()
-        .expect("failed to start scheduler");
+    // The scheduler runs document-defined jobs, so it has nothing to do here.
+    if doc_enabled {
+        db_manager
+            .start_scheduler()
+            .expect("failed to start scheduler");
+    }
 
     // Lazy sync mode: defer per-write fsync to a background thread.
     //
@@ -1287,7 +1401,7 @@ fn main() {
     let lazy_sync = env::var("OXIDB_LAZY_SYNC")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
-    if !in_memory_mode {
+    if !in_memory_mode && doc_enabled {
         // The "sync thread" is misnamed — its real job is periodic
         // BTree snapshot persistence (sync_writes). Both strict and
         // lazy modes need this; the difference is the cadence:
@@ -1323,31 +1437,39 @@ fn main() {
         }
     }
 
-    // TTL eviction thread: automatically remove expired documents.
-    // Runs every 100ms in memory mode, every 1s in file mode.
-    let ttl_interval = if in_memory_mode {
-        Duration::from_millis(100)
-    } else {
-        Duration::from_secs(1)
-    };
-    eprintln!(
-        "TTL eviction: enabled (interval={}ms)",
-        ttl_interval.as_millis()
-    );
+    // TTL eviction and alert evaluation are per-database document work; with
+    // documents off there are no documents to expire or alert on, so the
+    // threads are not started at all (they are the visible cost of the engine
+    // in an otherwise idle SQL-only server).
+    if doc_enabled {
+        // TTL eviction thread: automatically remove expired documents.
+        // Runs every 100ms in memory mode, every 1s in file mode.
+        let ttl_interval = if in_memory_mode {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        eprintln!(
+            "TTL eviction: enabled (interval={}ms)",
+            ttl_interval.as_millis()
+        );
 
-    // Alert evaluator thread (evaluates alert rules periodically)
-    let alert_interval_secs: u64 = env::var("OXIDB_ALERT_INTERVAL")
-        .unwrap_or_else(|_| "15".to_string())
-        .parse()
-        .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
-    eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
-    // Via the manager, so every database — the default, lazily-opened, and
-    // future ones — runs its own TTL eviction + alert evaluation.
-    db_manager.enable_background_threads(
-        Some(ttl_interval),
-        Some(Duration::from_secs(alert_interval_secs)),
-    );
-    eprintln!("{}", oxidb::fts::fts_config_summary());
+        // Alert evaluator thread (evaluates alert rules periodically)
+        let alert_interval_secs: u64 = env::var("OXIDB_ALERT_INTERVAL")
+            .unwrap_or_else(|_| "15".to_string())
+            .parse()
+            .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
+        eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
+        // Via the manager, so every database — the default, lazily-opened, and
+        // future ones — runs its own TTL eviction + alert evaluation.
+        db_manager.enable_background_threads(
+            Some(ttl_interval),
+            Some(Duration::from_secs(alert_interval_secs)),
+        );
+        eprintln!("{}", oxidb::fts::fts_config_summary());
+    } else {
+        eprintln!("document engine: DISABLED (OXIDB_DOC=0) — SQL/TSDB only");
+    }
 
     // GPU compute for vector search (optional, enabled with --features gpu)
     #[cfg(feature = "gpu")]
