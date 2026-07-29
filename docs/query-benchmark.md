@@ -36,12 +36,12 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 |---|---:|---:|---:|---:|---:|
 | Point `SELECT` by primary key | 37.0k | 27µs | 38.7k | 26µs | **0.96×** |
 | Composite primary key lookup | 35.8k | 28µs | 37.4k | 27µs | **0.96×** |
-| Secondary index equality | 42.4k | 24µs | 37.7k | 27µs | **1.13×** |
+| Secondary index equality | 42.6k | 23µs | 37.4k | 27µs | **1.14×** |
 | Range scan + `ORDER BY` + `LIMIT` | 35.8k | 27µs | 33.2k | 30µs | **1.08×** |
 | **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
 | `GROUP BY` | 54 | 18.4ms | 84 | 12.0ms | **0.65×** |
 | Join + filter | 54 | 18.4ms | 96 | 10.3ms | **0.56×** |
-| Index, low selectivity | 182 | 5.4ms | 593 | 1.7ms | **0.31×** |
+| Index, low selectivity | 306 | 3.2ms | 610 | 1.6ms | **0.50×** |
 
 ### What changed
 
@@ -52,8 +52,9 @@ Aggregates are now folded **during** the scan rather than after it
 | Workload | before | after |
 |---|---:|---:|
 | Full-scan aggregate | 0.48× | **1.02×** |
-| `GROUP BY` | 0.42× | **0.65×** |
-| Secondary index equality | 1.08× | **1.13×** |
+| `GROUP BY` | 0.42× | **0.66×** |
+| Index, low selectivity | 0.29× | **0.50×** |
+| Secondary index equality | 1.08× | **1.14×** |
 
 The general path builds every source row into a `Chunk` and then indexes into
 it per group — two passes over 400,000 rows and a 400,000-element vector, to
@@ -76,11 +77,17 @@ Two things that mattered more than the idea:
 **Joins (0.56×)** do not use this path at all — join execution materializes both
 sides and is untouched.
 
-**Low-selectivity index scans (0.31×)** are the sharpest remaining gap.
-`index_lookup_eq` returns `Vec<(u64, Vec<Value>)>` — it *materializes* every
-matching row, cloning all its columns, before anything folds them. For a
-predicate matching 20,000 rows that is 20,000 row clones to answer a `count(*)`.
-A streaming index lookup would close it, and is the obvious next piece.
+**Low-selectivity index scans (0.50×)**, improved from 0.29× but still half
+PostgreSQL's speed. Two things were costing per candidate row and are gone:
+`index_lookup_eq` built a `Vec<(u64, Vec<Value>)>` of every match before the
+caller saw any of them, and it materialized each row *twice* — once physically
+to verify the index key, once logically for the result. Rows now stream through
+`index_visit_eq` and are built once.
+
+What remains is that each candidate is still a full row build: a fresh `Vec` and
+a clone of every column, when the predicate reads three of them and `count(*)`
+reads none. Closing that needs projection pushed into the index walk, so only
+the columns a query touches are materialized.
 
 ## What this does not measure
 

@@ -248,6 +248,16 @@ impl RowStore {
     /// The row's **query-visible** (logical) cells: the stored physical row
     /// projected down to the live columns, tombstoned slots removed and any
     /// narrow row padded from `fill`. This is what the executor consumes.
+    /// Project a physical row the caller already has down to logical columns.
+    /// A no-op unless a `DROP COLUMN` has tombstoned a slot — the point is that
+    /// a caller holding a physical row need not fetch the logical one as well.
+    pub fn to_logical(&self, phys: Vec<Value>) -> Vec<Value> {
+        match self.projected {
+            true => project_row(&self.fill, &self.live, &phys),
+            false => phys,
+        }
+    }
+
     pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
         let mut cells = self.raw(row_id)?;
         if self.projected {

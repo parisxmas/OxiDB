@@ -1884,7 +1884,31 @@ impl SqlEngine {
 
     /// Look up rows using a secondary index whose columns are all present in
     /// the `column = value` pairs `eqs`. `Ok(None)` when no index qualifies.
+    /// Collecting form of [`index_visit_eq`](Self::index_visit_eq).
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
+        let mut rows: store::Rows = Vec::new();
+        let found = self.index_visit_eq_inner(table, eqs, &mut |id, cells| {
+            rows.push((id, cells.to_vec()));
+            Ok(true)
+        })?;
+        Ok(found.map(|()| rows))
+    }
+
+    /// Walk the rows an index selects for `eqs`, handing each to `visit`
+    /// without building a result.
+    ///
+    /// `Ok(None)` when no index qualifies — the caller then scans. `visit`
+    /// returns `false` to stop early.
+    ///
+    /// The point is what does *not* happen: a predicate matching 20,000 rows
+    /// used to cost a 20,000-element vector of cloned rows before the caller
+    /// could look at any of them, even to answer `count(*)`.
+    fn index_visit_eq_inner(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
         // `mut` because a qualifying index may not be populated yet — see
         // `SecondaryIndex::populated`. Reads still take the same single lock.
         let mut inner = self.inner.lock().unwrap();
@@ -1907,12 +1931,12 @@ impl SqlEngine {
                 })
                 .collect();
             if let Some(key) = key {
-                let rows: store::Rows = state
-                    .pk_owner_of(&key)
-                    .and_then(|id| state.rows.get(id).map(|c| (id, c)))
-                    .into_iter()
-                    .collect();
-                return Ok(Some(rows));
+                if let Some(id) = state.pk_owner_of(&key)
+                    && let Some(cells) = state.rows.get(id)
+                {
+                    visit(id, &cells)?;
+                }
+                return Ok(Some(()));
             }
         }
         // Find an index all of whose columns have an equality pair. Prefer
@@ -1962,18 +1986,22 @@ impl SqlEngine {
         // `col_pos` are PHYSICAL positions, so the key is recomputed from the
         // physical row — a table with a dropped column has a shorter logical
         // row, and checking against that would read the wrong cells.
-        let rows: store::Rows = idx
-            .candidates(&key)?
-            .into_iter()
-            .filter(|id| {
-                state
-                    .rows
-                    .get_physical(*id)
-                    .is_some_and(|phys| idx.key_of(&phys) == key)
-            })
-            .filter_map(|id| state.rows.get(id).map(|c| (id, c)))
-            .collect();
-        Ok(Some(rows))
+        // One materialization per candidate, not two: the physical row is what
+        // verification needs, and unless a column has been dropped it *is* the
+        // logical row. Fetching both cost a second full row build for every
+        // candidate — 20,000 of them on a low-selectivity predicate.
+        for id in idx.candidates(&key)? {
+            let Some(phys) = state.rows.get_physical(id) else {
+                continue;
+            };
+            if idx.key_of(&phys) != key {
+                continue;
+            }
+            if !visit(id, &state.rows.to_logical(phys))? {
+                break;
+            }
+        }
+        Ok(Some(()))
     }
 
     /// Number of live rows in a table.
@@ -3498,6 +3526,14 @@ impl Store for SqlEngine {
     }
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
         SqlEngine::index_lookup_eq(self, table, eqs)
+    }
+    fn index_visit_eq(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        SqlEngine::index_visit_eq_inner(self, table, eqs, &mut |_, cells| visit(cells))
     }
 }
 

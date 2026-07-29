@@ -212,4 +212,31 @@ pub(crate) trait Store {
     /// (the caller should fall back to a full scan); `Ok(Some(rows))` —
     /// possibly empty — when an index served the lookup.
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<Rows>>;
+
+    /// [`index_lookup_eq`](Store::index_lookup_eq) without building the result.
+    ///
+    /// `visit` is called with each matching row and returns `false` to stop
+    /// early; the outer `Option` is `None` when no index qualifies, exactly as
+    /// the collecting form. This exists because a predicate matching 20,000
+    /// rows should not cost a 20,000-element vector to answer `count(*)` — the
+    /// caller usually folds each row and drops it.
+    ///
+    /// The default collects and replays, so an implementation that has nothing
+    /// better to offer is still correct.
+    fn index_visit_eq(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let Some(rows) = self.index_lookup_eq(table, eqs)? else {
+            return Ok(None);
+        };
+        for (_, cells) in rows {
+            if !visit(&cells)? {
+                break;
+            }
+        }
+        Ok(Some(()))
+    }
 }

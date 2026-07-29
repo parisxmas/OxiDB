@@ -4828,12 +4828,12 @@ fn streamed_aggregate<S: Store>(
     // folding is about avoiding materialization, not about giving up index
     // access. Bypassing this turned `count(*) WHERE customer_id = ?` from a
     // 25µs probe into a 4ms full scan, which the benchmark caught immediately.
-    let indexed = match &select.filter {
+    let index_eqs = match &select.filter {
         Some(e) => {
             let eqs = eq_conjuncts(e, from.key(), params);
             match eqs.is_empty() {
                 true => None,
-                false => store.index_lookup_eq(&from.name, &eqs)?,
+                false => Some(eqs),
             }
         }
         None => None,
@@ -4880,19 +4880,20 @@ fn streamed_aggregate<S: Store>(
         }
         Ok(())
     };
-    match indexed {
-        // Already narrowed by the index: fold those rows and nothing else.
-        Some(rows) => {
-            for (_, cells) in rows {
-                fold_row(&cells)?;
-            }
-        }
-        None => {
-            store.scan_visit(&from.name, &mut |row| {
-                fold_row(row)?;
-                Ok(true)
-            })?;
-        }
+    // Narrowed by an index where one applies, else the whole table — either
+    // way the rows are folded as they arrive and never collected.
+    let served = match &index_eqs {
+        Some(eqs) => store.index_visit_eq(&from.name, eqs, &mut |cells| {
+            fold_row(cells)?;
+            Ok(true)
+        })?,
+        None => None,
+    };
+    if served.is_none() {
+        store.scan_visit(&from.name, &mut |row| {
+            fold_row(row)?;
+            Ok(true)
+        })?;
     }
 
     // Emit.
