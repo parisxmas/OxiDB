@@ -18,7 +18,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SqlError};
-use crate::types::{Value, decode_row, encode_row};
+use crate::types::{Value, decode_row, decode_row_into, encode_row};
 
 const RDAT_MAGIC: &[u8; 4] = b"OXSR";
 const RDAT_VERSION: u16 = 1;
@@ -214,10 +214,18 @@ impl MappedSnapshot {
     /// Decode the row at position `i` of the index. CRC was verified at open,
     /// so a decode failure here is snapshot corruption after the fact.
     pub fn decode_at(&self, i: usize) -> Vec<Value> {
+        let mut buf = Vec::new();
+        self.decode_at_into(i, &mut buf);
+        buf
+    }
+
+    /// [`decode_at`](MappedSnapshot::decode_at) into a reused buffer, so a scan
+    /// does not allocate a row at a time.
+    pub fn decode_at_into(&self, i: usize, buf: &mut Vec<Value>) {
         let (row_id, off, len) = self.index[i];
         let payload = &self.mmap[off as usize..off as usize + len as usize];
-        decode_row(payload, self.arity)
-            .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"))
+        decode_row_into(payload, self.arity, buf)
+            .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"));
     }
 }
 

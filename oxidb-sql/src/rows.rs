@@ -407,6 +407,106 @@ impl RowStore {
     /// All live rows in ascending `row_id` order, in full **physical** layout
     /// (tombstoned slots included, narrow rows padded to physical arity). Used
     /// for index rebuilds and snapshot writes, which work in physical space.
+    /// Walk every live row in `row_id` order, handing each to `f` as the
+    /// **query-visible** (logical) cells, reusing one buffer for rows that must
+    /// be decoded.
+    ///
+    /// The iterator form has to yield an owned `Vec` for a disk-first base row,
+    /// because a borrow of its own scratch cannot outlive `next`. That made a
+    /// scan of a million-row snapshot allocate a million vectors. A push loop
+    /// can hold the scratch itself, so it allocates one.
+    ///
+    /// Resident rows and overlay rows are still handed over borrowed.
+    pub fn visit_rows(
+        &self,
+        f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let fill = self.fill.as_slice();
+        // Padding a narrow row (one written before an `ADD COLUMN`) needs a
+        // buffer of its own; the common case never touches it.
+        let mut pad: Vec<Value> = Vec::new();
+        let projected = self.projected;
+        let live = self.live.as_slice();
+        let mut hand =
+            |id: u64,
+             cells: &[Value],
+             f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>| {
+                // Pad a row written before an `ADD COLUMN`, then project away any
+                // slot a `DROP COLUMN` tombstoned. Neither happens on the common
+                // path, so neither buffer is touched there.
+                let padded: &[Value] = if cells.len() < fill.len() {
+                    pad.clear();
+                    pad.extend_from_slice(cells);
+                    pad.extend_from_slice(&fill[cells.len()..]);
+                    &pad
+                } else {
+                    cells
+                };
+                if !projected {
+                    return f(id, padded);
+                }
+                let logical: Vec<Value> = live
+                    .iter()
+                    .map(|&s| padded.get(s).cloned().unwrap_or_else(|| fill[s].clone()))
+                    .collect();
+                f(id, &logical)
+            };
+        match &self.mode {
+            RowMode::Resident(m) => {
+                for (id, cells) in m {
+                    if !hand(*id, cells, f)? {
+                        break;
+                    }
+                }
+            }
+            RowMode::DiskFirst(d) => {
+                let mut buf: Vec<Value> = Vec::new();
+                let mut base_pos = 0usize;
+                let mut overlay = d.overlay.iter().peekable();
+                loop {
+                    let base_id = d
+                        .base
+                        .as_ref()
+                        .filter(|b| base_pos < b.len())
+                        .map(|b| b.row_id_at(base_pos));
+                    let over_id = overlay.peek().map(|(id, _)| **id);
+                    let take_base = match (base_id, over_id) {
+                        (None, None) => break,
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        // The overlay shadows the base at the same id.
+                        (Some(b), Some(o)) => b < o,
+                    };
+                    if take_base {
+                        let b = d.base.as_ref().expect("base id implies a base");
+                        b.decode_at_into(base_pos, &mut buf);
+                        let id = b.row_id_at(base_pos);
+                        base_pos += 1;
+                        if !hand(id, &buf, f)? {
+                            break;
+                        }
+                    } else {
+                        let (id, change) = overlay.next().expect("peeked");
+                        // A tombstone, or an upsert shadowing the base row of
+                        // the same id — skip the base copy either way.
+                        if base_id == Some(*id) {
+                            base_pos += 1;
+                        }
+                        match change {
+                            Some(cells) => {
+                                if !hand(*id, cells, f)? {
+                                    break;
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn iter_physical(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
         let fill = self.fill.as_slice();
         Box::new(self.iter_raw().map(move |(id, c)| (id, pad_cow(fill, c))))

@@ -3445,12 +3445,10 @@ impl Store for SqlEngine {
             // First sight of this generation (or just recorded): iterate direct.
             state.scan_seen_gen = Some(generation);
         }
-        for (_, row) in state.rows.iter() {
-            if !visit(row.as_ref())? {
-                break;
-            }
-        }
-        Ok(())
+        // A push walk rather than the iterator: it can hold one decode buffer
+        // across rows, where an iterator would have to yield an owned `Vec` for
+        // every disk-first row it reads out of the mmap.
+        state.rows.visit_rows(&mut |_, row| visit(row))
     }
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
         SqlEngine::insert(self, table, cells)

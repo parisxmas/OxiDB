@@ -275,8 +275,21 @@ pub fn encode_row(cells: &[Value]) -> Vec<u8> {
 
 /// Decode a row of exactly `ncols` cells from `bytes`.
 pub fn decode_row(bytes: &[u8], ncols: usize) -> Result<Vec<Value>> {
-    let mut pos = 0;
     let mut cells = Vec::with_capacity(ncols);
+    decode_row_into(bytes, ncols, &mut cells)?;
+    Ok(cells)
+}
+
+/// [`decode_row`] into a buffer the caller owns and reuses.
+///
+/// A disk-first scan decodes every row out of the mmap, and allocating a fresh
+/// `Vec` for each one was a per-row allocation on the hottest path in that
+/// mode. The buffer is cleared, not reallocated, so a scan of a million rows
+/// makes one.
+pub fn decode_row_into(bytes: &[u8], ncols: usize, cells: &mut Vec<Value>) -> Result<()> {
+    cells.clear();
+    cells.reserve(ncols);
+    let mut pos = 0;
     for _ in 0..ncols {
         cells.push(decode_cell(bytes, &mut pos)?);
     }
@@ -286,7 +299,7 @@ pub fn decode_row(bytes: &[u8], ncols: usize) -> Result<Vec<Value>> {
             bytes.len()
         )));
     }
-    Ok(cells)
+    Ok(())
 }
 
 fn read_8(bytes: &[u8], pos: &mut usize) -> Result<[u8; 8]> {
