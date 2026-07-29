@@ -252,6 +252,37 @@ The practical shape of the trap is unchanged: a server sized for its steady
 state cannot restart immediately after a bulk load. The margin needed is now
 about 3.5× steady state rather than 4.5×.
 
+## The document engine, measured separately
+
+Everything above is the **SQL** engine. `OXIDB_DISK_FIRST` (document engine,
+default **on**) and `OXIDB_SQL_DISK_FIRST` (SQL engine, default **off**) are
+different switches over different storage, and none of the tuning above touched
+the document side. Since OxiBase serves documents, storage and realtime from
+that engine, it is worth its own numbers.
+
+One million documents of the same shape as the `customers` table, loaded over
+OxiWire:
+
+| | Document engine |
+|---|---:|
+| Empty | 8 MB |
+| After loading 1M documents | 84 MB |
+| After restart, before any query | **52 MB** |
+| After a full scan + filter | **92 MB** |
+| On disk | 141 MB |
+
+**It is already bounded, which is the property the SQL engine had to be taught.**
+Five times the data costs 1.7× the memory, not 5×: both document caches are
+sized by a fixed 128 MiB budget rather than an entry count that tracks the
+collection (`doc_cache.rs`, `doc_bytes_cache.rs`), so a scan fills them and
+stops. That is the same shape as PostgreSQL's `shared_buffers`, reached
+deliberately — the comments there record an earlier default that cached a whole
+1M-document collection and dominated RSS.
+
+What still scales with the dataset is the per-document offset index, the
+document-side counterpart of the `.rdat` row-offset index that sets the SQL
+engine's floor.
+
 ## Many small tenants: the shape OxiBase actually runs
 
 Everything above compares one large database against one PostgreSQL. That is
