@@ -3748,6 +3748,111 @@ fn index_nested_loop_chunk<S: Store>(
     Ok(Some(Chunk::from_rows(rows.into_values(), keep)))
 }
 
+/// Right rows whose integer join key appears on the left, materialized; the
+/// rest are skipped before a row is ever built.
+///
+/// The hash join materializes the whole right table and then discards most of
+/// it — a left side matching 40,000 of 400,000 rows still paid to build all
+/// 400,000. The left keys are known here, so a membership test decides that.
+///
+/// **The structure is the whole point.** The obvious `BTreeSet<IndexKey>`
+/// version was measured and was *worse* than materializing (0.56x -> 0.22x):
+/// ~14 `Value` comparisons per right row cost more than the row build it
+/// avoided. A direct-addressed bitmap over the integer key range makes the test
+/// one shift and one mask, which is finally cheaper than building a row.
+///
+/// So this only applies when every left key is an integer in a range dense
+/// enough to be worth a bitmap; anything else returns `Ok(None)` and the
+/// caller's existing path runs.
+#[allow(clippy::too_many_arguments)]
+fn semi_join_scan<S: Store>(
+    store: &S,
+    join: &Join,
+    keys: &[(Expr, Expr)],
+    left_schema: &[ColRef],
+    src: &Sources,
+    tuples: &Tuples,
+    full: &[ColRef],
+    keep: &[usize],
+    where_filter: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Chunk>> {
+    // Only an INNER-style probe may drop right rows; an outer join that pads
+    // the right side needs the ones this would skip.
+    if matches!(join.kind, JoinKind::Right | JoinKind::Full) || keys.len() != 1 {
+        return Ok(None);
+    }
+    if tuples.stride == 0 || tuples.data.is_empty() {
+        return Ok(None);
+    }
+    let right_key = bind_expr(&keys[0].1, full)?;
+    if !streamable(&right_key, params) {
+        return Ok(None);
+    }
+
+    // Distinct left key values, as integers. NULL never equi-matches.
+    let left_key = bind_expr(&keys[0].0, left_schema)?;
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let mut vals: Vec<i64> = Vec::new();
+    for lt in tuples.data.chunks_exact(tuples.stride) {
+        let view = View { src, tuple: lt };
+        match eval_scalar(&left_key, left_schema, &view, params)? {
+            Value::Int(n) => {
+                lo = lo.min(n);
+                hi = hi.max(n);
+                vals.push(n);
+            }
+            Value::Null => {}
+            // A non-integer key: no bitmap, so leave it to the general path.
+            _ => return Ok(None),
+        }
+    }
+    if vals.is_empty() {
+        return Ok(Some(Chunk::from_rows(std::iter::empty(), keep)));
+    }
+    // A sparse key range would make the bitmap larger than the rows it saves.
+    let span = (hi - lo).saturating_add(1) as u128;
+    if span > 64 * 1024 * 1024 || span > vals.len() as u128 * 64 {
+        return Ok(None);
+    }
+    let mut bits = vec![0u64; (span as usize).div_ceil(64)];
+    for v in vals {
+        let i = (v - lo) as usize;
+        bits[i / 64] |= 1 << (i % 64);
+    }
+
+    let pushed = where_filter.and_then(|f| pushdown_filter(Some(f), full, params));
+    let mut cells = Vec::new();
+    let mut n = 0usize;
+    store.scan_visit(&join.table.name, &mut |row| {
+        if let Some(f) = &pushed
+            && !truthy(&eval_scalar(f, full, row, params)?)
+        {
+            return Ok(true);
+        }
+        let Value::Int(k) = eval_scalar(&right_key, full, row, params)? else {
+            return Ok(true);
+        };
+        if k < lo || k > hi {
+            return Ok(true);
+        }
+        let i = (k - lo) as usize;
+        if bits[i / 64] & (1 << (i % 64)) == 0 {
+            return Ok(true);
+        }
+        for &c in keep {
+            cells.push(row[c].clone());
+        }
+        n += 1;
+        Ok(true)
+    })?;
+    Ok(Some(Chunk {
+        width: keep.len(),
+        n,
+        cells,
+    }))
+}
+
 /// A materialized subquery result: (columns, types, rows).
 type SubRows = (Vec<String>, Vec<Option<SqlType>>, Vec<Vec<Value>>);
 
@@ -3930,7 +4035,24 @@ fn join_into<S: Store>(
     let chunk = match right_src {
         RightSrc::Ready(chunk) => chunk,
         RightSrc::Base { keep, full } => {
-            match index_nested_loop_chunk(store, join, &keys, schema, src, tuples, &keep, params)? {
+            let semi = match filter_pushable {
+                true => semi_join_scan(
+                    store,
+                    join,
+                    &keys,
+                    schema,
+                    src,
+                    tuples,
+                    &full,
+                    &keep,
+                    where_filter,
+                    params,
+                )?,
+                false => None,
+            };
+            match index_nested_loop_chunk(store, join, &keys, schema, src, tuples, &keep, params)?
+                .or(semi)
+            {
                 Some(chunk) => chunk,
                 None => {
                     // Push this table's own WHERE conjuncts into the scan

@@ -40,7 +40,7 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 | Range scan + `ORDER BY` + `LIMIT` | 35.8k | 27µs | 33.2k | 30µs | **1.08×** |
 | **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
 | `GROUP BY` | 54 | 18.4ms | 84 | 12.0ms | **0.65×** |
-| Join + filter | 54 | 18.4ms | 96 | 10.3ms | **0.56×** |
+| Join + filter | 86 | 11.6ms | 98 | 10.1ms | **0.87×** |
 | Index, low selectivity | 306 | 3.2ms | 610 | 1.6ms | **0.50×** |
 
 ### What changed
@@ -54,6 +54,7 @@ Aggregates are now folded **during** the scan rather than after it
 | Full-scan aggregate | 0.48× | **1.02×** |
 | `GROUP BY` | 0.42× | **0.66×** |
 | Index, low selectivity | 0.29× | **0.50×** |
+| Join + filter | 0.56× | **0.87×** |
 | Secondary index equality | 1.08× | **1.14×** |
 
 The general path builds every source row into a `Chunk` and then indexes into
@@ -74,8 +75,20 @@ Two things that mattered more than the idea:
 
 ### What still loses, and why
 
-**Joins (0.56×)** do not use this path at all — join execution materializes both
-sides and is untouched.
+**Joins (0.87×)**, improved from 0.56×. The hash join materialized the whole
+right table and then discarded most of it: a left side matching 40,000 of
+400,000 rows still paid to build all 400,000. A semi-join pre-filter now skips a
+right row before building it, when its key is not one the left holds.
+
+**The structure was the whole difficulty, and two measured failures found it.**
+Raising the index-nested-loop threshold so 19,823 left rows probed instead of
+scanning made it *worse* — 0.56× → 0.29× — which validated the existing 8,192
+cap rather than replacing it. Then the obvious `BTreeSet<IndexKey>` membership
+test was worse still, 0.22×: about fourteen `Value` comparisons per right row
+cost more than the row build it was avoiding. A direct-addressed bitmap over the
+integer key range makes the test one shift and one mask, and that is finally
+cheaper than building a row. It applies only to integer keys over a range dense
+enough to be worth the bitmap; anything else takes the old path.
 
 **Low-selectivity index scans (0.50×)**, improved from 0.29× but still half
 PostgreSQL's speed. Two things were costing per candidate row and are gone:
