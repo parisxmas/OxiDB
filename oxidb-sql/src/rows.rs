@@ -234,6 +234,44 @@ impl RowStore {
 
     /// The stored (physical) cells for `row_id`, exactly as written — no
     /// padding, no projection.
+    /// The stored cells of one row, **borrowed where they already exist**.
+    ///
+    /// [`raw`](RowStore::raw) clones unconditionally, which is right when the
+    /// caller keeps the row and wrong when it only reads it. An index lookup
+    /// reads: it verifies the key and hands the row to a visitor. Cloning there
+    /// copied every column of every candidate — in resident mode, out of a
+    /// `Vec` sitting in memory.
+    ///
+    /// Only the disk-first base has to materialize, because its rows live
+    /// encoded in the mmap.
+    fn raw_ref(&self, row_id: u64) -> Option<Cow<'_, [Value]>> {
+        match &self.mode {
+            RowMode::Resident(m) => m.get(&row_id).map(|c| Cow::Borrowed(c.as_slice())),
+            RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
+                Some(Some(cells)) => Some(Cow::Borrowed(cells.as_slice())),
+                Some(None) => None,
+                None => d.base.as_ref().and_then(|b| b.get(row_id)).map(Cow::Owned),
+            },
+        }
+    }
+
+    /// [`get_physical`](RowStore::get_physical) without the copy: the row is
+    /// padded to physical arity only when it is actually narrow, which is the
+    /// only case that needs to own.
+    pub fn physical_ref(&self, row_id: u64) -> Option<Cow<'_, [Value]>> {
+        let cells = self.raw_ref(row_id)?;
+        Some(pad_cow(&self.fill, cells))
+    }
+
+    /// The query-visible view of a row the caller already holds physically.
+    /// Borrowed unless a `DROP COLUMN` means the two differ.
+    pub fn logical_ref<'a>(&'a self, phys: Cow<'a, [Value]>) -> Cow<'a, [Value]> {
+        match self.projected {
+            true => Cow::Owned(project_row(&self.fill, &self.live, &phys)),
+            false => phys,
+        }
+    }
+
     fn raw(&self, row_id: u64) -> Option<Vec<Value>> {
         match &self.mode {
             RowMode::Resident(m) => m.get(&row_id).cloned(),
@@ -248,16 +286,6 @@ impl RowStore {
     /// The row's **query-visible** (logical) cells: the stored physical row
     /// projected down to the live columns, tombstoned slots removed and any
     /// narrow row padded from `fill`. This is what the executor consumes.
-    /// Project a physical row the caller already has down to logical columns.
-    /// A no-op unless a `DROP COLUMN` has tombstoned a slot — the point is that
-    /// a caller holding a physical row need not fetch the logical one as well.
-    pub fn to_logical(&self, phys: Vec<Value>) -> Vec<Value> {
-        match self.projected {
-            true => project_row(&self.fill, &self.live, &phys),
-            false => phys,
-        }
-    }
-
     pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
         let mut cells = self.raw(row_id)?;
         if self.projected {

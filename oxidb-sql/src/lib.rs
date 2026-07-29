@@ -1991,13 +1991,15 @@ impl SqlEngine {
         // logical row. Fetching both cost a second full row build for every
         // candidate — 20,000 of them on a low-selectivity predicate.
         for id in idx.candidates(&key)? {
-            let Some(phys) = state.rows.get_physical(id) else {
+            // Borrowed, not cloned: verification reads the row and the visitor
+            // reads the row. Only the disk-first base has to materialize.
+            let Some(phys) = state.rows.physical_ref(id) else {
                 continue;
             };
             if idx.key_of(&phys) != key {
                 continue;
             }
-            if !visit(id, &state.rows.to_logical(phys))? {
+            if !visit(id, &state.rows.logical_ref(phys))? {
                 break;
             }
         }

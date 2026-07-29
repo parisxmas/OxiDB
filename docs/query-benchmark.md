@@ -41,7 +41,7 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 | **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
 | `GROUP BY` | 54 | 18.4ms | 84 | 12.0ms | **0.65×** |
 | Join + filter | 86 | 11.6ms | 98 | 10.1ms | **0.87×** |
-| Index, low selectivity | 306 | 3.2ms | 610 | 1.6ms | **0.50×** |
+| Index, low selectivity | 462 | 2.1ms | 606 | 1.6ms | **0.76×** |
 
 ### What changed
 
@@ -53,7 +53,7 @@ Aggregates are now folded **during** the scan rather than after it
 |---|---:|---:|
 | Full-scan aggregate | 0.48× | **1.02×** |
 | `GROUP BY` | 0.42× | **0.66×** |
-| Index, low selectivity | 0.29× | **0.50×** |
+| Index, low selectivity | 0.29× | **0.76×** |
 | Join + filter | 0.56× | **0.87×** |
 | Secondary index equality | 1.08× | **1.14×** |
 
@@ -90,17 +90,17 @@ integer key range makes the test one shift and one mask, and that is finally
 cheaper than building a row. It applies only to integer keys over a range dense
 enough to be worth the bitmap; anything else takes the old path.
 
-**Low-selectivity index scans (0.50×)**, improved from 0.29× but still half
-PostgreSQL's speed. Two things were costing per candidate row and are gone:
-`index_lookup_eq` built a `Vec<(u64, Vec<Value>)>` of every match before the
-caller saw any of them, and it materialized each row *twice* — once physically
-to verify the index key, once logically for the result. Rows now stream through
-`index_visit_eq` and are built once.
+**Low-selectivity index scans (0.76×)**, from 0.29×. Three costs per candidate
+row were removed in turn. `index_lookup_eq` built a `Vec<(u64, Vec<Value>)>` of
+every match before the caller saw any of them — rows now stream through
+`index_visit_eq`. Each row was materialized *twice*, once physically to verify
+the index key and once logically for the result — they are the same row unless a
+column has been dropped. And `RowStore::raw` cloned unconditionally, so every
+candidate was copied out of a `Vec` sitting in memory; `physical_ref` borrows it
+instead, leaving only the disk-first base to materialize, because its rows live
+encoded in the mmap.
 
-What remains is that each candidate is still a full row build: a fresh `Vec` and
-a clone of every column, when the predicate reads three of them and `count(*)`
-reads none. Closing that needs projection pushed into the index walk, so only
-the columns a query touches are materialized.
+The remaining gap is the per-row predicate evaluation itself, not row access.
 
 ## What this does not measure
 
