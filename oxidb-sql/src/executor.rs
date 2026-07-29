@@ -4713,6 +4713,38 @@ fn base_chunk<S: Store>(
     store.scan_pruned(&from.name, keep)
 }
 
+/// Hash a value for group-key bucketing, consistent with `Value`'s own
+/// equality — which is why only the variants `streamed_aggregate` admits are
+/// handled here, and the rest are unreachable rather than merely unhandled.
+fn hash_value(v: &Value, h: &mut FxHasher) {
+    match v {
+        Value::Null => h.write_u8(0),
+        Value::Bool(b) => {
+            h.write_u8(1);
+            h.write_u8(*b as u8);
+        }
+        Value::Int(n) => {
+            h.write_u8(2);
+            h.write_i64(*n);
+        }
+        Value::Timestamp(t) => {
+            h.write_u8(3);
+            h.write_i64(*t);
+        }
+        Value::Text(s) => {
+            h.write_u8(4);
+            h.write(s.as_bytes());
+        }
+        Value::Bytes(b) => {
+            h.write_u8(5);
+            h.write(b);
+        }
+        // Floats and decimals never reach here: their equality is not
+        // hash-shaped, so those keys take the ordered path.
+        Value::Double(_) | Value::Decimal(_) => h.write_u8(6),
+    }
+}
+
 /// One accumulator, folding values as a scan produces them.
 enum Acc {
     /// `COUNT(*)` — no argument to evaluate.
@@ -4931,17 +4963,27 @@ fn streamed_aggregate<S: Store>(
     };
 
     // A group key that is a plain column can be compared straight out of the
-    // row. That matters more than it looks: `eval_scalar` returns an *owned*
-    // `Value`, so grouping by a text column heap-allocated and copied a string
-    // for every row — 400,000 times to find a group that already exists. Below
-    // `LINEAR_GROUPS` the comparison is a short linear walk and nothing is
-    // allocated until a genuinely new group appears; above it the map path
-    // takes over, so a high-cardinality grouping does not become quadratic.
-    const LINEAR_GROUPS: usize = 32;
+    // row, and hashed from it. That matters more than it looks: `eval_scalar`
+    // returns an *owned* `Value`, so grouping by a text column heap-allocated
+    // and copied a string for every row — 400,000 times to find a group that
+    // already exists.
+    //
+    // Restricted to types whose equality is unambiguous. `Value::total_order`,
+    // which the general map path uses, compares all numerics *across* types
+    // (`Int(1)` equals `Double(1.0)`) and treats NaN as equal to everything
+    // numeric — a relation no hash can reproduce, and one that plain `==`
+    // disagrees with. Rather than have two paths group differently, float and
+    // decimal keys stay on the map path.
+    let hashable = |i: usize| {
+        matches!(
+            full[i].ty,
+            Some(SqlType::Int | SqlType::Text | SqlType::Bool | SqlType::Timestamp)
+        )
+    };
     let key_cols: Option<Vec<usize>> = group
         .iter()
         .map(|g| match g {
-            Expr::Col(i) => Some(*i),
+            Expr::Col(i) if hashable(*i) => Some(*i),
             _ => None,
         })
         .collect();
@@ -4951,6 +4993,8 @@ fn streamed_aggregate<S: Store>(
     let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
     let mut index: std::collections::BTreeMap<Vec<IndexKey>, usize> =
         std::collections::BTreeMap::new();
+    // hash -> the groups sharing it; collisions are resolved by comparing.
+    let mut hashed: FxMap<u64, Vec<usize>> = FxMap::default();
     let fresh = || -> Vec<Acc> {
         plan.iter()
             .map(|p| match p {
@@ -4987,31 +5031,63 @@ fn streamed_aggregate<S: Store>(
         let at = if group.is_empty() {
             0
         } else {
-            // Plain columns, few groups: compare in place, allocate nothing.
-            if let Some(cols) = &key_cols
-                && groups.len() <= LINEAR_GROUPS
-            {
-                let hit = groups
-                    .iter()
-                    .position(|(k, _)| k.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
-                match hit {
-                    Some(i) => i,
-                    None => {
-                        groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
-                        groups.len() - 1
+            // Plain columns: hash straight from the row and compare in place,
+            // so a row joining an existing group allocates nothing however many
+            // groups there are. Buckets hold every group sharing a hash, which
+            // keeps the comparison exact rather than trusting the hash.
+            if let Some(cols) = &key_cols {
+                // Two shapes, and measurement picked the boundary. Below
+                // `LINEAR_GROUPS` a walk over the existing groups beats hashing
+                // outright — hashing a text key reads every byte, where a
+                // comparison usually stops at the first (1.10x -> 0.95x on a
+                // five-group key when the hash was used unconditionally).
+                // Above it the walk is what costs, so the hash takes over.
+                const LINEAR_GROUPS: usize = 32;
+                if groups.len() <= LINEAR_GROUPS && hashed.is_empty() {
+                    let hit = groups
+                        .iter()
+                        .position(|(k, _)| k.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
+                    match hit {
+                        Some(i) => i,
+                        None => {
+                            groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
+                            groups.len() - 1
+                        }
+                    }
+                } else {
+                    if hashed.is_empty() {
+                        // Crossing over: index the groups gathered so far.
+                        for (i, (k, _)) in groups.iter().enumerate() {
+                            let mut h = FxHasher::default();
+                            for v in k {
+                                hash_value(v, &mut h);
+                            }
+                            hashed.entry(h.finish()).or_default().push(i);
+                        }
+                    }
+                    let mut h = FxHasher::default();
+                    for &c in cols {
+                        hash_value(&row[c], &mut h);
+                    }
+                    let bucket = hashed.entry(h.finish()).or_default();
+                    let hit = bucket
+                        .iter()
+                        .copied()
+                        .find(|&i| groups[i].0.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
+                    match hit {
+                        Some(i) => i,
+                        None => {
+                            groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
+                            bucket.push(groups.len() - 1);
+                            groups.len() - 1
+                        }
                     }
                 }
             } else {
-                // Expression keys, or enough groups that a linear walk stops
-                // paying. `IndexKey` orders values but does not hash them, so
-                // groups live in a BTreeMap; the lookup borrows the reused
+                // Expression keys, and any key whose equality is not
+                // hash-shaped. `IndexKey` orders values but does not hash them,
+                // so groups live in a BTreeMap; the lookup borrows the reused
                 // buffer (`Vec<K>` borrows as `[K]`).
-                if index.len() < groups.len() {
-                    // Crossing over from the linear path: seed the map once.
-                    for (i, (k, _)) in groups.iter().enumerate() {
-                        index.insert(k.iter().cloned().map(IndexKey).collect(), i);
-                    }
-                }
                 key.clear();
                 for g in &group {
                     key.push(IndexKey(eval_scalar(g, &full, row, params)?));

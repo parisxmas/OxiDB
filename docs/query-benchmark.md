@@ -39,7 +39,7 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 | Secondary index equality | 42.6k | 23µs | 37.4k | 27µs | **1.14×** |
 | Range scan + `ORDER BY` + `LIMIT` | 35.8k | 27µs | 33.2k | 30µs | **1.08×** |
 | **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
-| `GROUP BY` | 91 | 11.1ms | 83 | 12.0ms | **1.10×** |
+| `GROUP BY` | 92 | 10.9ms | 85 | 11.7ms | **1.07×** |
 | Join + filter | 86 | 11.6ms | 98 | 10.1ms | **0.87×** |
 | Index, low selectivity | 462 | 2.1ms | 606 | 1.6ms | **0.76×** |
 
@@ -53,7 +53,7 @@ Aggregates are now folded **during** the scan rather than after it
 |---|---:|---:|
 | Full-scan aggregate | 0.48× | **1.02×** |
 | Index, low selectivity | 0.29× | **0.76×** |
-| `GROUP BY` | 0.42× | **1.10×** |
+| `GROUP BY` | 0.42× | **1.07×** |
 | Join + filter | 0.56× | **0.87×** |
 | Secondary index equality | 1.08× | **1.14×** |
 
@@ -108,12 +108,22 @@ grouping by a text column heap-allocated and copied a string for every row —
 plain column it is now compared straight out of the row and nothing is
 allocated until a genuinely new group appears.
 
-That fast path is bounded: above 32 groups the map path takes over, so a
-high-cardinality grouping does not become quadratic. **That case is the
-remaining gap** — 173,186 groups over 400,000 rows takes 153 ms against
-PostgreSQL's 58 ms, because the map path still clones each key and probes a
-`BTreeMap` with `Value` comparisons. A real hash of the key would close it, the
-same lesson the join's bitmap taught.
+Above 32 groups a hash index over the same in-place comparison takes over, so
+high cardinality does not turn the walk quadratic: 173,186 groups over 400,000
+rows went from 153 ms to 93 ms, against PostgreSQL's 72 ms.
+
+**Both paths are needed, and measurement set the boundary.** Using the hash
+unconditionally made the five-group case *slower* — 1.10× → 0.95× — because
+hashing a text key reads every byte where a comparison usually stops at the
+first. Keeping the walk below the threshold and hashing above it is what gets
+both.
+
+The key columns are restricted to types whose equality is unambiguous (integer,
+text, boolean, timestamp). `Value::total_order`, which the general path uses,
+compares numerics *across* types (`Int(1)` equals `Double(1.0)`) and treats NaN
+as equal to everything numeric — a relation no hash can reproduce and one plain
+`==` disagrees with. Rather than let two paths group differently, float and
+decimal keys stay on the ordered path.
 
 ## What this does not measure
 
