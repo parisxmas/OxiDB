@@ -39,7 +39,7 @@ Ratio > 1 means OxiDB is faster. OxiDB in its **default** (resident) mode:
 | Secondary index equality | 42.6k | 23µs | 37.4k | 27µs | **1.14×** |
 | Range scan + `ORDER BY` + `LIMIT` | 35.8k | 27µs | 33.2k | 30µs | **1.08×** |
 | **Full-scan aggregate** | 135 | 7.4ms | 132 | 7.6ms | **1.02×** |
-| `GROUP BY` | 54 | 18.4ms | 84 | 12.0ms | **0.65×** |
+| `GROUP BY` | 91 | 11.1ms | 83 | 12.0ms | **1.10×** |
 | Join + filter | 86 | 11.6ms | 98 | 10.1ms | **0.87×** |
 | Index, low selectivity | 462 | 2.1ms | 606 | 1.6ms | **0.76×** |
 
@@ -52,8 +52,8 @@ Aggregates are now folded **during** the scan rather than after it
 | Workload | before | after |
 |---|---:|---:|
 | Full-scan aggregate | 0.48× | **1.02×** |
-| `GROUP BY` | 0.42× | **0.66×** |
 | Index, low selectivity | 0.29× | **0.76×** |
+| `GROUP BY` | 0.42× | **1.10×** |
 | Join + filter | 0.56× | **0.87×** |
 | Secondary index equality | 1.08× | **1.14×** |
 
@@ -101,6 +101,19 @@ instead, leaving only the disk-first base to materialize, because its rows live
 encoded in the mmap.
 
 The remaining gap is the per-row predicate evaluation itself, not row access.
+
+**`GROUP BY` (1.10×)**, from 0.42×. `eval_scalar` returns an *owned* `Value`, so
+grouping by a text column heap-allocated and copied a string for every row —
+400,000 allocations to find a group that already existed. When the key is a
+plain column it is now compared straight out of the row and nothing is
+allocated until a genuinely new group appears.
+
+That fast path is bounded: above 32 groups the map path takes over, so a
+high-cardinality grouping does not become quadratic. **That case is the
+remaining gap** — 173,186 groups over 400,000 rows takes 153 ms against
+PostgreSQL's 58 ms, because the map path still clones each key and probes a
+`BTreeMap` with `Value` comparisons. A real hash of the key would close it, the
+same lesson the join's bitmap taught.
 
 ## What this does not measure
 

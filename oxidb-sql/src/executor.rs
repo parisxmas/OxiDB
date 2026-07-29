@@ -4930,6 +4930,22 @@ fn streamed_aggregate<S: Store>(
         Some(h) => Some(bind_expr(h, &full)?),
     };
 
+    // A group key that is a plain column can be compared straight out of the
+    // row. That matters more than it looks: `eval_scalar` returns an *owned*
+    // `Value`, so grouping by a text column heap-allocated and copied a string
+    // for every row — 400,000 times to find a group that already exists. Below
+    // `LINEAR_GROUPS` the comparison is a short linear walk and nothing is
+    // allocated until a genuinely new group appears; above it the map path
+    // takes over, so a high-cardinality grouping does not become quadratic.
+    const LINEAR_GROUPS: usize = 32;
+    let key_cols: Option<Vec<usize>> = group
+        .iter()
+        .map(|g| match g {
+            Expr::Col(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+
     // Fold. One entry per group; `None` key for the no-GROUP-BY case, which
     // still produces exactly one row even over an empty table.
     let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
@@ -4971,21 +4987,42 @@ fn streamed_aggregate<S: Store>(
         let at = if group.is_empty() {
             0
         } else {
-            key.clear();
-            for g in &group {
-                key.push(IndexKey(eval_scalar(g, &full, row, params)?));
-            }
-            // `IndexKey` orders values but does not hash them, so groups live
-            // in a BTreeMap. The lookup borrows the reused buffer — `Vec<K>`
-            // borrows as `[K]` — so a row that lands in an existing group
-            // allocates nothing. Building a fresh key vector per row cost more
-            // than the grouping itself on a table with few distinct keys.
-            match index.get(key.as_slice()) {
-                Some(i) => *i,
-                None => {
-                    groups.push((key.iter().map(|k| k.0.clone()).collect(), fresh()));
-                    index.insert(key.clone(), groups.len() - 1);
-                    groups.len() - 1
+            // Plain columns, few groups: compare in place, allocate nothing.
+            if let Some(cols) = &key_cols
+                && groups.len() <= LINEAR_GROUPS
+            {
+                let hit = groups
+                    .iter()
+                    .position(|(k, _)| k.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
+                match hit {
+                    Some(i) => i,
+                    None => {
+                        groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
+                        groups.len() - 1
+                    }
+                }
+            } else {
+                // Expression keys, or enough groups that a linear walk stops
+                // paying. `IndexKey` orders values but does not hash them, so
+                // groups live in a BTreeMap; the lookup borrows the reused
+                // buffer (`Vec<K>` borrows as `[K]`).
+                if index.len() < groups.len() {
+                    // Crossing over from the linear path: seed the map once.
+                    for (i, (k, _)) in groups.iter().enumerate() {
+                        index.insert(k.iter().cloned().map(IndexKey).collect(), i);
+                    }
+                }
+                key.clear();
+                for g in &group {
+                    key.push(IndexKey(eval_scalar(g, &full, row, params)?));
+                }
+                match index.get(key.as_slice()) {
+                    Some(i) => *i,
+                    None => {
+                        groups.push((key.iter().map(|k| k.0.clone()).collect(), fresh()));
+                        index.insert(key.clone(), groups.len() - 1);
+                        groups.len() - 1
+                    }
                 }
             }
         };
