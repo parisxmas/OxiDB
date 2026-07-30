@@ -192,11 +192,33 @@ What is left is materializing variable-length cells, which is what a borrowed
 cell type (`&str` into the mapping, copied only when a value is kept) would
 remove: roughly 16 ns a row per text column, or about 6 ms on a 400k-row scan.
 
-That is the ceiling, and it is worth being clear about where it is: a scan that
-reads *no* text and allocates nothing is still 0.65×, so allocation is not what
-separates disk-first from resident mode — decoding at all is. Resident mode does
-not decode, which is why it reaches parity and why disk-first cannot be made to
-match it by removing allocations.
+That is the ceiling for **allocation** work, and it is worth being precise about
+what is and is not proven. Proven: a scan that reads no text and allocates
+nothing is still slower than PostgreSQL, so removing allocations cannot close
+the rest. Not proven — and previously overstated here — is that the rest cannot
+be closed at all. The honest arithmetic: our no-filter scan runs ~21.5 ns/row
+against PostgreSQL's ~17.5, and PostgreSQL also pays per-row access (its tuple
+deform); the true gap is ~4–7 ns/row, much less than the 13 ns our decode
+costs in isolation.
+
+**Batching the visitor boundary was the obvious way to close it, and it
+measured flat-to-negative.** Handing the scan's rows to the executor 1024 (or
+256, or 128) at a time — one indirect call per batch instead of per row, decode
+appending into a flat buffer — changed the aggregates by −0.25 ms at best and
+made GROUP BY consistently ~1 ms *worse* at every batch size, plausibly because
+the per-row form's single reused 5-cell buffer stays cache-hot in a way a
+rotating batch buffer does not. Same-session A/B, then reverted. The per-row
+`dyn` call is not worth what a napkin says it is.
+
+Schema-specialized static offsets do not apply either: any variable-length
+column before a wanted one (here `status` before `total`) makes later offsets
+per-row again.
+
+So the honest floor: **within the current row-tag stream format, the scanning
+workloads' 0.72–0.78× is close to the bottom.** What would actually move it is
+a format change — per-record cell-offset tables (direct addressing, ~20% more
+disk) or a columnar layout (where these scans would likely win outright) — both
+real options, neither small.
 
 ### Borrowing the cells a scan only compares
 
