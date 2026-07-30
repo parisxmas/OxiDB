@@ -359,12 +359,36 @@ positional reason the scan path declines there.
 |---|---|---|
 | index, low selectivity | 0.52× | **0.65×** (3.17 ms → 2.54 ms) |
 
-The streamed join's right-side build fetches through the same mask. The
-remaining gap on this workload is per-candidate machinery, not decode: resident
-mode — which fetches from a map and decodes nothing — runs the same query at
-0.77×, so at most that much is reachable by fetch-side work. PostgreSQL's
-advantage here is its bitmap heap scan (candidates sorted, pages visited
-sequentially), which is a different execution shape, not a cheaper fetch.
+The streamed join's right-side build fetches through the same mask.
+
+### Walking the candidates instead of searching for each
+
+What remained after masking was the locate cost: every candidate found its row
+with a fresh binary search over the sparse block index plus a walk of up to a
+block's records. PostgreSQL does not pay this — its bitmap heap scan sorts the
+candidates and visits pages sequentially.
+
+The OxiDB shape of that trick turns out to be almost free, because both halves
+are already sorted: `candidates()` returns ascending row ids, and `.rdat`
+records are laid out in ascending row-id order. So a dense candidate set is
+fetched by **one cursor walking forward**, skipping records by header length —
+no searching at all (`visit_ids_masked`). Overlay rows are served from the
+overlay exactly as the per-id path resolves them; a sparse candidate set (less
+than one candidate per 16 base rows, where skipping costs more than searching)
+declines to the per-id path, as do resident tables and tables with a dropped
+column.
+
+| workload | before | after |
+|---|---|---|
+| index, low selectivity | 0.65× | **0.99×** (2.54 ms → 1.64 ms, parity) |
+
+Two notes on the estimate this replaced. The prediction was ~0.8×, from a
+decomposition putting the locate at ~45–60 ns of a 128 ns candidate — low
+again: the walk beat it to parity, so the search (and what it evicted from
+cache) was worth more like 70 ns. And the earlier claim that resident mode's
+0.77× bounded fetch-side work was wrong for this change — resident pays its own
+per-candidate map descent, which a sequential walk undercuts; disk-first now
+*beats* resident on this workload.
 
 ## What this does not measure
 

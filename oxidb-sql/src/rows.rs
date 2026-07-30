@@ -280,6 +280,101 @@ impl RowStore {
         Some(pad_cow(&self.fill, cells))
     }
 
+    /// Fetch the rows named by `ids` (ascending, deduplicated) in one forward
+    /// pass over the disk-first base, handing each to `f` in physical layout
+    /// with only the columns in `want` decoded.
+    ///
+    /// The per-id path locates every row with its own binary search over the
+    /// sparse block index and a walk of up to a block's records — on a
+    /// low-selectivity index fetch (20,000 candidates over 200,000 rows) that
+    /// search is the largest per-candidate cost. Records are laid out in
+    /// ascending `row_id` order and `ids` is ascending, so one cursor can walk
+    /// forward skipping records by header length and never search at all —
+    /// PostgreSQL's bitmap heap scan makes the same trade, visiting pages in
+    /// sorted order instead of index order.
+    ///
+    /// Ids in the overlay are served from it (an upsert shadows the base row of
+    /// the same id, exactly as the per-id path resolves it); tombstoned and
+    /// absent ids are skipped, which matches `physical_ref` returning `None`.
+    ///
+    /// Returns `None` — caller falls back to per-id fetches — when this cannot
+    /// win or cannot be correct: a resident table (no cursor to walk), a table
+    /// with a dropped column (the mask mixes physical and visible positions),
+    /// or a candidate set too sparse for a forward walk to beat searching.
+    /// Sparse means the walk skips many records per candidate: past ~16 skipped
+    /// records the per-id binary search is cheaper, so the gate requires one
+    /// candidate per 16 base rows, with the base's span standing in for the
+    /// true distance between the first and last candidate.
+    pub fn visit_ids_masked(
+        &self,
+        ids: &[u64],
+        want: &[bool],
+        f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
+    ) -> Option<crate::error::Result<()>> {
+        if self.projected || ids.is_empty() {
+            return None;
+        }
+        let RowMode::DiskFirst(d) = &self.mode else {
+            return None;
+        };
+        let base = d.base.as_ref()?;
+        if base.len() == 0 || ids.len() * 16 < base.len() {
+            return None;
+        }
+        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must ascend");
+        Some(self.walk_ids(ids, want, d, base, f))
+    }
+
+    fn walk_ids(
+        &self,
+        ids: &[u64],
+        want: &[bool],
+        d: &DiskRows,
+        base: &MappedSnapshot,
+        f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let fill = self.fill.as_slice();
+        let mut buf: Vec<Value> = Vec::new();
+        let mut cur = base.cursor();
+        for &id in ids {
+            // The overlay first, as the per-id path resolves it: an upsert
+            // shadows the base row, a tombstone hides it.
+            match d.overlay.get(&id) {
+                Some(Some(cells)) => {
+                    buf.clear();
+                    buf.extend_from_slice(cells);
+                    while buf.len() < fill.len() {
+                        buf.push(fill[buf.len()].clone());
+                    }
+                    if !f(id, &buf)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Some(None) => continue,
+                None => {}
+            }
+            // Forward to the candidate; never backward, since both ascend.
+            while let Some(rid) = cur.row_id() {
+                if rid >= id {
+                    break;
+                }
+                cur.advance();
+            }
+            if cur.row_id() != Some(id) {
+                continue; // absent from the base: a stale index entry
+            }
+            cur.decode_into_masked(want, &mut buf);
+            while buf.len() < fill.len() {
+                buf.push(fill[buf.len()].clone());
+            }
+            if !f(id, &buf)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// [`physical_ref`](Self::physical_ref) decoding only the columns in
     /// `want` for a disk-first base row — the rest are `Null` placeholders at
     /// their positions, so the caller must not read outside `want`. Rows that

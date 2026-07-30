@@ -2074,7 +2074,26 @@ impl SqlEngine {
             }
             m
         });
-        for id in idx.candidates(&key)? {
+        let ids = idx.candidates(&key)?;
+        // Dense candidate sets walk the snapshot forward with one cursor
+        // instead of binary-searching per id — see `visit_ids_masked` for the
+        // trade. It declines (sparse, resident, dropped column) rather than
+        // being wrong, and the per-id loop below is the unchanged fallback.
+        // Only when masking: the batch hands rows in physical layout, which is
+        // the visible layout exactly when nothing is dropped, and the mask
+        // being `Some` implies that (it is built only for unprojected tables).
+        if let Some(m) = &mask
+            && let Some(walked) = state.rows.visit_ids_masked(&ids, m, &mut |id, phys| {
+                if idx.key_of(phys) != key {
+                    return Ok(true);
+                }
+                visit(id, phys)
+            })
+        {
+            walked?;
+            return Ok(Some(()));
+        }
+        for id in ids {
             // Borrowed, not cloned: verification reads the row and the visitor
             // reads the row. Only the disk-first base has to materialize — and
             // it decodes only the columns something will read.
