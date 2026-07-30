@@ -60,10 +60,18 @@ pub fn sidx_path(dir: &Path, table: &str, index: &str) -> PathBuf {
 }
 
 /// Entries buffered before a sort-and-spill. At ~40 bytes an entry this is a
-/// few megabytes — small enough that a checkpoint's peak stops tracking the
-/// table, large enough that an ordinary table produces one run and never
+/// megabyte and a half — small enough that a checkpoint's peak stops tracking
+/// the table, large enough that an ordinary table produces one run and never
 /// touches the merge path.
-const SPILL_ENTRIES: usize = 131_072;
+///
+/// Sized by measurement, and the measurement changed when a checkpoint began
+/// building a table's indexes from a single row walk: several builders are now
+/// alive at once, so the buffer is paid per index rather than once. Over a
+/// 1.2M-row, 5-table database, dropping this from 131_072 took the open-time
+/// peak from 84 MB to 63 MB for 10% more time. Below 32_768 the peak stops
+/// falling — the buffers are no longer what is largest — and the extra spill
+/// runs keep costing merge IO, so this is the knee and not a floor.
+const SPILL_ENTRIES: usize = 32_768;
 
 /// Builds a `.sidx` from an unordered stream of `(key, row_id)` pairs in
 /// **bounded memory**.

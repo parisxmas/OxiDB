@@ -27,6 +27,7 @@ OXIDB_SQL=1 oxidb-server
 | `OXIDB_SQL_SYNC` | `full` | WAL durability: `full` = true storage flush per commit (survives power loss); `data` = OS-cache-level sync (PostgreSQL's default class, several times faster) |
 | `OXIDB_SQL_DISK_FIRST` | off | Keep table data on disk (mmap'd last-checkpoint snapshot) with only post-checkpoint changes in RAM, instead of holding every row resident. Same on-disk format either way — a database can be reopened in either mode. Indexes and the PRIMARY KEY map stay in RAM. |
 | `OXIDB_SQL_CHECKPOINT_BYTES` | 64 MiB | Auto-checkpoint when the live WAL exceeds this many bytes: folds the WAL into per-table `.rdat` snapshots and truncates it (bounds restart replay time, and bounds the RAM overlay in disk-first mode). `0` disables auto-checkpointing. |
+| `OXIDB_SQL_REPLAY_FOLD_OPS` | 50 000 | Row operations replayed between folds when opening a disk-first database — which is what sets the open-time memory peak, since a replayed record stays in RAM until a fold moves it to disk. The trade against open time is linear (see [the memory benchmark](pg-memory-benchmark.md)): lower it on a memory-constrained host, raise it for the fastest possible open. `0` never folds mid-replay. |
 
 At 1M rows (4 columns, PK), disk-first cuts resident memory roughly in half
 (272 → 143 MB) and opens faster; full scans pay a decode cost (11 → 43 ms).
@@ -47,9 +48,17 @@ Two things the engine deliberately does *not* do when it opens a database:
   the last checkpoint replay into the in-memory overlay, and only a checkpoint
   moves them into the mmap'd snapshot — so without this a restart inherited the
   previous process's pending WAL as resident memory and held it until the next
-  write. Measured at 1M rows, a 55 MB tail cost 60 MB of overlay.
+  write. Measured at 1M rows, a 55 MB tail cost 60 MB of overlay. The replay
+  therefore folds every 50k row operations, which is what bounds the open-time
+  peak: it is a straight line in pending operations, so the interval *is* the
+  peak (~55 MB plus ~370 bytes an operation, measured over a 1.2M-row database).
 
-Both are measured in [the memory benchmark](pg-memory-benchmark.md), which also
+A checkpoint **reuses the files of any table that has not changed** since the
+generation it is based on, hard-linking them into the new generation instead of
+writing them again. Without that, a checkpoint cost the whole database however
+little had changed (~1s per 1.2M rows here), which is what made folding often
+enough to bound the peak unaffordable. Both are measured in
+[the memory benchmark](pg-memory-benchmark.md), which also
 sets out honestly where OxiDB still loses to PostgreSQL: index and primary keys
 are held in RAM, so a workload that uses every index pays for every index, while
 PostgreSQL never exceeds its `shared_buffers` cap.

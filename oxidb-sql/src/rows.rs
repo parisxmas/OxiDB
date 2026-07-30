@@ -221,6 +221,23 @@ impl RowStore {
         }
     }
 
+    /// `true` when the stored rows are *exactly* the attached base snapshot —
+    /// disk-first, a base present, and nothing changed since it was attached.
+    ///
+    /// A checkpoint uses this to reuse a table's existing files instead of
+    /// rewriting them. It is derived from the store rather than tracked as a
+    /// dirty flag on purpose: every mutation path already funnels through
+    /// insert/remove/compact/rewrite_slot, each of which leaves an overlay
+    /// entry, so a write cannot fail to be noticed here. A flag would have to be
+    /// set in each of those places and would silently publish a stale snapshot
+    /// the day one was missed.
+    pub fn is_base_only(&self) -> bool {
+        match &self.mode {
+            RowMode::Resident(_) => false,
+            RowMode::DiskFirst(d) => d.base.is_some() && d.overlay.is_empty(),
+        }
+    }
+
     pub fn contains(&self, row_id: u64) -> bool {
         match &self.mode {
             RowMode::Resident(m) => m.contains_key(&row_id),
@@ -427,34 +444,65 @@ impl RowStore {
         let mut pad: Vec<Value> = Vec::new();
         let projected = self.projected;
         let live = self.live.as_slice();
-        let mut hand =
-            |id: u64,
-             cells: &[Value],
-             f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>| {
-                // Pad a row written before an `ADD COLUMN`, then project away any
-                // slot a `DROP COLUMN` tombstoned. Neither happens on the common
-                // path, so neither buffer is touched there.
-                let padded: &[Value] = if cells.len() < fill.len() {
-                    pad.clear();
-                    pad.extend_from_slice(cells);
-                    pad.extend_from_slice(&fill[cells.len()..]);
-                    &pad
-                } else {
-                    cells
-                };
-                if !projected {
-                    return f(id, padded);
-                }
-                let logical: Vec<Value> = live
-                    .iter()
-                    .map(|&s| padded.get(s).cloned().unwrap_or_else(|| fill[s].clone()))
-                    .collect();
-                f(id, &logical)
+        self.walk_raw(&mut |id, cells| {
+            // Pad a row written before an `ADD COLUMN`, then project away any
+            // slot a `DROP COLUMN` tombstoned. Neither happens on the common
+            // path, so neither buffer is touched there.
+            let padded: &[Value] = if cells.len() < fill.len() {
+                pad.clear();
+                pad.extend_from_slice(cells);
+                pad.extend_from_slice(&fill[cells.len()..]);
+                &pad
+            } else {
+                cells
             };
+            if !projected {
+                return f(id, padded);
+            }
+            let logical: Vec<Value> = live
+                .iter()
+                .map(|&s| padded.get(s).cloned().unwrap_or_else(|| fill[s].clone()))
+                .collect();
+            f(id, &logical)
+        })
+    }
+
+    /// Walk every live row in `row_id` order, handing each to `f` in full
+    /// **physical** layout — tombstoned slots included, narrow rows padded to
+    /// physical arity. The push counterpart of [`Self::iter_physical`], and for
+    /// the same reason: a checkpoint walks a table once per index plus once for
+    /// the snapshot, and the iterator form allocated an owned `Vec` per row on
+    /// every one of those walks.
+    pub fn visit_physical(
+        &self,
+        f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let fill = self.fill.as_slice();
+        let mut pad: Vec<Value> = Vec::new();
+        self.walk_raw(&mut |id, cells| {
+            let padded: &[Value] = if cells.len() < fill.len() {
+                pad.clear();
+                pad.extend_from_slice(cells);
+                pad.extend_from_slice(&fill[cells.len()..]);
+                &pad
+            } else {
+                cells
+            };
+            f(id, padded)
+        })
+    }
+
+    /// The shared walk under [`Self::visit_rows`] and [`Self::visit_physical`]:
+    /// every live row in `row_id` order, raw (unpadded, unprojected), decoded
+    /// into one reused buffer. `f` returns `false` to stop early.
+    fn walk_raw(
+        &self,
+        f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
         match &self.mode {
             RowMode::Resident(m) => {
                 for (id, cells) in m {
-                    if !hand(*id, cells, f)? {
+                    if !f(*id, cells)? {
                         break;
                     }
                 }
@@ -482,7 +530,7 @@ impl RowStore {
                         b.decode_at_into(base_pos, &mut buf);
                         let id = b.row_id_at(base_pos);
                         base_pos += 1;
-                        if !hand(id, &buf, f)? {
+                        if !f(id, &buf)? {
                             break;
                         }
                     } else {
@@ -494,7 +542,7 @@ impl RowStore {
                         }
                         match change {
                             Some(cells) => {
-                                if !hand(*id, cells, f)? {
+                                if !f(*id, cells)? {
                                     break;
                                 }
                             }

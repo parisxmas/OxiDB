@@ -239,18 +239,114 @@ And `Wal::open_since` no longer parses the tail into a `Vec` up front; it hands
 back locations and decodes one record at a time. Both are right on their own
 terms. Neither reduced the peak: it went 328 → 337 MB.
 
-**What the peak actually is, measured rather than assumed.** The cgroup's
-breakdown on a *clean* open is `anon 71 MB, file 0 MB` with a peak of 83 MB. On
-the tail open it is 337 MB and still anonymous. So it is not one live structure
-being held — bounding the overlay proved that — it is **allocator retention
-across repeated large allocations**: each fold rebuilds every table's row-offset
-index (24 bytes a row) and musl's allocator does not return the freed pages.
-Fixing that is an allocator-behaviour problem, not a data-structure one, and it
-is where this stops for now.
+At that point this document concluded the remainder was **allocator retention** —
+freed pages musl was not returning — and that no data-structure change would
+help. **That was wrong, and it was wrong because it was inferred rather than
+measured.** Process-level metrics cannot distinguish live bytes from freed-but-
+retained ones, so the conclusion was reached by elimination, from the fact that
+two structural fixes had not paid.
 
-The practical shape of the trap is unchanged: a server sized for its steady
-state cannot restart immediately after a bulk load. The margin needed is now
-about 3.5× steady state rather than 4.5×.
+### Measuring the peak instead of arguing about it
+
+`cargo run -p oxidb-sql --example open_mem <dir>` installs a counting global
+allocator and reports live and peak *allocated* bytes across an open. That
+distinguishes exactly what process metrics cannot: if peak-live tracks the peak
+footprint, something really is that big.
+
+It does. Opening the 1.2M-row database with a 204 MB tail: **peak live 128.7 MB,
+process peak 116 MiB, steady state 37.5 MB.** The peak is live memory, and the
+same open with an already-folded WAL peaks at 42 MB — so *all* of it is the WAL
+replay, none of it retention.
+
+Sweeping how often the replay folds gives a straight line, reproducible to a
+tenth of a megabyte:
+
+| Fold every | Peak | Open time |
+|---|---:|---:|
+| 25k row ops | 71 MB | 42.6 s |
+| 50k | 78 MB | 22.8 s |
+| 200k (the default then) | 129 MB | 8.0 s |
+| never | 356 MB | 2.1 s |
+
+So the peak was ≈ 55 MB + ~370 bytes per pending row operation, and the "356 MB"
+row is the number this document had been calling irreducible. It was reducible by
+one constant — except that folding four times as often cost five times the open
+time, which is why the trade had looked like a dead end.
+
+**Why folding was so expensive.** A fold wrote every table's snapshot and rebuilt
+every index, walking the table once per consumer: a table with a primary key, a
+`UNIQUE` column and one secondary index was read four times, and in disk-first
+mode each read decodes every row out of the mmap. Timing the phases put ~40% in
+the walks and ~58% in sorting and writing the index files — and, decisively, the
+cost was the same whether the fold had 200k pending operations to absorb or 2.
+
+Two changes, in the order the measurements asked for them:
+
+1. **One walk per table feeds every consumer.** The snapshot writer became a sink
+   (`storage::SnapshotWriter`) so the primary key, `UNIQUE` and secondary index
+   builders can be driven from the same pass. Worth ~10% — the walk was not the
+   problem — and it *cost* 20 MB, because several spill buffers are now alive at
+   once. On its own this was not a win.
+2. **A table nothing has touched is not written at all.** Its files in the
+   generation it is based on are already correct, so they are hard-linked into the
+   new generation. Reclaiming the old generation then just drops a directory
+   entry; the MANIFEST rename is still the only commit point. This is what changed
+   the trade: a fold became proportional to what changed rather than to the
+   database.
+
+With folds cheap, the buffer regression from (1) was worth paying back:
+`SPILL_ENTRIES` dropped from 131_072 to 32_768, which bought 22 MB for 10% time
+and stops helping below that. Then the fold threshold moved to the new knee, 50k.
+
+| | Peak live | Open time |
+|---|---:|---:|
+| Before | 129 MB | 8.0 s |
+| Untouched tables reused, fold every 50k | **63 MB** | **6.1 s** |
+
+Both axes improved: half the peak, and faster than the setting it replaced.
+
+### The same thing measured end to end, in a cgroup
+
+The allocator counts live bytes; an operator sizes a container. `openpeak.sh`
+measures the second: load 1.2M rows at the **default** settings (so the tail is
+whatever the engine leaves — 12 MB here, since auto-checkpointing bounds it),
+`SIGKILL`, restart, and read the kernel's own `memory.peak`. Same box, same data,
+the two builds differing only in this change:
+
+| | Peak opening | Settled after | Clean reopen |
+|---|---:|---:|---:|
+| Before | 333 MB | 258 MB | 82 / 73 MB |
+| After | **180 MB** | **108 MB** | 83 / 73 MB |
+
+These are larger than the allocator's figures because a cgroup charges the page
+cache the open faults, and they confirm the earlier ad-hoc number this document
+reported (333 MB) on a harness that can be re-run.
+
+**But the peak is not what a memory limit binds on, and that must not be
+oversold.** Under a hard limit the kernel reclaims the page-cache share of that
+peak, so what decides whether the server starts is the anonymous part. Opening
+the same bulk-loaded database inside decreasing `--memory` limits:
+
+| Limit | Before | After |
+|---|---|---|
+| 256 MB | opens | opens |
+| 192 MB | opens | opens |
+| 160 MB | OOM | **opens** |
+| 128 MB | OOM | OOM |
+
+One step, not the 1.9× the peak figure suggests. Both numbers are real and they
+answer different questions: the peak is what the process transiently needs, the
+limit sweep is what it survives.
+
+Reuse is the kind of optimization that loses data quietly, so it is deliberately
+conservative — a table qualifies only if its row store *is* its base snapshot
+(derived from the store, not tracked as a dirty flag that a new write path could
+forget to set), and only if every file the new generation needs already exists in
+the old one. That second condition is not redundant: an index created since the
+last checkpoint has no file yet, and linking "whatever exists" would commit a
+generation declaring an index it holds no file for — which answers no query
+wrongly, it just silently stops being an index. `checkpoint_reuse_tests` pins
+each case, and the index one fails when the check is removed.
 
 ## The document engine, measured separately
 
@@ -343,9 +439,12 @@ benchmark runs with the document engine on, as OxiBase does.
 Query speed (see [the wire benchmark](wire-benchmark.md)), concurrency, or
 larger datasets. It does now measure behaviour under memory pressure, and that
 section is the one to read before believing any of the others. It also flatters neither engine on load time:
-5.7 s against 22 s is real, and materializing indexes and key sets at every
-checkpoint is part of why OxiDB's is slower. Both went through `psql` with multi-row `INSERT`s —
-PostgreSQL's `COPY` would be far faster and OxiDB has no equivalent.
+5.7 s against 22 s is real, and rewriting every table's snapshot and indexes at
+every checkpoint is part of why OxiDB's is slower — a checkpoint now skips the
+tables that have not changed, which a load of one table at a time benefits from,
+but the table being loaded is still rewritten each time. Both went through `psql`
+with multi-row `INSERT`s — PostgreSQL's `COPY` would be far faster and OxiDB has
+no equivalent.
 
 The honest summary: OxiDB in disk-first mode holds no *key set* in anonymous
 memory — rows, secondary indexes, primary keys and `UNIQUE` columns are files it
@@ -354,9 +453,12 @@ physical use to about two-thirds of PostgreSQL's. But it is not three times
 lighter (that came from a metric which stopped counting the pages it had moved
 into files), and it does not run in a smaller box: its floor is ~96 MB against a
 tuned PostgreSQL's ~64 MB, because what is left anonymous — a 37 MB baseline
-plus 24 bytes per row of offset index — is still most of what it needs. And
-opening after a bulk load still peaks at 328 MB against a 94 MB steady state,
-which is the sharpest edge in the design.
+plus 24 bytes per row of offset index — is still most of what it needs. Opening
+after a bulk load used to be the sharpest edge in the design, peaking at 4.6×
+the steady state; measuring where those bytes actually were — rather than
+inferring it, which is how this document previously got the answer wrong — took
+that to 2.4×, and the smallest limit it can restart a bulk-loaded database in
+from 192 MB to 160 MB.
 
 Resident mode still trades memory for speed on purpose, and is the right default
 for databases that fit comfortably in RAM.

@@ -267,10 +267,17 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
 /// Encode a full row (one cell per column, in column order) to bytes.
 pub fn encode_row(cells: &[Value]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(cells.len() * 9);
-    for c in cells {
-        encode_cell(c, &mut buf);
-    }
+    encode_row_into(cells, &mut buf);
     buf
+}
+
+/// [`encode_row`] into a buffer the caller owns and reuses — the counterpart of
+/// [`decode_row_into`], for writing a whole table without an allocation per row.
+/// The buffer is appended to, so callers clear it between rows.
+pub fn encode_row_into(cells: &[Value], buf: &mut Vec<u8>) {
+    for c in cells {
+        encode_cell(c, buf);
+    }
 }
 
 /// Decode a row of exactly `ncols` cells from `bytes`.

@@ -18,7 +18,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SqlError};
-use crate::types::{Value, decode_row, decode_row_into, encode_row};
+use crate::types::{Value, decode_row, decode_row_into, encode_row_into};
 
 const RDAT_MAGIC: &[u8; 4] = b"OXSR";
 const RDAT_VERSION: u16 = 1;
@@ -29,40 +29,83 @@ pub fn rdat_path(dir: &Path, table: &str) -> PathBuf {
     dir.join(format!("{table}.rdat"))
 }
 
+/// A snapshot being written, one row at a time.
+///
+/// The whole-iterator [`write_snapshot`] cannot share a walk with anything else,
+/// and a checkpoint has several things to do per row: write it here, and derive
+/// the primary-key, UNIQUE and secondary-index entries for it. Walking the table
+/// once per consumer meant decoding every row once per consumer — the dominant
+/// cost of a checkpoint, and paid again on each of them. This exposes the writer
+/// as a sink so one walk can feed them all.
+///
+/// Nothing is visible until [`finish`](Self::finish): rows go to a temporary
+/// file that is fsynced and then renamed over the target.
+pub struct SnapshotWriter {
+    w: std::io::BufWriter<File>,
+    tmp: PathBuf,
+    path: PathBuf,
+    /// Reused encode buffer — one per snapshot rather than one per row.
+    buf: Vec<u8>,
+}
+
+impl SnapshotWriter {
+    pub fn create(dir: &Path, table: &str) -> Result<SnapshotWriter> {
+        let path = rdat_path(dir, table);
+        let tmp = path.with_extension("rdat.tmp");
+        // Streamed through a BufWriter rather than assembled in one `Vec`.
+        // Building the whole file in memory first cost a second copy of the
+        // table at every checkpoint — invisible on an unconstrained machine,
+        // fatal in a cgroup: a 1.2M-row database could not open inside a 256 MB
+        // limit that it otherwise runs in comfortably, because opening replays
+        // the WAL tail and checkpoints.
+        let mut w = std::io::BufWriter::with_capacity(1 << 16, File::create(&tmp)?);
+        w.write_all(RDAT_MAGIC)?;
+        w.write_all(&RDAT_VERSION.to_le_bytes())?;
+        w.write_all(&0u16.to_le_bytes())?; // flags
+        Ok(SnapshotWriter {
+            w,
+            tmp,
+            path,
+            buf: Vec::new(),
+        })
+    }
+
+    pub fn push(&mut self, row_id: u64, cells: &[Value]) -> Result<()> {
+        self.buf.clear();
+        encode_row_into(cells, &mut self.buf);
+        let crc = crc32fast::hash(&self.buf);
+        self.w.write_all(&row_id.to_le_bytes())?;
+        self.w.write_all(&(self.buf.len() as u32).to_le_bytes())?;
+        self.w.write_all(&crc.to_le_bytes())?;
+        self.w.write_all(&self.buf)?;
+        Ok(())
+    }
+
+    /// fsync the rows written so far, then atomically publish them.
+    pub fn finish(self) -> Result<()> {
+        let f = self.w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        fs::rename(&self.tmp, &self.path)?;
+        Ok(())
+    }
+}
+
 /// Atomically write a table snapshot containing `rows` (each `(row_id, cells)`).
+///
+/// The whole-table convenience form over [`SnapshotWriter`]. The checkpoint path
+/// drives the writer directly so it can share its row walk with the index
+/// builders, which leaves this used only by the tests that pin the file format.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_snapshot<I, C>(dir: &Path, table: &str, rows: I) -> Result<()>
 where
     I: IntoIterator<Item = (u64, C)>,
     C: std::borrow::Borrow<[Value]>,
 {
-    let path = rdat_path(dir, table);
-    let tmp = path.with_extension("rdat.tmp");
-
-    // Streamed through a BufWriter rather than assembled in one `Vec`. Building
-    // the whole file in memory first cost a second copy of the table at every
-    // checkpoint — invisible on an unconstrained machine, fatal in a cgroup: a
-    // 1.2M-row database could not open inside a 256 MB limit that it otherwise
-    // runs in comfortably, because opening replays the WAL tail and checkpoints.
-    {
-        let f = File::create(&tmp)?;
-        let mut w = std::io::BufWriter::with_capacity(1 << 16, f);
-        w.write_all(RDAT_MAGIC)?;
-        w.write_all(&RDAT_VERSION.to_le_bytes())?;
-        w.write_all(&0u16.to_le_bytes())?; // flags
-
-        for (row_id, cells) in rows {
-            let payload = encode_row(cells.borrow());
-            let crc = crc32fast::hash(&payload);
-            w.write_all(&row_id.to_le_bytes())?;
-            w.write_all(&(payload.len() as u32).to_le_bytes())?;
-            w.write_all(&crc.to_le_bytes())?;
-            w.write_all(&payload)?;
-        }
-        let f = w.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
+    let mut w = SnapshotWriter::create(dir, table)?;
+    for (row_id, cells) in rows {
+        w.push(row_id, cells.borrow())?;
     }
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    w.finish()
 }
 
 /// Read a table snapshot. `ncols` is the table arity (from the catalog), needed

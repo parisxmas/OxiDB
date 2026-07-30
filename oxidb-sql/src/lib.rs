@@ -106,6 +106,19 @@ impl SqlOptions {
         {
             opts.lock_timeout_ms = n;
         }
+        // Exposed because this constant *is* the open-time memory peak (see
+        // `REPLAY_FOLD_OPS`): the trade against open time is linear and which
+        // end of it you want depends on the machine, not on the engine. `0`
+        // means never fold mid-replay, which is the fastest open and the
+        // largest peak.
+        if let Ok(v) = std::env::var("OXIDB_SQL_REPLAY_FOLD_OPS")
+            && let Ok(n) = v.trim().parse::<usize>()
+        {
+            opts.replay_fold_ops = match n {
+                0 => usize::MAX,
+                n => n,
+            };
+        }
         opts
     }
 }
@@ -969,11 +982,30 @@ const STMT_CACHE_CAP: usize = 512;
 
 /// Row operations replayed between folds when opening a disk-first database.
 ///
-/// Bounds how much of a WAL tail is ever materialized at once. Small enough
-/// that a large tail cannot dominate the process, large enough that an ordinary
-/// restart folds once or not at all — a fold rewrites every table, so making
-/// this small would turn recovery into repeated full rewrites.
-const REPLAY_FOLD_OPS: usize = 200_000;
+/// Bounds how much of a WAL tail is ever materialized at once, which is what
+/// sets the open-time memory peak: replaying a record puts a row in the overlay
+/// and entries in the in-memory index maps, and only a fold moves them to disk.
+/// Measured on a 1.2M-row, 5-table database, the peak is a straight line —
+/// about 55 MB fixed plus ~370 bytes per pending row operation — so this
+/// constant *is* the peak, in the only units the engine can count cheaply.
+///
+/// The value is the measured knee of the trade against open time (204 MB tail):
+///
+/// ```text
+///   fold every   open time   peak
+///       25_000      10.2 s   59 MB
+///       50_000       6.1 s   63 MB
+///      100_000       4.5 s   78 MB
+///      200_000       3.5 s  121 MB
+/// ```
+///
+/// It was 200_000, when a fold rewrote every table whether or not it had
+/// changed and walked each table once per index: folding this often then cost
+/// 23 s, so the peak had to be traded away instead. Reusing untouched tables'
+/// files made a fold proportional to what changed, which bought this row of the
+/// table outright — the default is now both faster and less than half the peak
+/// of what it replaced (8.0 s / 129 MB).
+const REPLAY_FOLD_OPS: usize = 50_000;
 
 /// Longest statement text worth caching.
 ///
@@ -2291,79 +2323,140 @@ impl SqlEngine {
         let new_gen = old_gen + 1;
         let new_dir = manifest::gen_dir(dir, new_gen);
         std::fs::create_dir_all(&new_dir)?;
-        for (name, state) in tables.iter() {
-            storage::write_snapshot(&new_dir, name, state.rows.iter_physical())?;
-        }
-        // Primary keys, UNIQUE columns and secondary indexes are all
+        // Rows, primary keys, UNIQUE columns and secondary indexes are all
         // materialized into the generation, whether or not they are currently
         // in memory — that is what lets the next open serve them from a mapping
         // instead of rebuilding them into RAM.
         //
-        // Each streams through an `IndexBuilder`, which sorts in bounded chunks
-        // and spills. Collecting the entries into a map first was simpler and
-        // made a checkpoint's peak proportional to the table: a 1.2M-row
+        // Each index streams through an `IndexBuilder`, which sorts in bounded
+        // chunks and spills. Collecting the entries into a map first was simpler
+        // and made a checkpoint's peak proportional to the table: a 1.2M-row
         // database peaked at 415 MB opening against the 94 MB it then ran in,
         // so it could not restart inside a limit it ran fine in.
+        //
+        // **One walk per table feeds all of them.** Every consumer here wants
+        // the same rows in the same order, and the walk is the expensive part:
+        // in disk-first mode each row is decoded out of the mmap, so walking
+        // once per consumer decoded the table once per consumer. A table with a
+        // primary key, a UNIQUE column and a secondary index was read four
+        // times. That cost is what made a checkpoint ~1s per 1.2M rows
+        // regardless of how little had changed, and so what made bounding the
+        // open-time peak by checkpointing more often during a WAL replay
+        // unaffordable: folding every 25k row ops instead of 200k held the peak
+        // to 71 MB instead of 129 MB, but took 42s instead of 8s.
+        // A table nothing has touched since the generation it is based on
+        // already has correct files in that generation — link them into the new
+        // one instead of writing them again.
+        //
+        // This is what makes checkpointing often affordable. Every part of the
+        // work above is proportional to the rows in the table, so a checkpoint
+        // cost the whole database (~1s per 1.2M rows here) no matter how little
+        // had changed. During a WAL replay that is the binding constraint: the
+        // peak is the pending work held in RAM, so bounding it means folding
+        // more often, and folding more often multiplied a whole-database cost.
+        // Reusing untouched tables makes a fold proportional to what changed.
+        //
+        // Hard links, not copies: the file is one inode with two directory
+        // entries, so reclaiming the old generation just drops its entry and the
+        // data stays reachable through the new one. Crash safety is unchanged —
+        // the MANIFEST rename is still the only commit point, and every file the
+        // new generation names exists before it happens.
+        let old_dir = match old_gen {
+            // Generation 0 is the legacy flat layout: files sit at the root.
+            0 => dir.clone(),
+            g => manifest::gen_dir(dir, g),
+        };
+        let reusable: std::collections::BTreeSet<String> = tables
+            .iter()
+            .filter(|(name, state)| {
+                state.rows.is_base_only()
+                    && Self::link_generation_files(&old_dir, &new_dir, name, state, catalog)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
         for (name, state) in tables.iter() {
-            if !state.pk_cols.is_empty() {
-                let mut b = index_file::IndexBuilder::new(
+            if reusable.contains(name) {
+                continue;
+            }
+            let mut snap = storage::SnapshotWriter::create(&new_dir, name)?;
+            let mut pk = match state.pk_cols.is_empty() {
+                true => None,
+                false => Some(index_file::IndexBuilder::new(
                     &new_dir,
                     name,
                     PK_INDEX_NAME,
                     state.pk_cols.len(),
-                );
-                for (rid, cells) in state.rows.iter_physical() {
-                    if let Some(key) = state.pk_key(&cells) {
-                        b.push(key, rid)?;
-                    }
-                }
-                b.finish()?;
-            }
+                )),
+            };
+            let mut uniques: Vec<(usize, index_file::IndexBuilder)> = state
+                .uniques
+                .iter()
+                .map(|u| {
+                    (
+                        u.pos,
+                        index_file::IndexBuilder::new(&new_dir, name, &unique_index_name(u.pos), 1),
+                    )
+                })
+                .collect();
+            // Only indexes the table actually holds: a definition in the
+            // catalog with no in-memory index is one this engine never built.
+            let mut secondaries: Vec<(&SecondaryIndex, index_file::IndexBuilder)> = catalog
+                .indexes
+                .values()
+                .filter(|def| &def.table == name)
+                .filter_map(|def| state.indexes.get(&def.name).map(|idx| (def, idx)))
+                .map(|(def, idx)| {
+                    (
+                        idx,
+                        index_file::IndexBuilder::new(
+                            &new_dir,
+                            &def.table,
+                            &def.name,
+                            idx.col_pos.len(),
+                        ),
+                    )
+                })
+                .collect();
 
-            // NULLs are exempt from UNIQUE under SQL, so they are simply not
-            // written — a key absent from the file is a key nothing owns.
-            for u in &state.uniques {
-                let mut b =
-                    index_file::IndexBuilder::new(&new_dir, name, &unique_index_name(u.pos), 1);
-                for (rid, cells) in state.rows.iter_physical() {
-                    if !matches!(cells[u.pos], Value::Null) {
+            state.rows.visit_physical(&mut |rid, cells| {
+                snap.push(rid, cells)?;
+                if let Some(b) = pk.as_mut()
+                    && let Some(key) = state.pk_key(cells)
+                {
+                    b.push(key, rid)?;
+                }
+                // NULLs are exempt from UNIQUE under SQL, so they are simply
+                // not written — a key absent from the file is a key nothing
+                // owns.
+                for (pos, b) in uniques.iter_mut() {
+                    if !matches!(cells[*pos], Value::Null) {
                         b.push(
-                            std::iter::once(IndexKey(cells[u.pos].clone())).collect(),
+                            std::iter::once(IndexKey(cells[*pos].clone())).collect(),
                             rid,
                         )?;
                     }
                 }
+                // Fed from the rows even when the in-memory map is the whole
+                // truth (`populated`): the rows are being walked anyway, and a
+                // secondary index covers every row including NULL keys, so the
+                // two sources agree entry for entry.
+                for (idx, b) in secondaries.iter_mut() {
+                    b.push(idx.key_of(cells), rid)?;
+                }
+                Ok(true)
+            })?;
+
+            snap.finish()?;
+            if let Some(b) = pk {
                 b.finish()?;
             }
-        }
-
-        for def in catalog.indexes.values() {
-            let Some(state) = tables.get(&def.table) else {
-                continue;
-            };
-            let Some(idx) = state.indexes.get(&def.name) else {
-                continue;
-            };
-            let mut b =
-                index_file::IndexBuilder::new(&new_dir, &def.table, &def.name, idx.col_pos.len());
-            if idx.populated {
-                // Already the whole truth, in key order — feed it straight
-                // through; the builder will not spill on an ordered stream any
-                // sooner than on an unordered one, and this avoids re-reading
-                // every row.
-                for (key, ids) in idx.map.iter() {
-                    for id in ids.iter() {
-                        b.push(key.clone(), *id)?;
-                    }
-                }
-            } else {
-                // A mapped base plus an overlay, or an index never built: the
-                // rows are the only source that reflects both.
-                for (rid, cells) in state.rows.iter_physical() {
-                    b.push(idx.key_of(&cells), rid)?;
-                }
+            for (_, b) in uniques {
+                b.finish()?;
             }
-            b.finish()?;
+            for (_, b) in secondaries {
+                b.finish()?;
+            }
         }
         catalog.save(&new_dir)?;
 
@@ -2379,6 +2472,16 @@ impl SqlEngine {
         // the RAM overlays they absorbed.
         if *disk_first {
             for (name, state) in tables.iter_mut() {
+                // A reused table's mappings already describe these exact bytes
+                // (the new generation's files are links to the ones they were
+                // opened from), and its overlays are already empty. Re-opening
+                // them would allocate a fresh row-offset index — 24 bytes a row —
+                // to hold a copy of what is already mapped. The old directory
+                // entry is about to go, but an mmap keeps the inode alive and the
+                // new generation holds the surviving link.
+                if reusable.contains(name) {
+                    continue;
+                }
                 if let Some(snap) =
                     storage::MappedSnapshot::open(&new_dir, name, state.def.arity())?
                 {
@@ -2422,7 +2525,7 @@ impl SqlEngine {
         // generation, skip the WAL truncation too — the backup is archiving a
         // stable prefix of it.
         if !pinned_gens.contains_key(&old_gen) {
-            Self::gc_superseded(dir, old_gen);
+            Self::gc_superseded(dir, old_gen, pinned_gens);
         }
         // Only when this snapshot covers the whole log. Mid-replay it does not,
         // and truncating would destroy the records still to be applied.
@@ -2433,13 +2536,84 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Hard-link every file the new generation needs for `table` from the
+    /// generation it is based on, for a table whose rows have not changed since.
+    ///
+    /// Returns `false` — having left the new generation with none of this
+    /// table's files — when any source is missing or the filesystem refuses a
+    /// link, in which case the caller writes the table out as usual. A source can
+    /// legitimately be missing: an index created since the last checkpoint has no
+    /// file in it yet.
+    fn link_generation_files(
+        old_dir: &Path,
+        new_dir: &Path,
+        table: &str,
+        state: &TableState,
+        catalog: &Catalog,
+    ) -> bool {
+        let mut names: Vec<PathBuf> = vec![storage::rdat_path(Path::new(""), table)];
+        if !state.pk_cols.is_empty() {
+            names.push(index_file::sidx_path(Path::new(""), table, PK_INDEX_NAME));
+        }
+        for u in &state.uniques {
+            names.push(index_file::sidx_path(
+                Path::new(""),
+                table,
+                &unique_index_name(u.pos),
+            ));
+        }
+        for def in catalog.indexes.values().filter(|d| d.table == table) {
+            if state.indexes.contains_key(&def.name) {
+                names.push(index_file::sidx_path(Path::new(""), table, &def.name));
+            }
+        }
+
+        if names.iter().any(|n| !old_dir.join(n).exists()) {
+            return false;
+        }
+        for n in &names {
+            // A crashed earlier checkpoint can have left this directory behind
+            // with a file of the same name; a link onto an existing path fails.
+            let dst = new_dir.join(n);
+            let _ = std::fs::remove_file(&dst);
+            if std::fs::hard_link(old_dir.join(n), &dst).is_err() {
+                for n in &names {
+                    let _ = std::fs::remove_file(new_dir.join(n));
+                }
+                return false;
+            }
+        }
+        true
+    }
+
     /// Remove the storage the just-committed checkpoint superseded: the old
     /// `gen.<old>/` directory, or — on the first checkpoint of a legacy
     /// database (`old_gen == 0`) — the flat root-level `catalog.json` and
     /// `<table>.rdat` files it migrated from.
-    fn gc_superseded(root: &Path, old_gen: u64) {
+    fn gc_superseded(root: &Path, old_gen: u64, pinned: &std::collections::BTreeMap<u64, usize>) {
         if old_gen >= 1 {
             let _ = std::fs::remove_dir_all(manifest::gen_dir(root, old_gen));
+            // Retry any older generation that a previous attempt could not
+            // remove. On Unix nothing is ever left: removing a directory whose
+            // files are still mapped is legal, and the inode outlives the entry.
+            // Windows refuses to delete a mapped file, and a checkpoint that
+            // reuses a table's files keeps mapping the generation it linked them
+            // from — so without this retry each such generation would be left
+            // behind for good, since the next checkpoint only looks at *its*
+            // predecessor. Bounded by the number of directories present, and a
+            // failure only leaves reclaimable disk (the sweep at open finishes
+            // the job once nothing maps them).
+            for g in (1..old_gen).rev() {
+                let dir = manifest::gen_dir(root, g);
+                if !dir.exists() {
+                    break;
+                }
+                // A backup is archiving this one; it stays until unpinned.
+                if pinned.contains_key(&g) {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(dir);
+            }
             return;
         }
         let _ = std::fs::remove_file(root.join("catalog.json"));
@@ -4680,5 +4854,217 @@ mod commit_gate_tests {
 
         let last = db.inner.lock().unwrap().wal.last_seq();
         assert_eq!(db.commit.synced_seq.load(Ordering::SeqCst), last);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_reuse_tests {
+    //! A checkpoint reuses the files of any table that has not changed since the
+    //! generation it is based on, by hard-linking them into the new generation
+    //! rather than writing them again. That is what makes checkpointing often
+    //! enough to bound the open-time memory peak affordable.
+    //!
+    //! It is also the kind of optimization that loses data quietly: the failure
+    //! mode is not a crash but a generation that claims to describe rows it
+    //! actually describes as they were some checkpoints ago. These tests are
+    //! about the reuse decision being *conservative* — never reusing a file that
+    //! is no longer the truth.
+    use super::*;
+
+    fn opts() -> SqlOptions {
+        SqlOptions {
+            disk_first: true,
+            ..SqlOptions::default()
+        }
+    }
+
+    fn rows_of(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop() {
+            Some(QueryResult::Select { rows, .. }) => rows,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    fn one_int(db: &SqlEngine, sql: &str) -> i64 {
+        match rows_of(db, sql).first().and_then(|r| r.first()).cloned() {
+            Some(Value::Int(n)) => n,
+            other => panic!("expected one integer, got {other:?}"),
+        }
+    }
+
+    /// The base case: two tables, only one of them written between two
+    /// checkpoints. The untouched one is served from a linked file after the
+    /// second checkpoint reclaimed the generation that wrote it.
+    #[test]
+    fn an_untouched_table_survives_the_generation_that_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+            db.execute("CREATE TABLE quiet (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.execute("CREATE TABLE busy (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+            for i in 1..=50 {
+                db.execute(&format!("INSERT INTO quiet VALUES ({i}, 'q{i}')"))
+                    .unwrap();
+                db.execute(&format!("INSERT INTO busy VALUES ({i}, 'b{i}')"))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+            // Only `busy` changes from here, so `quiet` is reused — twice, so
+            // that the second reuse links a file that was itself a link.
+            for round in 0..2 {
+                for i in 1..=10 {
+                    db.execute(&format!(
+                        "INSERT INTO busy VALUES ({}, 'more')",
+                        100 + round * 10 + i
+                    ))
+                    .unwrap();
+                }
+                db.checkpoint().unwrap();
+            }
+            assert_eq!(one_int(&db, "SELECT count(*) FROM quiet"), 50);
+            assert_eq!(one_int(&db, "SELECT count(*) FROM busy"), 70);
+        }
+        // The generation that wrote `quiet` has been reclaimed by now; reopening
+        // proves its rows are still on disk and still indexed.
+        let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+        assert_eq!(one_int(&db, "SELECT count(*) FROM quiet"), 50);
+        assert_eq!(one_int(&db, "SELECT count(*) FROM busy"), 70);
+        assert_eq!(
+            rows_of(&db, "SELECT v FROM quiet WHERE id = 42"),
+            vec![vec![Value::Text("q42".into())]]
+        );
+        // The primary key still enforces, which it can only do from the linked
+        // index file.
+        assert!(matches!(
+            db.execute("INSERT INTO quiet VALUES (42, 'dup')"),
+            Err(SqlError::DuplicateKey(_))
+        ));
+    }
+
+    /// An index created *after* the last checkpoint has no file in the
+    /// generation being reused, while the table's rows are untouched — so a
+    /// "rows unchanged, link everything" rule would commit a generation that
+    /// declares an index it holds no file for.
+    ///
+    /// Nothing would answer wrongly: the reopened index is simply declared with
+    /// no base, so it is not `usable()` and every query it would have served
+    /// falls back to a scan. That is the bug — an index that quietly stops being
+    /// an index — and it is invisible from the outside, which is why this asserts
+    /// on the committed generation's files.
+    #[test]
+    fn an_index_created_since_the_last_checkpoint_is_not_reused_away() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+                .unwrap();
+            for i in 1..=40 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 4))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+            // Rows untouched from here on; only the schema gains an index.
+            db.execute("CREATE INDEX tk ON t (k)").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let generation = manifest::Manifest::load(dir.path())
+            .unwrap()
+            .expect("a checkpointed database has a manifest")
+            .generation;
+        let gen_dir = manifest::gen_dir(dir.path(), generation);
+        assert!(
+            index_file::sidx_path(&gen_dir, "t", "tk").exists(),
+            "the committed generation declares index tk but holds no file for it"
+        );
+
+        let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+        assert_eq!(one_int(&db, "SELECT count(*) FROM t WHERE k = 2"), 10);
+        assert!(
+            db.inner.lock().unwrap().tables["t"].indexes["tk"].usable(),
+            "the index reopened unusable, so its queries silently scan"
+        );
+    }
+
+    /// A dropped column is compacted away at the next checkpoint, which rewrites
+    /// every row of that table. Reuse must not skip it — the reclaim is the whole
+    /// point of the compaction, and the old file still holds the dropped cells.
+    #[test]
+    fn a_compacting_table_is_written_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, keep TEXT, gone TEXT)")
+                .unwrap();
+            for i in 1..=30 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'k{i}', 'g{i}')"))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+            db.execute("ALTER TABLE t DROP COLUMN gone").unwrap();
+            db.checkpoint().unwrap();
+        }
+        let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+        assert_eq!(
+            rows_of(&db, "SELECT * FROM t WHERE id = 5"),
+            vec![vec![Value::Int(5), Value::Text("k5".into())]],
+            "the dropped column came back"
+        );
+        assert!(db.execute("SELECT gone FROM t").is_err());
+    }
+
+    /// A checkpoint that reuses everything — nothing changed at all — is still a
+    /// complete, independently openable generation.
+    #[test]
+    fn a_checkpoint_that_changes_nothing_is_still_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            for i in 1..=20 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+            for _ in 0..3 {
+                db.checkpoint().unwrap();
+            }
+        }
+        let db = SqlEngine::open_with_options(dir.path(), opts()).unwrap();
+        assert_eq!(one_int(&db, "SELECT count(*) FROM t"), 20);
+        // UNIQUE, from a file linked through three generations.
+        assert!(matches!(
+            db.execute("INSERT INTO t VALUES (99, 'v7')"),
+            Err(SqlError::DuplicateKey(_))
+        ));
+    }
+
+    /// Reuse is a disk-first optimization: resident mode has no base snapshot to
+    /// be unchanged with respect to, so every table is written every time.
+    #[test]
+    fn resident_mode_never_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open_with_options(
+            dir.path(),
+            SqlOptions {
+                disk_first: false,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+        db.checkpoint().unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(
+                !inner.tables["t"].rows.is_base_only(),
+                "a resident table must never look reusable"
+            );
+        }
+        db.checkpoint().unwrap();
+        assert_eq!(one_int(&db, "SELECT count(*) FROM t"), 3);
     }
 }
