@@ -40,7 +40,11 @@ pub use parser::{
     DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,
 };
 use types::KeyTuple;
-pub use types::{SqlType, Value};
+pub use types::{SqlType, Value, ValueRef};
+// Exposed for `examples/decode_bench.rs`, which times the row decoder on its own
+// to see what share of a scan it actually is — the query benchmark can only
+// measure it together with predicate evaluation and the scan machinery.
+pub use types::{decode_row_into, decode_row_masked, encode_row};
 
 use catalog::Catalog;
 use rows::RowStore;
@@ -3554,49 +3558,14 @@ pub fn is_read_only(sql: &str) -> Result<bool> {
 }
 
 /// Autocommit `Store`: every operation is applied and logged immediately.
-impl Store for SqlEngine {
-    fn table_def(&self, name: &str) -> Option<Table> {
-        SqlEngine::table_def(self, name)
-    }
-    fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()> {
-        let owner = STMT_LOCK_OWNER.get();
-        if owner == 0 {
-            // Every public execution path scopes an owner around the
-            // statement; reaching this means a new call path skipped it.
-            return Err(SqlError::Unsupported(
-                "row locking outside a statement scope".into(),
-            ));
-        }
-        // Blocks on contention — `inner` is NOT held here, so the holder can
-        // commit and release while we wait.
-        self.row_locks
-            .lock_many(table, row_ids, owner, self.lock_timeout)
-    }
-    fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
-        SqlEngine::scan(self, table)
-    }
-    fn scan_pruned(&self, table: &str, keep: &[usize]) -> Result<store::Chunk> {
-        let inner = self.inner.lock().unwrap();
-        let state = inner
-            .tables
-            .get(table)
-            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        let n = state.rows.len();
-        let mut cells = Vec::with_capacity(n * keep.len());
-        for (_, row) in state.rows.iter() {
-            for &k in keep {
-                cells.push(row[k].clone());
-            }
-        }
-        Ok(store::Chunk {
-            width: keep.len(),
-            n,
-            cells,
-        })
-    }
-    fn scan_visit(
+impl SqlEngine {
+    /// The body behind [`Store::scan_visit`] and [`Store::scan_visit_cols`].
+    /// `want` is the query-visible column positions the caller will read, or
+    /// `None` for all of them.
+    fn scan_visit_inner(
         &self,
         table: &str,
+        want: Option<&[usize]>,
         visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
     ) -> Result<()> {
         // Rows are handed to the visitor borrowed, under the table lock: a
@@ -3642,7 +3611,130 @@ impl Store for SqlEngine {
         // A push walk rather than the iterator: it can hold one decode buffer
         // across rows, where an iterator would have to yield an owned `Vec` for
         // every disk-first row it reads out of the mmap.
-        state.rows.visit_rows(&mut |_, row| visit(row))
+        //
+        // `want` becomes a per-position mask so the decoder can skip the cells
+        // this query never reads — the scan cache above is resident-only, where
+        // rows are already materialized and there is nothing to skip.
+        //
+        // Note what this can and cannot buy: skipping a fixed-width cell costs
+        // about what decoding it costs (read the tag, advance, push a
+        // placeholder), so the gain comes from the cells that would have
+        // allocated — text and bytes. A query whose skipped columns are all
+        // integers is not expected to move.
+        let mask: Option<Vec<bool>> = want.map(|cols| {
+            let mut m = vec![false; width.max(cols.iter().copied().max().map_or(0, |c| c + 1))];
+            for &c in cols {
+                m[c] = true;
+            }
+            m
+        });
+        state
+            .rows
+            .visit_rows_masked(mask.as_deref(), &mut |_, row| visit(row))
+    }
+}
+
+impl Store for SqlEngine {
+    fn table_def(&self, name: &str) -> Option<Table> {
+        SqlEngine::table_def(self, name)
+    }
+    fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()> {
+        let owner = STMT_LOCK_OWNER.get();
+        if owner == 0 {
+            // Every public execution path scopes an owner around the
+            // statement; reaching this means a new call path skipped it.
+            return Err(SqlError::Unsupported(
+                "row locking outside a statement scope".into(),
+            ));
+        }
+        // Blocks on contention — `inner` is NOT held here, so the holder can
+        // commit and release while we wait.
+        self.row_locks
+            .lock_many(table, row_ids, owner, self.lock_timeout)
+    }
+    fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
+        SqlEngine::scan(self, table)
+    }
+    fn scan_pruned(&self, table: &str, keep: &[usize]) -> Result<store::Chunk> {
+        let inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        let n = state.rows.len();
+        let mut cells = Vec::with_capacity(n * keep.len());
+        for (_, row) in state.rows.iter() {
+            for &k in keep {
+                cells.push(row[k].clone());
+            }
+        }
+        Ok(store::Chunk {
+            width: keep.len(),
+            n,
+            cells,
+        })
+    }
+    fn scan_visit(
+        &self,
+        table: &str,
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_visit_inner(table, None, visit)
+    }
+    fn scan_visit_cols(
+        &self,
+        table: &str,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_visit_inner(table, Some(want), visit)
+    }
+    fn scan_visit_refs(
+        &self,
+        table: &str,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[ValueRef<'_>]) -> Result<bool>,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        // Resident tables gain nothing: their cells are already `Value`s, so
+        // "borrowing" them only converts each one and then compares through a
+        // second path. Declining keeps resident mode — which is at parity with
+        // PostgreSQL on these scans — byte-for-byte on the code it had, and it is
+        // what makes the disk-first/resident differential test meaningful: with
+        // both modes borrowing, a broken borrow broke both sides equally and the
+        // comparison stayed green.
+        if state.rows.is_resident() {
+            return Ok(false);
+        }
+        // A decimal cannot be borrowed out of an already-materialized row, so a
+        // table holding one takes the owned path rather than reading NULL for it.
+        // Checked here because this is where the column types are.
+        if state
+            .def
+            .columns
+            .iter()
+            .any(|c| !c.dropped && c.ty == SqlType::Decimal)
+        {
+            return Ok(false);
+        }
+        let width = state.rows.logical_width();
+        if width == 0 {
+            return Ok(false);
+        }
+        let mut mask = vec![false; width.max(want.iter().copied().max().map_or(0, |c| c + 1))];
+        for &c in want {
+            mask[c] = true;
+        }
+        // `None` here means the row store declined (a dropped column shifts
+        // stored positions away from visible ones).
+        match state.rows.visit_rows_refs(&mask, &mut |_, row| visit(row)) {
+            Some(r) => r.map(|()| true),
+            None => Ok(false),
+        }
     }
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
         SqlEngine::insert(self, table, cells)

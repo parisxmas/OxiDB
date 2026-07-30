@@ -18,7 +18,10 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SqlError};
-use crate::types::{Value, decode_row, decode_row_into, encode_row_into};
+use crate::types::{
+    Value, ValueRef, decode_row, decode_row_into, decode_row_masked, decode_row_refs,
+    encode_row_into,
+};
 
 const RDAT_MAGIC: &[u8; 4] = b"OXSR";
 const RDAT_VERSION: u16 = 1;
@@ -369,6 +372,15 @@ impl MappedSnapshot {
             .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"));
     }
 
+    /// [`decode_record`](Self::decode_record) for only the columns in `want`,
+    /// leaving the rest as `Value::Null` at their own positions. See
+    /// [`crate::types::decode_row_masked`] for why the shape is preserved.
+    fn decode_record_masked(&self, off: usize, want: &[bool], buf: &mut Vec<Value>) {
+        let (row_id, payload, len) = self.record_at(off);
+        decode_row_masked(&self.mmap[payload..payload + len], self.arity, want, buf)
+            .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"));
+    }
+
     /// A reader positioned at the first record, for reading rows **in order**.
     pub fn cursor(&self) -> SnapshotCursor<'_> {
         SnapshotCursor {
@@ -419,6 +431,27 @@ impl<'a> SnapshotCursor<'a> {
     pub fn decode_into(&self, buf: &mut Vec<Value>) {
         assert!(self.left > 0, "cursor read past the last record");
         self.snap.decode_record(self.off, buf);
+    }
+
+    /// [`decode_into`](Self::decode_into) for only the columns in `want`.
+    pub fn decode_into_masked(&self, want: &[bool], buf: &mut Vec<Value>) {
+        assert!(self.left > 0, "cursor read past the last record");
+        self.snap.decode_record_masked(self.off, want, buf);
+    }
+
+    /// The current record's wanted cells **borrowed from the mapping** — no copy
+    /// for text or bytes. The borrow is of the snapshot, which outlives the
+    /// cursor, so the cells stay valid for as long as the caller holds them.
+    pub fn decode_refs_into(&self, want: &[bool], buf: &mut Vec<ValueRef<'a>>) {
+        assert!(self.left > 0, "cursor read past the last record");
+        let (row_id, payload, len) = self.snap.record_at(self.off);
+        // Borrowed from the *snapshot*, not from this cursor: the mapping outlives
+        // the walk, so the cells stay valid after the cursor advances. Tying them
+        // to `&self` instead made every decoded row keep the cursor frozen, which
+        // is both wrong in intent and rejected outright.
+        let bytes: &'a [u8] = &self.snap.mmap;
+        decode_row_refs(&bytes[payload..payload + len], self.snap.arity, want, buf)
+            .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"));
     }
 
     /// Decode the current record into a fresh vector.

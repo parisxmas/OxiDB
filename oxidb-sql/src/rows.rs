@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::storage::{MappedSnapshot, SnapshotCursor};
-use crate::types::Value;
+use crate::types::{Value, ValueRef};
 
 enum RowMode {
     Resident(BTreeMap<u64, Vec<Value>>),
@@ -433,8 +433,24 @@ impl RowStore {
     /// can hold the scratch itself, so it allocates one.
     ///
     /// Resident rows and overlay rows are still handed over borrowed.
-    pub fn visit_rows(
+    ///
+    /// `want` names the columns to decode; `None` decodes everything. A base
+    /// row's unwanted cells are
+    /// skipped rather than materialized and arrive as `Value::Null` at their own
+    /// positions — a scan reading a few of a wide table's columns stops paying
+    /// for the rest, which in disk-first mode is an allocation and a copy for
+    /// every text cell. Rows that are already materialized (resident mode, or the
+    /// overlay) are handed over whole: they cost nothing to pass and masking them
+    /// would only hide values the caller may legitimately read.
+    ///
+    /// Masking is **declined when the table has a dropped column**: `want` is in
+    /// query-visible column positions, while the skip happens in stored
+    /// (physical) ones, and after a `DROP COLUMN` those differ. Translating the
+    /// mask is possible but it is the one case where getting it wrong returns
+    /// wrong data, so this takes the full decode instead.
+    pub fn visit_rows_masked(
         &self,
+        want: Option<&[bool]>,
         f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
     ) -> crate::error::Result<()> {
         let fill = self.fill.as_slice();
@@ -443,7 +459,11 @@ impl RowStore {
         let mut pad: Vec<Value> = Vec::new();
         let projected = self.projected;
         let live = self.live.as_slice();
-        self.walk_raw(&mut |id, cells| {
+        let want = match projected {
+            true => None, // see the note above: physical positions differ
+            false => want,
+        };
+        self.walk_raw(want, &mut |id, cells| {
             // Pad a row written before an `ADD COLUMN`, then project away any
             // slot a `DROP COLUMN` tombstoned. Neither happens on the common
             // path, so neither buffer is touched there.
@@ -478,7 +498,7 @@ impl RowStore {
     ) -> crate::error::Result<()> {
         let fill = self.fill.as_slice();
         let mut pad: Vec<Value> = Vec::new();
-        self.walk_raw(&mut |id, cells| {
+        self.walk_raw(None, &mut |id, cells| {
             let padded: &[Value] = if cells.len() < fill.len() {
                 pad.clear();
                 pad.extend_from_slice(cells);
@@ -491,11 +511,113 @@ impl RowStore {
         })
     }
 
+    /// Walk every live row in `row_id` order, handing each to `f` as **borrowed**
+    /// query-visible cells: a base row's text and bytes point into the mapping
+    /// rather than being copied out of it.
+    ///
+    /// Only the columns in `want` are decoded; the rest are `Null` placeholders,
+    /// as in [`Self::visit_rows_masked`]. Overlay and resident rows are already
+    /// materialized, so their cells are borrowed from the store itself
+    /// ([`Value::as_ref`]) — same shape, nothing copied either way.
+    ///
+    /// Declined, by handing back `None`, when the table has a dropped column: the
+    /// mask is in query-visible positions and the skip happens in stored ones, and
+    /// after a `DROP COLUMN` those differ. The caller then takes the owned path.
+    /// A decimal cell cannot be borrowed (`Value::as_ref` cannot represent one),
+    /// so a caller that may meet decimals must compare through the fallback in
+    /// `eq_value_ref` — which it does.
+    pub fn visit_rows_refs<'a>(
+        &'a self,
+        want: &[bool],
+        f: &mut dyn FnMut(u64, &[ValueRef<'a>]) -> crate::error::Result<bool>,
+    ) -> Option<crate::error::Result<()>> {
+        if self.projected {
+            return None;
+        }
+        Some(self.walk_refs(want, self.fill.as_slice(), f))
+    }
+
+    fn walk_refs<'a>(
+        &'a self,
+        want: &[bool],
+        fill: &'a [Value],
+        f: &mut dyn FnMut(u64, &[ValueRef<'a>]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        // One buffer for the borrowed cells, reused per row, plus the padding
+        // template converted once — a row written before an `ADD COLUMN` is
+        // shorter than the layout and its tail comes from `fill`.
+        let mut cells: Vec<ValueRef<'a>> = Vec::new();
+        // A row written before an `ADD COLUMN` is short; its tail reads from the
+        // layout's default template, exactly as the owned walk pads it. Padding
+        // with `Null` instead would answer a query about the new column with NULL
+        // where its default is something else.
+        let pad_from = |cells: &mut Vec<ValueRef<'a>>| {
+            while cells.len() < fill.len() {
+                cells.push(fill[cells.len()].as_ref());
+            }
+        };
+        match &self.mode {
+            RowMode::Resident(m) => {
+                for (id, row) in m {
+                    cells.clear();
+                    cells.extend(row.iter().map(|v| v.as_ref()));
+                    pad_from(&mut cells);
+                    if !f(*id, &cells)? {
+                        break;
+                    }
+                }
+            }
+            RowMode::DiskFirst(d) => {
+                let mut base = d.base.as_ref().map(|b| b.cursor());
+                let mut overlay = d.overlay.iter().peekable();
+                loop {
+                    let base_id = base.as_ref().and_then(|c| c.row_id());
+                    let over_id = overlay.peek().map(|(id, _)| **id);
+                    let take_base = match (base_id, over_id) {
+                        (None, None) => break,
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (Some(b), Some(o)) => b < o,
+                    };
+                    if take_base {
+                        let cur = base.as_ref().expect("a base id implies a cursor");
+                        cur.decode_refs_into(want, &mut cells);
+                        pad_from(&mut cells);
+                        let id = base_id.expect("checked above");
+                        let go = f(id, &cells)?;
+                        base.as_mut().expect("a base id implies a cursor").advance();
+                        if !go {
+                            break;
+                        }
+                    } else {
+                        let (id, change) = overlay.next().expect("peeked");
+                        if base_id == Some(*id) {
+                            base.as_mut().expect("a base id implies a cursor").advance();
+                        }
+                        match change {
+                            Some(row) => {
+                                cells.clear();
+                                cells.extend(row.iter().map(|v| v.as_ref()));
+                                pad_from(&mut cells);
+                                if !f(*id, &cells)? {
+                                    break;
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The shared walk under [`Self::visit_rows`] and [`Self::visit_physical`]:
     /// every live row in `row_id` order, raw (unpadded, unprojected), decoded
     /// into one reused buffer. `f` returns `false` to stop early.
     fn walk_raw(
         &self,
+        want: Option<&[bool]>,
         f: &mut dyn FnMut(u64, &[Value]) -> crate::error::Result<bool>,
     ) -> crate::error::Result<()> {
         match &self.mode {
@@ -525,7 +647,10 @@ impl RowStore {
                     };
                     if take_base {
                         let cur = base.as_mut().expect("a base id implies a cursor");
-                        cur.decode_into(&mut buf);
+                        match want {
+                            Some(w) => cur.decode_into_masked(w, &mut buf),
+                            None => cur.decode_into(&mut buf),
+                        }
                         let id = base_id.expect("checked above");
                         cur.advance();
                         if !f(id, &buf)? {

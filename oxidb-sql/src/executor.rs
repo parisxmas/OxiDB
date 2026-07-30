@@ -22,7 +22,7 @@ use crate::ast::{
 use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
-use crate::types::{IndexKey, SqlType, Value};
+use crate::types::{IndexKey, SqlType, Value, ValueRef};
 
 /// A column in a working row set, qualified by its (aliased) table name.
 #[derive(Debug, Clone)]
@@ -3824,7 +3824,7 @@ fn semi_join_scan<S: Store>(
     let pushed = where_filter.and_then(|f| pushdown_filter(Some(f), full, params));
     let mut cells = Vec::new();
     let mut n = 0usize;
-    store.scan_visit(&join.table.name, &mut |row| {
+    store.scan_visit_cols(&join.table.name, keep, &mut |row| {
         if let Some(f) = &pushed
             && !truthy(&eval_scalar(f, full, row, params)?)
         {
@@ -4716,6 +4716,113 @@ fn base_chunk<S: Store>(
 /// Hash a value for group-key bucketing, consistent with `Value`'s own
 /// equality — which is why only the variants `streamed_aggregate` admits are
 /// handled here, and the rest are unreachable rather than merely unhandled.
+/// Column indices a **bound** expression reads, appended to `out`. Returns
+/// `false` when the expression's shape is not one this enumerates, in which case
+/// the caller must assume it reads everything.
+///
+/// Deliberately conservative rather than exhaustive: the caller uses this to
+/// decide which cells to materialize for evaluation, so a variant this misses
+/// must cost speed and never correctness. Adding a variant here is an
+/// optimization; forgetting one is not a bug.
+fn bound_cols(e: &Expr, out: &mut Vec<usize>) -> bool {
+    match e {
+        Expr::Col(i) => {
+            out.push(*i);
+            true
+        }
+        Expr::Literal(_) | Expr::Param(_) => true,
+        Expr::Binary { left, right, .. } => bound_cols(left, out) && bound_cols(right, out),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => bound_cols(expr, out),
+        Expr::Func { args, .. } => args.iter().all(|a| bound_cols(a, out)),
+        Expr::In { expr, list, .. } => {
+            bound_cols(expr, out) && list.iter().all(|a| bound_cols(a, out))
+        }
+        Expr::InSet { expr, .. } => bound_cols(expr, out),
+        Expr::Aggregate { arg, .. } => match arg {
+            None => true,
+            Some(a) => bound_cols(a, out),
+        },
+        // Column references by name (unbound), subqueries and correlated forms:
+        // not enumerated, so the caller materializes the whole row.
+        _ => false,
+    }
+}
+
+/// Where a grouping key's cells come from — an owned row, or one borrowed from
+/// storage.
+///
+/// The point is that the grouping logic below has **one** implementation. A
+/// second copy of "compare, else hash, else insert" for borrowed rows is exactly
+/// how two paths end up grouping differently: this engine already had a fast path
+/// comparing with `==` while the general one used `total_order`, and they
+/// disagreed on `Int(1)` versus `Double(1.0)`.
+trait KeyCells {
+    /// Whether the cell at `i` equals an already-stored key value.
+    fn eq_at(&self, i: usize, v: &Value) -> bool;
+    fn hash_at(&self, i: usize, h: &mut FxHasher);
+    /// Materialize the cell at `i` — called once per new group, not per row.
+    fn own_at(&self, i: usize) -> Value;
+}
+
+impl KeyCells for &[Value] {
+    fn eq_at(&self, i: usize, v: &Value) -> bool {
+        self[i] == *v
+    }
+    fn hash_at(&self, i: usize, h: &mut FxHasher) {
+        hash_value(&self[i], h);
+    }
+    fn own_at(&self, i: usize) -> Value {
+        self[i].clone()
+    }
+}
+
+impl KeyCells for &[ValueRef<'_>] {
+    fn eq_at(&self, i: usize, v: &Value) -> bool {
+        crate::types::eq_value_ref(v, &self[i])
+    }
+    fn hash_at(&self, i: usize, h: &mut FxHasher) {
+        hash_value_ref(&self[i], h);
+    }
+    fn own_at(&self, i: usize) -> Value {
+        self[i].to_value()
+    }
+}
+
+/// [`hash_value`] for a borrowed cell. The two must agree byte for byte or a row
+/// would hash into a different bucket than the group it belongs to;
+/// `borrowed_hash_matches_owned_hash` checks them against each other.
+fn hash_value_ref(v: &ValueRef<'_>, h: &mut FxHasher) {
+    match v {
+        ValueRef::Null => h.write_u8(0),
+        ValueRef::Bool(b) => {
+            h.write_u8(1);
+            h.write_u8(*b as u8);
+        }
+        ValueRef::Int(n) => {
+            h.write_u8(2);
+            h.write_i64(*n);
+        }
+        ValueRef::Timestamp(t) => {
+            h.write_u8(3);
+            h.write_i64(*t);
+        }
+        ValueRef::Text(s) => {
+            h.write_u8(4);
+            h.write(s.as_bytes());
+        }
+        ValueRef::Bytes(b) => {
+            h.write_u8(5);
+            h.write(b);
+        }
+        // Not reachable from the borrowed grouping path (decimals and doubles are
+        // excluded from it), and hashing them would have to agree with
+        // `total_order`'s cross-type numeric equality, which no hash can do.
+        ValueRef::Double(_) | ValueRef::Decimal(_) => {
+            unreachable!("borrowed grouping admits only int/text/bool/timestamp keys")
+        }
+    }
+}
+
 fn hash_value(v: &Value, h: &mut FxHasher) {
     match v {
         Value::Null => h.write_u8(0),
@@ -4959,7 +5066,25 @@ fn streamed_aggregate<S: Store>(
     };
     let having = match &select.having {
         None => None,
-        Some(h) => Some(bind_expr(h, &full)?),
+        Some(h) => {
+            // HAVING is evaluated below against the *finished group row*, whose
+            // columns are the projection — so an aggregate still written as an
+            // aggregate (`HAVING count(*) > 3`) has nothing to fold over there and
+            // `eval_scalar` rejects it outright. That made a plain, valid query
+            // fail with "aggregate function used outside an aggregated query"
+            // whenever it lacked an ORDER BY, since an ORDER BY is what otherwise
+            // keeps a query off this path (found by a differential test whose
+            // queries had to drop ORDER BY to reach here at all).
+            //
+            // Declined rather than half-supported: the general aggregated path
+            // resolves aggregates in HAVING against the group's rows and answers
+            // it correctly, which is what the ORDER BY spelling of the same query
+            // has always done.
+            if has_aggregate(h) {
+                return Ok(None);
+            }
+            Some(bind_expr(h, &full)?)
+        }
     };
 
     // A group key that is a plain column can be compared straight out of the
@@ -5022,7 +5147,11 @@ fn streamed_aggregate<S: Store>(
     };
 
     let mut key: Vec<IndexKey> = Vec::with_capacity(group.len());
-    let mut fold_row = |row: &[Value]| -> Result<()> {
+    // `row` is what expressions are evaluated against; `keys` is where a
+    // plain-column group key is read from. They are the same slice on the owned
+    // path, and on the borrowed path `row` holds just the cells evaluation needs
+    // while `keys` borrows the rest from storage.
+    let mut fold_row = |row: &[Value], keys: &dyn KeyCells| -> Result<()> {
         if let Some(f) = &filter
             && !truthy(&eval_scalar(f, &full, row, params)?)
         {
@@ -5046,11 +5175,11 @@ fn streamed_aggregate<S: Store>(
                 if groups.len() <= LINEAR_GROUPS && hashed.is_empty() {
                     let hit = groups
                         .iter()
-                        .position(|(k, _)| k.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
+                        .position(|(k, _)| k.iter().zip(cols).all(|(kv, &c)| keys.eq_at(c, kv)));
                     match hit {
                         Some(i) => i,
                         None => {
-                            groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
+                            groups.push((cols.iter().map(|&c| keys.own_at(c)).collect(), fresh()));
                             groups.len() - 1
                         }
                     }
@@ -5067,17 +5196,20 @@ fn streamed_aggregate<S: Store>(
                     }
                     let mut h = FxHasher::default();
                     for &c in cols {
-                        hash_value(&row[c], &mut h);
+                        keys.hash_at(c, &mut h);
                     }
                     let bucket = hashed.entry(h.finish()).or_default();
-                    let hit = bucket
-                        .iter()
-                        .copied()
-                        .find(|&i| groups[i].0.iter().zip(cols).all(|(kv, &c)| *kv == row[c]));
+                    let hit = bucket.iter().copied().find(|&i| {
+                        groups[i]
+                            .0
+                            .iter()
+                            .zip(cols)
+                            .all(|(kv, &c)| keys.eq_at(c, kv))
+                    });
                     match hit {
                         Some(i) => i,
                         None => {
-                            groups.push((cols.iter().map(|&c| row[c].clone()).collect(), fresh()));
+                            groups.push((cols.iter().map(|&c| keys.own_at(c)).collect(), fresh()));
                             bucket.push(groups.len() - 1);
                             groups.len() - 1
                         }
@@ -5119,16 +5251,76 @@ fn streamed_aggregate<S: Store>(
     // way the rows are folded as they arrive and never collected.
     let served = match &index_eqs {
         Some(eqs) => store.index_visit_eq(&from.name, eqs, &mut |cells| {
-            fold_row(cells)?;
+            fold_row(cells, &cells)?;
             Ok(true)
         })?,
         None => None,
     };
     if served.is_none() {
-        store.scan_visit(&from.name, &mut |row| {
-            fold_row(row)?;
-            Ok(true)
-        })?;
+        // The aggregate arguments, group keys, filter and HAVING are all
+        // expressions of this statement, so the columns `collect_needed` finds
+        // are exactly the ones `fold_row` can read.
+        let want = keep_indices(&full, from.key(), &collect_needed(select));
+
+        // Which of those columns does *evaluation* need? Everything except a
+        // plain-column group key, which is compared straight from the row. That
+        // is what makes grouping by a text column cheap: the cell is read 400k
+        // times and copied once per group instead of once per row. Any expression
+        // whose shape `bound_cols` does not enumerate means "assume all of them",
+        // so a miss there is slower, not wrong.
+        let mut eval_cols: Option<Vec<usize>> = Some(Vec::new());
+        {
+            let mut note = |e: &Expr| {
+                if let Some(v) = eval_cols.as_mut()
+                    && !bound_cols(e, v)
+                {
+                    eval_cols = None;
+                }
+            };
+            if let Some(f) = &filter {
+                note(f);
+            }
+            for p in &plan {
+                if let Item::Agg(_, Some(a)) = p {
+                    note(a);
+                }
+            }
+            // Expression keys go through `eval_scalar`, so their columns must be
+            // materialized; plain-column keys are exactly what we are avoiding.
+            if key_cols.is_none() {
+                for g in &group {
+                    note(g);
+                }
+            }
+        }
+        let mat: Vec<usize> = match &eval_cols {
+            Some(cols) => {
+                let mut c = cols.clone();
+                c.sort_unstable();
+                c.dedup();
+                c
+            }
+            None => want.clone(),
+        };
+
+        // Borrowed rows where the store can serve them; the owned scan otherwise,
+        // which answers identically.
+        let arity = full.len();
+        let mut scratch: Vec<Value> = vec![Value::Null; arity];
+        let borrowed =
+            store.scan_visit_refs(&from.name, &want, &mut |row: &[ValueRef<'_>]| {
+                for &c in &mat {
+                    scratch[c] = row[c].to_value();
+                }
+                fold_row(&scratch, &row)?;
+                Ok(true)
+            })?;
+        if !borrowed {
+            store.scan_visit_cols(&from.name, &want, &mut |row| {
+                fold_row(row, &row)?;
+                Ok(true)
+            })?;
+        }
     }
 
     // Emit.
@@ -5304,7 +5496,7 @@ fn streamed_chunk<S: Store>(
         let mut best: Vec<(Vec<Value>, usize, Vec<Value>)> = Vec::with_capacity(k.min(64) + 1);
         let mut kbuf: Vec<Value> = Vec::with_capacity(keys.len());
         let mut seq = 0usize;
-        store.scan_visit(&from.name, &mut |row| {
+        store.scan_visit_cols(&from.name, keep, &mut |row| {
             if let Some(f) = &filter
                 && !truthy(&eval_scalar(f, full, row, params)?)
             {
@@ -5371,7 +5563,10 @@ fn filtered_scan<S: Store>(
 ) -> Result<Chunk> {
     let mut cells = Vec::new();
     let mut n = 0usize;
-    store.scan_visit(table, &mut |row| {
+    // Only the columns this statement reads are decoded. `keep` comes from
+    // `collect_needed`, which walks the filter as well as the projection, so the
+    // predicate evaluated below can never want a column that was skipped.
+    store.scan_visit_cols(table, keep, &mut |row| {
         if let Some(f) = filter
             && !truthy(&eval_scalar(f, full, row, params)?)
         {
@@ -8179,5 +8374,127 @@ fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
             let (x, y) = (as_f64(a)?, as_f64(b)?);
             x.partial_cmp(&y)
         }
+    }
+}
+
+#[cfg(test)]
+mod borrowed_key_tests {
+    //! Grouping can now read a key cell either from an owned row or borrowed from
+    //! the mapping. The two must agree on **equality and on hashing**: a row that
+    //! hashes differently from the group it belongs to silently starts a second
+    //! group, and the query returns two rows where it should return one.
+    use super::*;
+    use crate::types::encode_cell;
+
+    /// The variants the borrowed grouping path admits (`hashable` in
+    /// `streamed_aggregate`), which are the only ones either function may meet.
+    fn key_variants() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Int(i64::MIN),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(i64::MAX),
+            Value::Timestamp(0),
+            Value::Timestamp(1_704_067_200_000),
+            Value::Text("".into()),
+            Value::Text("a".into()),
+            Value::Text("paid".into()),
+            Value::Text("çok baytlı".into()),
+            Value::Bytes(vec![].into()),
+            Value::Bytes(vec![1, 2, 3].into()),
+        ]
+    }
+
+    fn hash_owned(v: &Value) -> u64 {
+        let mut h = FxHasher::default();
+        hash_value(v, &mut h);
+        h.finish()
+    }
+
+    fn hash_borrowed(v: &ValueRef<'_>) -> u64 {
+        let mut h = FxHasher::default();
+        hash_value_ref(v, &mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn borrowed_hash_matches_owned_hash() {
+        for v in key_variants() {
+            // Both through `as_ref` (an overlay row) and through the encoding (a
+            // base row), because the borrowed path meets cells both ways.
+            assert_eq!(
+                hash_borrowed(&v.as_ref()),
+                hash_owned(&v),
+                "as_ref hash differs for {v:?}"
+            );
+
+            let mut buf = Vec::new();
+            encode_cell(&v, &mut buf);
+            let mut pos = 0;
+            let decoded = crate::types::decode_cell_ref_for_test(&buf, &mut pos).expect("decode");
+            assert_eq!(
+                hash_borrowed(&decoded),
+                hash_owned(&v),
+                "decoded hash differs for {v:?}"
+            );
+        }
+    }
+
+    /// Distinct values must not collide into one group by construction — the hash
+    /// may collide (buckets compare exactly), but equality must never lie.
+    #[test]
+    fn borrowed_equality_never_merges_distinct_keys() {
+        let vals = key_variants();
+        for a in &vals {
+            for b in &vals {
+                let cells: &[Value] = std::slice::from_ref(b);
+                let refs: Vec<ValueRef<'_>> = vec![b.as_ref()];
+                let owned_eq = cells.eq_at(0, a);
+                let borrowed_eq = refs.as_slice().eq_at(0, a);
+                assert_eq!(
+                    owned_eq, borrowed_eq,
+                    "KeyCells impls disagree comparing stored {a:?} against {b:?}"
+                );
+                assert_eq!(owned_eq, a == b, "eq_at disagrees with == for {a:?}/{b:?}");
+            }
+        }
+    }
+
+    /// Materializing a key produces the same value from either source — this is
+    /// the copy that happens once per group.
+    #[test]
+    fn owning_a_borrowed_key_reproduces_it() {
+        for v in key_variants() {
+            let refs: Vec<ValueRef<'_>> = vec![v.as_ref()];
+            assert_eq!(refs.as_slice().own_at(0), v, "own_at lost {v:?}");
+        }
+    }
+
+    /// `bound_cols` must be conservative: an unenumerated shape has to report
+    /// failure so the caller materializes everything, rather than quietly
+    /// claiming the expression reads no columns.
+    #[test]
+    fn bound_cols_reports_failure_for_shapes_it_does_not_know() {
+        let mut out = Vec::new();
+        // A bound column reference is known.
+        assert!(bound_cols(&Expr::Col(3), &mut out));
+        assert_eq!(out, vec![3]);
+
+        // An *unbound* column reference is not — it carries a name, not an index,
+        // so there is no index to report and pretending otherwise would drop it.
+        out.clear();
+        assert!(
+            !bound_cols(
+                &Expr::Column {
+                    table: None,
+                    name: "x".into()
+                },
+                &mut out
+            ),
+            "an unbound column reference must not report success"
+        );
     }
 }

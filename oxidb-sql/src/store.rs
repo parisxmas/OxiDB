@@ -8,7 +8,7 @@
 
 use crate::catalog::{IndexDef, Table};
 use crate::error::Result;
-use crate::types::Value;
+use crate::types::{Value, ValueRef};
 
 /// A set of rows as `(row_id, cells)` pairs.
 pub(crate) type Rows = Vec<(u64, Vec<Value>)>;
@@ -91,6 +91,56 @@ pub(crate) trait Store {
             }
         }
         Ok(())
+    }
+    /// [`scan_visit`](Store::scan_visit) where the caller will only read the
+    /// columns in `want`.
+    ///
+    /// Rows arrive at **full arity with columns in their usual positions**, so
+    /// this is a drop-in for `scan_visit`; what changes is that an
+    /// implementation may leave the other cells as `Value::Null` instead of
+    /// materializing them. In disk-first mode that is the difference between
+    /// decoding one integer and decoding five cells with two string
+    /// allocations, per row.
+    ///
+    /// **`want` must cover every column the visitor reads** — including ones it
+    /// only reads to evaluate a predicate, not just the ones it keeps. Callers
+    /// derive it from `collect_needed`, which walks the projection, filter, join
+    /// conditions, GROUP BY, HAVING and ORDER BY, so the set is a superset by
+    /// construction. The default implementation ignores `want` entirely, which
+    /// is always correct.
+    fn scan_visit_cols(
+        &self,
+        table: &str,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        let _ = want;
+        self.scan_visit(table, visit)
+    }
+
+    /// [`scan_visit_cols`](Store::scan_visit_cols) handing the visitor cells
+    /// **borrowed** from storage rather than copied out of it, or `false` if this
+    /// store cannot (the caller then takes the owned path and gets the same
+    /// answers, more slowly).
+    ///
+    /// Worth using where a scan only *compares* a variable-length cell — grouping
+    /// by a text column reads it 400k times and keeps one copy per group — since
+    /// materializing text is about 20 ns a cell against 2 ns for a fixed-width
+    /// one, two thirds of it the copy.
+    ///
+    /// Declined rather than emulated when the answer could differ: a table with a
+    /// dropped column (stored positions no longer match visible ones) or a
+    /// `DECIMAL` column (a decimal cannot be borrowed from an owned `Value`, so
+    /// it would read as NULL). Both are decided by the implementation, which is
+    /// the only place that knows the layout.
+    fn scan_visit_refs(
+        &self,
+        table: &str,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[ValueRef<'_>]) -> Result<bool>,
+    ) -> Result<bool> {
+        let _ = (table, want, visit);
+        Ok(false)
     }
 
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64>;

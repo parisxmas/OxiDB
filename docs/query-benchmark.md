@@ -125,6 +125,112 @@ as equal to everything numeric — a relation no hash can reproduce and one plai
 `==` disagrees with. Rather than let two paths group differently, float and
 decimal keys stay on the ordered path.
 
+## Disk-first mode, and where its scan cost actually is
+
+Everything above is resident mode, the SQL engine's default. Disk-first
+(`OXIDB_SQL_DISK_FIRST=1`) keeps rows in a mapped file and decodes them as it
+reads, which costs scan speed — and since the same executor runs in both modes,
+the difference *is* that decode. Measured against the same native PostgreSQL:
+
+| workload | disk-first | resident |
+|---|---|---|
+| point SELECT by PK | 0.95× | 0.95× |
+| composite PK lookup | 0.94× | 0.97× |
+| secondary index eq | 1.06× | 1.19× |
+| range scan + ORDER BY | 1.08× | 1.09× |
+| index, low selectivity | 0.45× | 0.77× |
+| GROUP BY | 0.51× | 1.07× |
+| full scan aggregate | 0.59× | 1.00× |
+| join + filter | 0.46× | 0.87× |
+
+Point and indexed work is unaffected — those read a row or two. Scanning work is
+where the decode is paid per row.
+
+### Decoding only the columns a query reads
+
+A scan used to decode the whole row. `sum(total)` reads one of `orders`' five
+columns, so four were rebuilt and dropped. Skipping a cell costs reading its
+length and advancing, so the executor now passes the column set it will read
+(`collect_needed`, which already walks the projection, filter, joins, GROUP BY,
+HAVING and ORDER BY, so it is a superset by construction) and the decoder skips
+the rest, leaving `Value::Null` placeholders so positions — and therefore every
+caller — are unchanged.
+
+| workload | before | after |
+|---|---|---|
+| full scan aggregate | 0.37× | **0.59×** |
+| join + filter | 0.27× | **0.46×** |
+| GROUP BY | 0.53× | 0.51× |
+| index, low selectivity | 0.46× | 0.45× |
+
+The two that did not move say something precise about the remaining cost.
+`GROUP BY status` needs the one *text* column and skips three integers, and the
+low-selectivity query is served through an index rather than a scan.
+
+### What a scanned cell costs (`examples/decode_bench.rs`)
+
+Two attempts to reason about this from query timings were wrong — subtracting one
+query from another conflates a cell with the predicate term that reads it — so
+the decoder is timed on its own, over 400k rows of the benchmark's `orders`
+shape:
+
+```text
+  full decode (5 cells)                  40.0 ns/row
+  masked: id + total (two numerics)      13.3 ns/row
+  masked: id + status (one text)         32.6 ns/row
+  masked: id only (one numeric)          12.4 ns/row
+
+  of which, measured separately:
+  Box<str> alloc + copy + free           13.2 ns
+  UTF-8 validation                        3.4 ns
+```
+
+**A numeric cell costs about 2 ns; a text cell costs about 20 ns**, and two
+thirds of that is the allocation. There is no broad per-cell inefficiency to
+trim — the fixed-width path is already close to the cost of reading eight bytes.
+What is left is materializing variable-length cells, which is what a borrowed
+cell type (`&str` into the mapping, copied only when a value is kept) would
+remove: roughly 16 ns a row per text column, or about 6 ms on a 400k-row scan.
+
+That is the ceiling, and it is worth being clear about where it is: a scan that
+reads *no* text and allocates nothing is still 0.65×, so allocation is not what
+separates disk-first from resident mode — decoding at all is. Resident mode does
+not decode, which is why it reaches parity and why disk-first cannot be made to
+match it by removing allocations.
+
+### Borrowing the cells a scan only compares
+
+`ValueRef<'a>` is a cell pointing into the mapping — `&str` rather than a copied
+`Box<str>`. It is deliberately not what `Value` becomes: a lifetime on `Value`
+would spread through the catalog, the WAL records and their serde derives to
+benefit one code path.
+
+It is used where a cell is *compared* far more often than it is kept: a group key.
+Grouping 400k rows by a text column read that column 400k times and copied it
+400k times, to find a group that already existed. Now it is copied once per group.
+
+| workload | before | after |
+|---|---|---|
+| GROUP BY (text key) | 0.51× | **0.63×** |
+
+p50 fell from 23.0 ms to 18.6 ms — about 11 ns a row against the ~16 the
+allocation costs, the difference being the borrowed row's own bookkeeping. The
+other workloads are unchanged, which is the expected result rather than a
+disappointment: they have no text group key, and this changes nothing else.
+
+Three things are declined rather than emulated, each because the answer could
+otherwise differ: **resident tables** (their cells are already `Value`s, so
+borrowing only converts and compares twice — and leaving them alone keeps the
+mode that is at parity untouched), **a `DECIMAL` column** (a decimal cannot be
+borrowed out of an owned value, so it would read as NULL), and **a dropped
+column** (stored positions no longer match visible ones).
+
+The grouping logic itself has one implementation, reading key cells through a
+`KeyCells` trait with an impl per source. A second copy for borrowed rows is
+precisely how this engine previously ended up with two paths that grouped
+differently — one comparing with `==` while the other used `total_order`, which
+disagree on `Int(1)` versus `Double(1.0)`.
+
 ## What this does not measure
 
 Concurrency (both were driven by one connection), larger datasets, a tuned
