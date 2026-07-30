@@ -449,7 +449,7 @@ each case, and the index one fails when the check is removed.
 ## The document engine, measured separately
 
 Everything above is the **SQL** engine. `OXIDB_DISK_FIRST` (document engine,
-default **on**) and `OXIDB_SQL_DISK_FIRST` (SQL engine, default **off**) are
+default **on**) and `OXIDB_SQL_DISK_FIRST` (SQL engine, default **on** since 0.41.33 — it was off when this document began) are
 different switches over different storage, and none of the tuning above touched
 the document side. Since OxiBase serves documents, storage and realtime from
 that engine, it is worth its own numbers.

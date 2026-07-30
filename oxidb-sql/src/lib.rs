@@ -60,7 +60,12 @@ use wal::{Wal, WalRecord};
 pub struct SqlOptions {
     /// Keep the bulk of each table on disk (mmap'd last-checkpoint snapshot)
     /// with only post-checkpoint changes in RAM, instead of holding every row
-    /// resident. Env: `OXIDB_SQL_DISK_FIRST`.
+    /// resident. **Default on** since 0.41.33 — a warm 1.2M-row database runs
+    /// in 39 MB against resident's ~370, point and indexed queries are at
+    /// parity, and the price is scans at ~1.3–1.4× PostgreSQL against
+    /// resident's ~1.0× (`docs/query-benchmark.md`). `OXIDB_SQL_DISK_FIRST=0`
+    /// restores resident mode; the on-disk format is identical either way, so
+    /// the switch is safe in both directions on an existing database.
     pub disk_first: bool,
     /// Auto-checkpoint when the live WAL exceeds this many bytes (folds the
     /// WAL into `.rdat` snapshots and truncates it; also bounds the RAM
@@ -86,7 +91,7 @@ pub struct SqlOptions {
 impl Default for SqlOptions {
     fn default() -> Self {
         SqlOptions {
-            disk_first: false,
+            disk_first: true,
             checkpoint_bytes: 64 << 20, // 64 MiB
             lock_timeout_ms: 5_000,
             replay_fold_ops: None,
@@ -5049,6 +5054,23 @@ mod commit_gate_tests {
 
         let last = db.inner.lock().unwrap().wal.last_seq();
         assert_eq!(db.commit.synced_seq.load(Ordering::SeqCst), last);
+    }
+}
+
+#[cfg(test)]
+mod default_mode_tests {
+    use super::*;
+
+    /// Disk-first is the default (0.41.33). Pinned because the whole test suite
+    /// opens engines through this default: flipping it back silently changes
+    /// what every mode-agnostic test exercises, and that should be a loud
+    /// decision, not a side effect.
+    #[test]
+    fn disk_first_is_the_default() {
+        assert!(SqlOptions::default().disk_first);
+        // The env opt-out still works in both directions.
+        // (from_env reads the live environment, so only the default is pinned
+        // here; the parse itself is exercised by the server's own tests.)
     }
 }
 

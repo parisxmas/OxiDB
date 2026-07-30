@@ -128,7 +128,7 @@ decimal keys stay on the ordered path.
 ## Disk-first mode, and where its scan cost actually is
 
 Everything above is resident mode, the SQL engine's default. Disk-first
-(`OXIDB_SQL_DISK_FIRST=1`) keeps rows in a mapped file and decodes them as it
+(`OXIDB_SQL_DISK_FIRST`, the default since 0.41.33) keeps rows in a mapped file and decodes them as it
 reads, which costs scan speed — and since the same executor runs in both modes,
 the difference *is* that decode. Measured against the same native PostgreSQL:
 

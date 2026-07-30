@@ -25,14 +25,18 @@ OXIDB_SQL=1 oxidb-server
 | `OXIDB_DOC` | **on** | Set to `0` to run the server **without the document engine** — SQL/TSDB only. The one engine switch that is on by default. See below. |
 | `OXIDB_SQL_DATA` | `${OXIDB_DATA}/sql` | SQL engine data directory |
 | `OXIDB_SQL_SYNC` | `full` | WAL durability: `full` = true storage flush per commit (survives power loss); `data` = OS-cache-level sync (PostgreSQL's default class, several times faster) |
-| `OXIDB_SQL_DISK_FIRST` | off | Keep table data on disk (mmap'd last-checkpoint snapshot) with only post-checkpoint changes in RAM, instead of holding every row resident. Same on-disk format either way — a database can be reopened in either mode. Indexes and the PRIMARY KEY map stay in RAM. |
+| `OXIDB_SQL_DISK_FIRST` | **on** | Table data served from the mmap'd last-checkpoint snapshot with only post-checkpoint changes in RAM; rows, secondary indexes, primary keys and `UNIQUE` columns are all mapped files, so a warm 1.2M-row database runs in ~39 MB. **Default on since 0.41.33**; `0` restores resident mode (every row in RAM — scans ~30% faster, memory a function of the data: ~370 MB warm on the same rows). Same on-disk format either way, so an existing database reopens in either mode and the switch is safe in both directions. |
 | `OXIDB_SQL_CHECKPOINT_BYTES` | 64 MiB | Auto-checkpoint when the live WAL exceeds this many bytes: folds the WAL into per-table `.rdat` snapshots and truncates it (bounds restart replay time, and bounds the RAM overlay in disk-first mode). `0` disables auto-checkpointing. |
 | `OXIDB_SQL_REPLAY_FOLD_OPS` | `rows / 24`, at least 50 000 | Row operations replayed between folds when opening a disk-first database — which is what sets the open-time memory peak, since a replayed record stays in RAM until a fold moves it to disk. Derived from the database's own row count by default, because both sides of the trade are per-row: a fixed interval holds the peak to 1.7× the steady state at 1.2M rows but spends 9 extra seconds reaching 1.3× at 9.6M, where the transient is already small next to what the database costs to run. Set this to override; `0` never folds mid-replay (fastest open, largest peak). See [the memory benchmark](pg-memory-benchmark.md). |
 
-At 1M rows (4 columns, PK), disk-first cuts resident memory roughly in half
-(272 → 143 MB) and opens faster; full scans pay a decode cost (11 → 43 ms).
-Mapped snapshot pages are clean file pages the OS can evict under memory
-pressure, so the effective floor is lower than RSS suggests.
+The trade, measured on the 1.2M-row benchmark (`docs/query-benchmark.md`,
+`docs/pg-memory-benchmark.md`): disk-first holds ~39 MB warm against resident's
+~370, point and indexed queries are at parity with resident (and with
+PostgreSQL), and scans pay a per-cell decode — 0.72–0.78× PostgreSQL against
+resident's ~1.0×. Mapped snapshot pages are clean file pages the OS can evict
+under memory pressure, so the effective floor is lower still than RSS suggests.
+Resident mode remains the right choice for scan-heavy analytics on data that
+comfortably fits in RAM.
 
 ### Memory at startup
 

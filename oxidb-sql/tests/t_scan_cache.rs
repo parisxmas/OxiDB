@@ -6,6 +6,23 @@ mod common;
 
 use common::*;
 
+/// The scan cache is a **resident-mode** mechanism (`is_resident` gates it), and
+/// disk-first became the default in 0.41.33 — under the default these tests
+/// would pass while never building the cache they exist to check. Opened
+/// resident explicitly so they keep testing what they name.
+fn open_resident() -> (tempfile::TempDir, oxidb_sql::SqlEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = oxidb_sql::SqlEngine::open_with_options(
+        dir.path(),
+        oxidb_sql::SqlOptions {
+            disk_first: false,
+            ..oxidb_sql::SqlOptions::default()
+        },
+    )
+    .unwrap();
+    (dir, db)
+}
+
 fn sum_v(db: &oxidb_sql::SqlEngine) -> i64 {
     match rows(db, "SELECT SUM(v) FROM t")[0][0] {
         oxidb_sql::Value::Int(n) => n,
@@ -15,11 +32,12 @@ fn sum_v(db: &oxidb_sql::SqlEngine) -> i64 {
 
 #[test]
 fn scan_cache_reflects_writes() {
-    let (_d, db) = open();
+    let (_d, db) = open_resident();
     db.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     // 2000 rows (> 1024 threshold), v = 1 each -> SUM(v) = 2000.
     for i in 0..2000 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 1)")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 1)"))
+            .unwrap();
     }
     // Scan repeatedly: builds the cache on the second scan.
     assert_eq!(sum_v(&db), 2000);
@@ -28,11 +46,19 @@ fn scan_cache_reflects_writes() {
 
     // Update: must invalidate. One row 1 -> 1001, SUM becomes 3000.
     db.execute("UPDATE t SET v = 1001 WHERE id = 0").unwrap();
-    assert_eq!(sum_v(&db), 3000, "update must not be masked by a stale cache");
+    assert_eq!(
+        sum_v(&db),
+        3000,
+        "update must not be masked by a stale cache"
+    );
 
     // Delete: SUM drops by that row's value.
     db.execute("DELETE FROM t WHERE id = 0").unwrap();
-    assert_eq!(sum_v(&db), 1999, "delete must not be masked by a stale cache");
+    assert_eq!(
+        sum_v(&db),
+        1999,
+        "delete must not be masked by a stale cache"
+    );
 
     // Insert after caching: reflected too.
     db.execute("INSERT INTO t VALUES (99999, 5)").unwrap();
