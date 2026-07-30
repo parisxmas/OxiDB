@@ -269,6 +269,17 @@ without computed goto — costs more than the inlined recursive match it replace
 This removes the per-row work rather than relocating it, and leaves the general
 evaluator in place for everything it does not cover.
 
+The obvious next step — specializing each term on the column's static type, so an
+integer comparison becomes a direct `i64` compare instead of a `cmp_values`
+dispatch — **was built and measured worse**: 3.5 ns a term against 2.7. Storing
+terms as an enum meant the column and operator accessors each became a match over
+four variants, and the compare a two-level match on `(term, cell)`; that dispatch
+costs more per row than the call it removes. A micro-benchmark had predicted a
+2.7x gain, because `black_box`ing the row inflates what both variants share and
+makes the differing part look dominant — the absolute numbers were known to be
+contaminated, and assuming the *ratio* transferred was the error. The ladder above
+is what caught it.
+
 A second evaluator is only correct while it agrees with the first, so it is
 checked against `eval_scalar` over every pairing of values and operators. That
 caught a real divergence on its first run: for `c0 > 0 AND c1 < 'm'` with a NULL

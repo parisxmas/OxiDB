@@ -8656,6 +8656,10 @@ mod simple_filter_tests {
             Value::Double(0.0),
             Value::Double(1.0),
             Value::Double(-0.5),
+            // Compares to nothing, so both paths must *error* rather than pick
+            // an answer — the specialized compare returns None from partial_cmp
+            // exactly where cmp_values does.
+            Value::Double(f64::NAN),
             Value::Bool(true),
             Value::Bool(false),
             Value::Text("".into()),
@@ -8822,5 +8826,176 @@ mod simple_filter_tests {
             })
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod predicate_cost {
+    //! A measurement harness, not an assertion — run it, read it, decide.
+    //!
+    //! ```bash
+    //! cargo test --release -p oxidb-sql --lib predicate_cost -- --ignored --nocapture
+    //! ```
+    //!
+    //! It exists because reasoning about where nanoseconds live has been wrong
+    //! repeatedly in this engine: a per-cell cost inferred by subtracting one
+    //! query's time from another's conflated a decoded cell with the predicate
+    //! term that read it, twice. Timing the piece on its own is what settled it
+    //! both times.
+    //!
+    //! The question it was written for: a filter term costs ~2.7 ns a row after
+    //! the shape is hoisted, against PostgreSQL's ~1 ns. `cmp_values` matches over
+    //! *pairs* of `Value` variants and sends two integers through an `as_f64`
+    //! fallback, so specializing a term on the column's static type should remove
+    //! that.
+    //!
+    //! **It was built, measured, and reverted — do not re-attempt it this way.**
+    //! Specializing terms into an enum (`Int`/`Ts`/`Double`/`General`) made a term
+    //! cost **3.5 ns instead of 2.7**: the accessors for the column and operator
+    //! each became a match over four variants, and the compare became a two-level
+    //! match on `(term, cell)`, which costs more per row than the `cmp_values`
+    //! call it avoided.
+    //!
+    //! **And this harness is why the wrong call got made.** It reported the
+    //! specialized compare at 3.12 ns against 8.46 for the general one — a 2.7x
+    //! ratio that did not survive contact with a real scan. `black_box` on the row
+    //! forces a reload per iteration, which inflates the part both variants share
+    //! and makes the differing part look proportionally huge. The absolute numbers
+    //! were known to be contaminated; the assumption that the *ratio* transferred
+    //! was the mistake. Treat what follows as an upper bound on a difference, not
+    //! as a prediction — and confirm any change with the query-level ladder in
+    //! `docs/query-benchmark.md`, which is what caught this.
+    use super::*;
+    use std::hint::black_box;
+
+    /// Rows shaped like the benchmark's `orders` table.
+    fn rows(n: usize) -> Vec<Vec<Value>> {
+        (0..n)
+            .map(|i| {
+                vec![
+                    Value::Int(i as i64),
+                    Value::Int((i % 200_000) as i64),
+                    Value::Text(["pending", "paid", "shipped"][i % 3].into()),
+                    Value::Double(i as f64 * 1.5),
+                    Value::Timestamp(1_704_067_200_000 + i as i64),
+                ]
+            })
+            .collect()
+    }
+
+    fn report(label: &str, n: usize, hits: usize, d: std::time::Duration) {
+        println!(
+            "  {label:<46} {:>7.2} ms   {:>5.2} ns/row   (hits {hits})",
+            d.as_secs_f64() * 1e3,
+            d.as_secs_f64() * 1e9 / n as f64
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_predicate_term_cost() {
+        let data = rows(400_000);
+        let n = data.len();
+        println!("\n{n} rows, one predicate term, best of 3\n");
+
+        // (a) What ships today: the hoisted filter, still through cmp_values.
+        let int_filter = SimpleFilter {
+            terms: vec![(0, BinOp::Gt, Value::Int(100))],
+        };
+        let mut best = std::time::Duration::MAX;
+        let mut hits = 0;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            for r in &data {
+                if int_filter.passes(black_box(r)).unwrap() {
+                    h += 1;
+                }
+            }
+            best = best.min(t.elapsed());
+            hits = h;
+        }
+        report("SimpleFilter, INT term (ships today)", n, hits, best);
+
+        let dbl_filter = SimpleFilter {
+            terms: vec![(3, BinOp::Gt, Value::Double(0.0))],
+        };
+        let mut best = std::time::Duration::MAX;
+        let mut hits = 0;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            for r in &data {
+                if dbl_filter.passes(black_box(r)).unwrap() {
+                    h += 1;
+                }
+            }
+            best = best.min(t.elapsed());
+            hits = h;
+        }
+        report("SimpleFilter, DOUBLE term (ships today)", n, hits, best);
+
+        // (b) cmp_values alone, to see how much of the term is the comparison.
+        let want = Value::Int(100);
+        let mut best = std::time::Duration::MAX;
+        let mut hits = 0;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            for r in &data {
+                if cmp_values(black_box(&r[0]), &want) == Some(Ordering::Greater) {
+                    h += 1;
+                }
+            }
+            best = best.min(t.elapsed());
+            hits = h;
+        }
+        report("cmp_values alone, INT vs INT", n, hits, best);
+
+        // (c) What specializing on the column's static type would leave: a direct
+        //     compare on the expected variant, falling back for anything else.
+        let lit: i64 = 100;
+        let mut best = std::time::Duration::MAX;
+        let mut hits = 0;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            for r in &data {
+                let cell = black_box(&r[0]);
+                let pass = match cell {
+                    Value::Int(v) => *v > lit,
+                    Value::Null => false,
+                    other => cmp_values(other, &Value::Int(lit)) == Some(Ordering::Greater),
+                };
+                if pass {
+                    h += 1;
+                }
+            }
+            best = best.min(t.elapsed());
+            hits = h;
+        }
+        report("specialized INT compare (the proposal)", n, hits, best);
+
+        let litf: f64 = 0.0;
+        let mut best = std::time::Duration::MAX;
+        let mut hits = 0;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            for r in &data {
+                let cell = black_box(&r[3]);
+                let pass = match cell {
+                    Value::Double(v) => *v > litf,
+                    Value::Null => false,
+                    other => cmp_values(other, &Value::Double(litf)) == Some(Ordering::Greater),
+                };
+                if pass {
+                    h += 1;
+                }
+            }
+            best = best.min(t.elapsed());
+            hits = h;
+        }
+        report("specialized DOUBLE compare (the proposal)", n, hits, best);
     }
 }
