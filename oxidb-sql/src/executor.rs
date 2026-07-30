@@ -3027,6 +3027,11 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     if let Some(result) = streamed_aggregate(store, &select, params)? {
         return Ok(result);
     }
+    // 0c. The same, over a single INNER equi-join: hash the (filtered) right
+    //     side and stream the left, folding matches — no left materialization.
+    if let Some(result) = streamed_join_aggregate(store, &select, params)? {
+        return Ok(result);
+    }
     // 1. Build the source: base table, then joins (the join ON is bound inside).
     let (schema, src, mut tuples) = build_source(store, &select, params)?;
 
@@ -3985,6 +3990,506 @@ fn lateral_join_into<S: Store>(
         data: out,
     };
     Ok(())
+}
+
+/// Aggregates over a single INNER equi-join, folded while **streaming** the
+/// left table — the join analog of [`streamed_aggregate`], and the same
+/// execution shape PostgreSQL uses for `SELECT count(*) FROM big JOIN small ON
+/// … WHERE …`: hash the (filtered, usually small) right side, then stream the
+/// big side probing per row, materializing nothing.
+///
+/// The general path materializes the left side into a chunk, walks it *again*
+/// to collect join keys for the semi-join, and emits matched tuple pairs that
+/// an aggregate then folds and throws away. On the benchmark's join
+/// (400k ⋈ 200k, one count) those materializations were 17.7 ms of a 20 ms
+/// query in disk-first mode — the probe itself was 1.1 ms — because every
+/// materialized row is decoded out of the mmap and cloned. Streaming folds each
+/// match as it is found, so a row is decoded once and kept never.
+///
+/// Anything outside the gated shape returns `Ok(None)` and the general path
+/// runs unchanged. WHERE conjuncts must each bind against one side alone (a
+/// cross-side conjunct declines); pushing them into the two scans is
+/// equivalence-preserving for INNER joins, and the NULL-drops-row semantics are
+/// the same in both places.
+///
+/// Grouping uses the ordered-map path only (no borrowed-key fast path): correct
+/// for every key type, and the queries this exists for are dominated by the
+/// probe, not the group lookup. `t_masked_scan::streamed_join` holds this path
+/// and the general one to identical answers.
+fn streamed_join_aggregate<S: Store>(
+    store: &S,
+    select: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<QueryResult>> {
+    // ── Shape gate ─────────────────────────────────────────────────────────
+    let Some(from) = &select.from else {
+        return Ok(None);
+    };
+    let [join] = select.joins.as_slice() else {
+        return Ok(None);
+    };
+    if from.subquery.is_some()
+        || join.table.subquery.is_some()
+        || join.table.lateral
+        || !matches!(join.kind, JoinKind::Inner)
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.distinct
+    {
+        return Ok(None);
+    }
+    // A *selective* equality filter is the general path's home turf: it probes
+    // the index, gets a small driver chunk, and index-nested-loops into the
+    // other table in microseconds. This path always scans its streamed side, so
+    // engaging there would turn those queries into multi-millisecond ones.
+    //
+    // Selectivity cannot be read off the query, but it can be bounded cheaply:
+    // walk the index for the equality with a counter that stops past
+    // `INL_MAX_LEFT`. Overflowing the cap (or having no usable index) means the
+    // general path would not INL either — the equality is scan-shaped, exactly
+    // what this path is for. The probe is bounded at INL_MAX_LEFT + 1 rows.
+    // INNER is symmetric, so orient it: the streamed side is never
+    // materialized, so it should be the expensive one to materialize. An
+    // equality-filtered side goes to the index side (its chunk shrinks to the
+    // matches, and the equality may be servable by an actual index there);
+    // otherwise the smaller table does.
+    let has_eq = |r: &TableRef| {
+        select
+            .filter
+            .as_ref()
+            .is_some_and(|f| !eq_conjuncts(f, r.key(), params).is_empty())
+    };
+    let (stream_ref, index_ref) = match (has_eq(from), has_eq(&join.table)) {
+        (true, false) => (&join.table, from),
+        (false, true) => (from, &join.table),
+        _ => {
+            let a = store.row_count_hint(&from.name);
+            let b = store.row_count_hint(&join.table.name);
+            match (a, b) {
+                (Some(fa), Some(fb)) if fa < fb => (&join.table, from),
+                _ => (from, &join.table),
+            }
+        }
+    };
+    // A *selective* equality on the streamed side is the general path's home
+    // turf — index probe, small driver, index-nested-loop — and this path
+    // would full-scan it instead. Bound the selectivity with a capped index
+    // walk: overflowing the cap (or having no index) means the general path
+    // would scan too, which is exactly the shape this path is for. The
+    // indexed side needs no guard — its equality is consumed by the index
+    // build below, which declines to the general path when the match count is
+    // small enough for the index-nested-loop to win.
+    if let Some(f) = &select.filter {
+        let eqs = eq_conjuncts(f, stream_ref.key(), params);
+        if !eqs.is_empty() {
+            let mut n = 0usize;
+            let served = store.index_visit_eq(&stream_ref.name, &eqs, &mut |_| {
+                n += 1;
+                Ok(n <= INL_MAX_LEFT)
+            })?;
+            if served.is_some() && n <= INL_MAX_LEFT {
+                return Ok(None);
+            }
+        }
+    }
+    let (Some(left_def), Some(right_def)) = (
+        store.table_def(&stream_ref.name),
+        store.table_def(&index_ref.name),
+    ) else {
+        return Ok(None);
+    };
+    let left_full = qualified_schema(stream_ref.key(), &left_def);
+    let right_full = qualified_schema(index_ref.key(), &right_def);
+    let left_len = left_full.len();
+    let mut combined = left_full.clone();
+    combined.extend(right_full.iter().cloned());
+
+    // Equi-keys only, nothing left over in the ON.
+    let (keys, residual) = split_on(&join.on, left_len, &combined);
+    if keys.is_empty() || residual.is_some() {
+        return Ok(None);
+    }
+
+    // ── The aggregate plan, exactly as the single-table path builds it ─────
+    let proj = expand_projection(&select.projection, &combined)?;
+    if proj.is_empty() {
+        return Ok(None);
+    }
+    let group: Vec<Expr> = select
+        .group_by
+        .iter()
+        .map(|e| bind_expr(e, &combined))
+        .collect::<Result<_>>()?;
+    enum Item {
+        Agg(AggFunc, Option<Expr>),
+        Key(usize),
+    }
+    let mut plan: Vec<Item> = Vec::new();
+    for (_, e) in &proj {
+        let bound = bind_expr(e, &combined)?;
+        match &bound {
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct: false,
+            } => {
+                if *func == AggFunc::Mode {
+                    return Ok(None);
+                }
+                let arg = match arg.as_deref() {
+                    None => None,
+                    Some(a) if streamable(a, params) && !has_aggregate(a) => Some(a.clone()),
+                    Some(_) => return Ok(None),
+                };
+                // Same exactness rule as the single-table path: SUM/AVG stream
+                // through f64, which is only right for these types.
+                if matches!(func, AggFunc::Sum | AggFunc::Avg) {
+                    let ty = arg.as_ref().and_then(|a| expr_type(a, &combined));
+                    if !matches!(
+                        ty,
+                        Some(SqlType::Int) | Some(SqlType::Double) | Some(SqlType::Timestamp)
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                plan.push(Item::Agg(*func, arg));
+            }
+            other if !has_aggregate(other) => match group.iter().position(|g| g == other) {
+                Some(i) => plan.push(Item::Key(i)),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+    if group.iter().any(|g| !streamable(g, params)) {
+        return Ok(None);
+    }
+    if !plan.iter().any(|p| matches!(p, Item::Agg(..))) {
+        return Ok(None);
+    }
+    // HAVING with an aggregate still written as an aggregate cannot be
+    // evaluated against the finished group row — same decline as the
+    // single-table path (see the fix there).
+    if let Some(h) = &select.having
+        && has_aggregate(h)
+    {
+        return Ok(None);
+    }
+
+    // ── Assign each WHERE conjunct to the one side it reads ────────────────
+    let mut left_conj: Vec<Expr> = Vec::new();
+    let mut right_conj: Vec<Expr> = Vec::new();
+    if let Some(f) = &select.filter {
+        let mut conjuncts = Vec::new();
+        collect_conjuncts(f, &mut conjuncts);
+        for c in conjuncts {
+            if !streamable(c, params) || has_aggregate(c) {
+                return Ok(None);
+            }
+            // Bound against the combined schema for the authoritative name
+            // resolution (ambiguity errors are the general path's to report).
+            let Ok(bound) = bind_expr(c, &combined) else {
+                return Ok(None);
+            };
+            let mut cols = Vec::new();
+            if !bound_cols(&bound, &mut cols) {
+                return Ok(None); // a shape whose reads are unknown: cannot split
+            }
+            if cols.iter().all(|&p| p < left_len) {
+                left_conj.push(bound);
+            } else if cols.iter().all(|&p| p >= left_len) {
+                // Re-bind the *named* conjunct against the right schema alone,
+                // so it evaluates against a right scan row directly.
+                match bind_expr(c, &right_full) {
+                    Ok(b) => right_conj.push(b),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                return Ok(None); // reads both sides: not pushable
+            }
+        }
+    }
+    let and_all = |mut v: Vec<Expr>| -> Option<Expr> {
+        v.drain(..).reduce(|l, r| Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(l),
+            right: Box::new(r),
+        })
+    };
+    let left_filter = and_all(left_conj);
+    let right_filter = and_all(right_conj);
+
+    // ── Which combined positions the fold actually reads ───────────────────
+    let used: Vec<usize> = {
+        let mut cols = Vec::new();
+        let mut known = true;
+        for p in &plan {
+            if let Item::Agg(_, Some(a)) = p {
+                known &= bound_cols(a, &mut cols);
+            }
+        }
+        for g in &group {
+            known &= bound_cols(g, &mut cols);
+        }
+        match known {
+            true => {
+                cols.sort_unstable();
+                cols.dedup();
+                cols
+            }
+            false => (0..combined.len()).collect(), // conservative: all of them
+        }
+    };
+
+    // ── Left scan columns: keys + filter + used, all in left positions ─────
+    let left_keys: Vec<Expr> = keys
+        .iter()
+        .map(|(l, _)| bind_expr(l, &left_full))
+        .collect::<Result<_>>()?;
+    let mut lkeep: Vec<usize> = used.iter().copied().filter(|&p| p < left_len).collect();
+    for e in left_keys.iter().chain(left_filter.iter()) {
+        if !bound_cols(e, &mut lkeep) {
+            lkeep = (0..left_len).collect();
+            break;
+        }
+    }
+    lkeep.sort_unstable();
+    lkeep.dedup();
+
+    // ── Right side: filtered, pruned, indexed ──────────────────────────────
+    let mut rkeep: Vec<usize> = used
+        .iter()
+        .filter(|&&p| p >= left_len)
+        .map(|&p| p - left_len)
+        .collect();
+    {
+        // Key and filter columns, in right-full positions.
+        let mut ok = true;
+        for (_, r) in &keys {
+            let Ok(b) = bind_expr(r, &right_full) else {
+                return Ok(None);
+            };
+            ok &= bound_cols(&b, &mut rkeep);
+        }
+        for f in right_filter.iter() {
+            ok &= bound_cols(f, &mut rkeep);
+        }
+        if !ok {
+            rkeep = (0..right_full.len()).collect();
+        }
+        rkeep.sort_unstable();
+        rkeep.dedup();
+    }
+    // Through an index where one serves this side's equality conjuncts —
+    // 20,000 matching rows fetched directly beat a 200,000-row scan that
+    // decodes every row to reject 90% of them. The full right filter is
+    // re-applied to each fetched row (re-checking the equality is harmless,
+    // and any non-equality conjuncts still have to hold).
+    let right_eqs = select
+        .filter
+        .as_ref()
+        .map(|f| eq_conjuncts(f, index_ref.key(), params))
+        .unwrap_or_default();
+    let mut right_chunk: Option<Chunk> = None;
+    if !right_eqs.is_empty() {
+        let mut cells: Vec<Value> = Vec::new();
+        let mut n = 0usize;
+        // `rkeep` already contains the key, filter and used columns, so it is
+        // exactly what the visitor reads — the fetch decodes nothing else.
+        let served =
+            store.index_visit_eq_cols(&index_ref.name, &right_eqs, &rkeep, &mut |row| {
+                if let Some(f) = &right_filter
+                    && !truthy(&eval_scalar(f, &right_full, row, params)?)
+                {
+                    return Ok(true);
+                }
+                for &c in &rkeep {
+                    cells.push(row[c].clone());
+                }
+                n += 1;
+                Ok(true)
+            })?;
+        if served.is_some() {
+            if n <= INL_MAX_LEFT {
+                // Small enough that the general path's index-nested-loop is
+                // the better join. The fetched rows are discarded — bounded
+                // waste, and the alternative was not knowing.
+                return Ok(None);
+            }
+            right_chunk = Some(Chunk {
+                width: rkeep.len(),
+                n,
+                cells,
+            });
+        }
+    }
+    let right_chunk = match right_chunk {
+        Some(c) => c,
+        None => filtered_scan(
+            store,
+            &index_ref.name,
+            right_filter.as_ref(),
+            &right_full,
+            &rkeep,
+            params,
+            None,
+        )?,
+    };
+    let pruned: Vec<ColRef> = rkeep.iter().map(|&i| right_full[i].clone()).collect();
+    let right_keys: Vec<Expr> = keys
+        .iter()
+        .map(|(_, r)| bind_expr(r, &pruned))
+        .collect::<Result<_>>()?;
+    let index = RightIndex::build(&right_keys, &pruned, &right_chunk, params)?;
+
+    // Combined position → right-chunk column, for filling the scratch row.
+    let used_left: Vec<usize> = used.iter().copied().filter(|&p| p < left_len).collect();
+    let used_right: Vec<(usize, usize)> = used
+        .iter()
+        .filter(|&&p| p >= left_len)
+        .map(|&p| {
+            let col = rkeep
+                .iter()
+                .position(|&r| r == p - left_len)
+                .expect("used right columns were added to rkeep");
+            (p, col)
+        })
+        .collect();
+
+    // ── Stream the left side, folding each match as it appears ─────────────
+    let fast_probe: Option<usize> = match left_keys.as_slice() {
+        [Expr::Col(c)] => Some(*c),
+        _ => None,
+    };
+    let left_simple = left_filter.as_ref().and_then(SimpleFilter::build);
+    let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
+    let mut gindex: std::collections::BTreeMap<Vec<IndexKey>, usize> =
+        std::collections::BTreeMap::new();
+    let fresh = || -> Vec<Acc> {
+        plan.iter()
+            .map(|p| match p {
+                Item::Agg(f, a) => Acc::new(*f, a.is_none()),
+                Item::Key(_) => Acc::CountStar(0), // unused for key positions
+            })
+            .collect()
+    };
+    if group.is_empty() {
+        groups.push((Vec::new(), fresh()));
+    }
+    let mut scratch: Vec<Value> = vec![Value::Null; combined.len()];
+    let mut kbuf: Vec<IndexKey> = Vec::with_capacity(group.len());
+    store.scan_visit_cols(&stream_ref.name, &lkeep, &mut |row| {
+        let keep_row = match (&left_simple, &left_filter) {
+            (Some(sf), _) => sf.passes(row)?,
+            (None, Some(f)) => truthy(&eval_scalar(f, &left_full, row, params)?),
+            (None, None) => true,
+        };
+        if !keep_row {
+            return Ok(true);
+        }
+        // The common key shape — one plain column, dense integer index — probes
+        // without an expression evaluation or a Value clone per row.
+        let mut ri = match (&fast_probe, &index) {
+            (Some(c), RightIndex::Dense { min, heads, .. }) => match row.get(*c) {
+                Some(Value::Int(k)) => {
+                    let off = *k as i128 - *min as i128;
+                    if off >= 0 && off < heads.len() as i128 {
+                        heads[off as usize]
+                    } else {
+                        CHAIN_END
+                    }
+                }
+                _ => index.probe(&left_keys, &left_full, row, params)?,
+            },
+            _ => index.probe(&left_keys, &left_full, row, params)?,
+        };
+        if ri == CHAIN_END {
+            return Ok(true);
+        }
+        for &p in &used_left {
+            scratch[p] = row[p].clone();
+        }
+        while ri != CHAIN_END {
+            let rrow = right_chunk.row(ri as usize);
+            for &(p, col) in &used_right {
+                scratch[p] = rrow[col].clone();
+            }
+            let at = if group.is_empty() {
+                0
+            } else {
+                kbuf.clear();
+                for g in &group {
+                    kbuf.push(IndexKey(eval_scalar(
+                        g,
+                        &combined,
+                        scratch.as_slice(),
+                        params,
+                    )?));
+                }
+                match gindex.get(kbuf.as_slice()) {
+                    Some(i) => *i,
+                    None => {
+                        groups.push((kbuf.iter().map(|k| k.0.clone()).collect(), fresh()));
+                        gindex.insert(kbuf.clone(), groups.len() - 1);
+                        groups.len() - 1
+                    }
+                }
+            };
+            for (i, p) in plan.iter().enumerate() {
+                if let Item::Agg(_, arg) = p {
+                    match arg {
+                        None => groups[at].1[i].fold(&Value::Null), // COUNT(*)
+                        Some(a) => {
+                            let v = eval_scalar(a, &combined, scratch.as_slice(), params)?;
+                            groups[at].1[i].fold(&v);
+                        }
+                    }
+                }
+            }
+            ri = index.next(ri);
+        }
+        Ok(true)
+    })?;
+
+    // ── Emit, exactly as the single-table path does ────────────────────────
+    let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<Option<SqlType>> = proj.iter().map(|(_, e)| expr_type(e, &combined)).collect();
+    let mut rows = Vec::with_capacity(groups.len());
+    for (key, accs) in groups {
+        let out: Vec<Value> = accs
+            .into_iter()
+            .zip(&plan)
+            .map(|(acc, p)| match p {
+                Item::Agg(..) => acc.finish(),
+                Item::Key(i) => key[*i].clone(),
+            })
+            .collect();
+        if let Some(h) = &select.having {
+            let names: Vec<ColRef> = columns
+                .iter()
+                .zip(&types)
+                .map(|(c, t)| ColRef {
+                    table: String::new(),
+                    name: c.clone(),
+                    ty: *t,
+                })
+                .collect();
+            let bound = match bind_expr(h, &names) {
+                Ok(b) => b,
+                Err(_) => return Ok(None), // HAVING over something not projected
+            };
+            if !truthy(&eval_scalar(&bound, &names, out.as_slice(), params)?) {
+                continue;
+            }
+        }
+        rows.push(out);
+    }
+    Ok(Some(QueryResult::Select {
+        columns,
+        types,
+        rows,
+    }))
 }
 
 // A join-execution step; bundling these into a struct would only move the
@@ -5377,19 +5882,21 @@ fn streamed_aggregate<S: Store>(
     };
     // Narrowed by an index where one applies, else the whole table — either
     // way the rows are folded as they arrive and never collected.
+    // The aggregate arguments, group keys, filter and HAVING are all
+    // expressions of this statement, so the columns `collect_needed` finds are
+    // exactly the ones `fold_row` can read — on the index path as much as the
+    // scan path. An index-driven fetch used to materialize whole rows; on a
+    // 20,000-candidate predicate that was two text allocations per row for
+    // cells nothing read.
+    let want = keep_indices(&full, from.key(), &collect_needed(select));
     let served = match &index_eqs {
-        Some(eqs) => store.index_visit_eq(&from.name, eqs, &mut |cells| {
+        Some(eqs) => store.index_visit_eq_cols(&from.name, eqs, &want, &mut |cells| {
             fold_row(cells, &cells)?;
             Ok(true)
         })?,
         None => None,
     };
     if served.is_none() {
-        // The aggregate arguments, group keys, filter and HAVING are all
-        // expressions of this statement, so the columns `collect_needed` finds
-        // are exactly the ones `fold_row` can read.
-        let want = keep_indices(&full, from.key(), &collect_needed(select));
-
         // Which of those columns does *evaluation* need? Everything except a
         // plain-column group key, which is compared straight from the row. That
         // is what makes grouping by a text column cheap: the cell is read 400k

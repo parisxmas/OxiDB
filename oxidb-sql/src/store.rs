@@ -273,6 +273,21 @@ pub(crate) trait Store {
     ///
     /// The default collects and replays, so an implementation that has nothing
     /// better to offer is still correct.
+    /// [`index_visit_eq`](Store::index_visit_eq) where the visitor will only
+    /// read the columns in `want` — an implementation may hand rows whose other
+    /// cells are `Value::Null` placeholders. The default ignores `want`, which
+    /// is always correct.
+    fn index_visit_eq_cols(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let _ = want;
+        self.index_visit_eq(table, eqs, visit)
+    }
+
     fn index_visit_eq(
         &self,
         table: &str,

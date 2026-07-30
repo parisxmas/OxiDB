@@ -364,6 +364,18 @@ impl MappedSnapshot {
         Some(buf)
     }
 
+    /// [`get`](Self::get) decoding only the columns in `want`; the rest arrive
+    /// as `Value::Null` placeholders holding their positions. An index-driven
+    /// fetch reads two or three of a row's columns and used to materialize all
+    /// of them — on a low-selectivity predicate that was two text allocations
+    /// per candidate for cells nothing looked at.
+    pub fn get_masked(&self, row_id: u64, want: &[bool]) -> Option<Vec<Value>> {
+        let off = self.offset_of(row_id)?;
+        let mut buf = Vec::new();
+        self.decode_record_masked(off, want, &mut buf);
+        Some(buf)
+    }
+
     /// Decode the record whose header starts at `off`. CRC was verified at open,
     /// so a decode failure here is snapshot corruption after the fact.
     fn decode_record(&self, off: usize, buf: &mut Vec<Value>) {

@@ -280,6 +280,28 @@ impl RowStore {
         Some(pad_cow(&self.fill, cells))
     }
 
+    /// [`physical_ref`](Self::physical_ref) decoding only the columns in
+    /// `want` for a disk-first base row — the rest are `Null` placeholders at
+    /// their positions, so the caller must not read outside `want`. Rows that
+    /// are already materialized (resident, overlay) are handed over whole, and
+    /// a table with a dropped column falls back to the full fetch: the mask
+    /// mixes query-visible and physical positions, which only coincide while
+    /// nothing is dropped.
+    pub fn physical_ref_masked(&self, row_id: u64, want: &[bool]) -> Option<Cow<'_, [Value]>> {
+        if self.projected {
+            return self.physical_ref(row_id);
+        }
+        let cells: Cow<'_, [Value]> = match &self.mode {
+            RowMode::Resident(m) => Cow::Borrowed(m.get(&row_id)?.as_slice()),
+            RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
+                Some(Some(cells)) => Cow::Borrowed(cells.as_slice()),
+                Some(None) => return None,
+                None => Cow::Owned(d.base.as_ref()?.get_masked(row_id, want)?),
+            },
+        };
+        Some(pad_cow(&self.fill, cells))
+    }
+
     /// The query-visible view of a row the caller already holds physically.
     /// Borrowed unless a `DROP COLUMN` means the two differ.
     pub fn logical_ref<'a>(&'a self, phys: Cow<'a, [Value]>) -> Cow<'a, [Value]> {

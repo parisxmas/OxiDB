@@ -63,6 +63,13 @@ const QUERIES: &[&str] = &[
     // Every cell of a text column, to catch a skip that corrupted the offset of
     // the cell after it.
     "SELECT id, grp, note FROM t ORDER BY id",
+    // Aggregates with an equality on the indexed column and no ORDER BY: the
+    // streaming path serves these from the index, fetching candidates with a
+    // column mask — a mask missing a column the fold or the residual filter
+    // reads would answer from NULLs.
+    "SELECT count(*), min(note), max(qty) FROM t WHERE grp = 'a'",
+    "SELECT count(*) FROM t WHERE grp = 'a' AND qty > 2",
+    "SELECT count(*), sum(qty) FROM t WHERE grp = 'b' AND seen > TIMESTAMP '2024-01-01 12:00:00'",
 ];
 
 fn rows_for(
@@ -360,5 +367,151 @@ mod borrowed_grouping {
             "fixture should produce several groups, got {}",
             first.len()
         );
+    }
+}
+
+/// Aggregates over one INNER equi-join stream the left side instead of
+/// materializing it (`streamed_join_aggregate`). A second execution of the same
+/// semantics, so: differential against the general path, which any query with a
+/// LIMIT takes (the streamed path declines LIMIT — and a large one changes no
+/// answers here).
+mod streamed_join {
+    use super::*;
+
+    const SCHEMA: &[&str] = &[
+        "CREATE TABLE cust (id INT PRIMARY KEY, country TEXT NOT NULL, credit INT)",
+        "CREATE INDEX cust_country ON cust (country)",
+        "CREATE TABLE ord (id INT PRIMARY KEY, cust_id INT, total DOUBLE, note TEXT)",
+        "CREATE INDEX ord_cust ON ord (cust_id)",
+    ];
+
+    /// Every query twice: bare (streams) and with `LIMIT 100000` (declines to
+    /// the general path). Same rows either way, which is the whole assertion.
+    ///
+    /// The fixture is shaped so the assertions cannot pass vacuously — the
+    /// first version of this test did (twice): `cust` is **larger** than `ord`,
+    /// so orientation streams `cust` and indexes `ord`, whose `cust_id` is
+    /// deliberately non-unique — bucket chains have real length, so a fold that
+    /// stops after a chain's first match changes answers. And the `country =
+    /// 'TR'` equality matches more rows than `INL_MAX_LEFT`, so the eq-driven
+    /// index build engages instead of declining. Both were verified by
+    /// sabotaging the implementation and watching this fail.
+    const QUERIES: &[&str] = &[
+        // The benchmark's shape: count over an equality-filtered join, with the
+        // equality selecting too many rows for the index-nested-loop.
+        "SELECT count(*) FROM ord o JOIN cust c ON c.id = o.cust_id WHERE c.country = 'TR' AND o.id > 3",
+        // Aggregates reading both sides, chains exercised (index side = ord).
+        "SELECT count(*), sum(o.total), min(c.credit), max(o.id) FROM cust c JOIN ord o ON o.cust_id = c.id",
+        // Grouped by a right-side column.
+        "SELECT c.country, count(*), sum(o.total) FROM ord o JOIN cust c ON c.id = o.cust_id GROUP BY c.country",
+        // Grouped by the duplicate key itself, HAVING on the finished groups.
+        "SELECT o.cust_id, count(*) FROM cust c JOIN ord o ON o.cust_id = c.id GROUP BY o.cust_id HAVING count(*) > 2",
+        // Filters on both sides at once (each conjunct binds one side).
+        "SELECT count(*) FROM cust c JOIN ord o ON o.cust_id = c.id WHERE c.credit > 10 AND o.total > 5.0",
+        // The equality plus a second conjunct on the same side: the index
+        // satisfies the equality, and the credit predicate must still be
+        // re-applied to every fetched row — dropping that re-check is exactly
+        // the bug this query exists to catch.
+        "SELECT count(*) FROM ord o JOIN cust c ON c.id = o.cust_id WHERE c.country = 'TR' AND c.credit > 10",
+        // A selective equality: declines to the general path (INL territory) —
+        // the differential holds across the decline too.
+        "SELECT count(*) FROM ord o JOIN cust c ON c.id = o.cust_id WHERE c.id = 7",
+        // Zero matches still yields the one scalar row.
+        "SELECT count(*), sum(o.total) FROM ord o JOIN cust c ON c.id = o.cust_id WHERE c.country = 'XX'",
+    ];
+
+    /// Per query: (streamed rows, general-path rows).
+    type Pair = (Vec<Vec<Value>>, Vec<Vec<Value>>);
+
+    fn results(dir: &std::path::Path, disk_first: bool) -> Vec<Pair> {
+        let db = SqlEngine::open_with_options(
+            dir,
+            SqlOptions {
+                disk_first,
+                ..SqlOptions::default()
+            },
+        )
+        .unwrap();
+        for s in SCHEMA {
+            db.execute(s).unwrap();
+        }
+        // 12,000 customers, ~92% 'TR' (well past INL_MAX_LEFT = 8192), inserted
+        // in batches. Credit is NULL every fifth row.
+        let mut batch: Vec<String> = Vec::new();
+        for i in 1..=12_000 {
+            let country = if i % 12 == 0 { "US" } else { "TR" };
+            let credit = match i % 5 {
+                0 => "NULL".into(),
+                n => format!("{}", n * 7),
+            };
+            batch.push(format!("({i}, '{country}', {credit})"));
+            if batch.len() == 500 {
+                db.execute(&format!("INSERT INTO cust VALUES {}", batch.join(",")))
+                    .unwrap();
+                batch.clear();
+            }
+        }
+        // 3,000 orders over the first 900 customers: chains of length ~3, plus
+        // NULL keys (join nothing) and dangling keys (no such customer).
+        for i in 1..=3_000 {
+            let cust = match i % 11 {
+                0 => "NULL".into(),
+                _ => format!("{}", (i % 903) + 1), // 901..903 dangle
+            };
+            let note = match i % 4 {
+                0 => "NULL".into(),
+                _ => format!("'n{i}'"),
+            };
+            batch.push(format!("({i}, {cust}, {}.5, {note})", i % 20));
+            if batch.len() == 500 {
+                db.execute(&format!("INSERT INTO ord VALUES {}", batch.join(",")))
+                    .unwrap();
+                batch.clear();
+            }
+        }
+        assert!(batch.is_empty(), "row counts must be batch multiples");
+        if disk_first {
+            db.checkpoint().unwrap();
+        }
+        // Post-checkpoint writes in both modes, so the fixtures stay identical
+        // while disk-first merges base and overlay.
+        db.execute("INSERT INTO ord VALUES (3001, 3, 9.5, 'late')")
+            .unwrap();
+        db.execute("DELETE FROM ord WHERE id = 7").unwrap();
+        db.execute("UPDATE cust SET country = 'US' WHERE id = 40")
+            .unwrap();
+
+        QUERIES
+            .iter()
+            .map(|q| {
+                let run = |sql: &str| -> Vec<Vec<Value>> {
+                    match db
+                        .execute(sql)
+                        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                        .pop()
+                    {
+                        Some(QueryResult::Select { mut rows, .. }) => {
+                            rows.sort_by_key(|r| format!("{r:?}"));
+                            rows
+                        }
+                        other => panic!("{q} returned {other:?}"),
+                    }
+                };
+                (run(q), run(&format!("{q} LIMIT 100000")))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streamed_join_matches_the_general_path() {
+        for disk_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            for (q, (streamed, general)) in QUERIES.iter().zip(results(dir.path(), disk_first)) {
+                assert_eq!(
+                    streamed, general,
+                    "streamed and general disagree (disk_first={disk_first}) on: {q}"
+                );
+            }
+        }
     }
 }

@@ -289,6 +289,83 @@ continues to the second term and *errors*. The reduction was quietly answering a
 query that should fail. It now tracks unknown separately from false, and the test
 compares error-reachability rather than only the boolean.
 
+### Streaming the join instead of materializing it
+
+With evaluation fixed, the join workload's remaining gap had a precise shape.
+Phase-timing the general path on the benchmark join (400k orders ⋈ 200k
+customers, one count) in disk-first mode:
+
+| phase | disk-first | resident |
+|---|---:|---:|
+| materialize the left side | 7.0 ms | 1.6 ms |
+| semi-join scan of the right | 10.7 ms | 4.6 ms |
+| probe + emit | 1.1 ms | 1.1 ms |
+
+The join itself is 1.1 ms in both modes; everything else is building chunks
+whose rows are read once and thrown away — and in disk-first mode every
+materialized row is a decode. PostgreSQL does not materialize the probe side at
+all: it hashes the small filtered side and streams the big one.
+
+`streamed_join_aggregate` is that execution shape. When an aggregate query has
+exactly one INNER equi-join (no residual ON predicate, no ORDER BY/LIMIT/
+DISTINCT, each WHERE conjunct binding one side alone), the right side is built
+small — through an index when one serves its equality conjuncts, 20k fetches
+instead of a 200k scan — and the left side is *streamed*, each match folded as
+it is found. Nothing left is materialized, no tuples, no emit.
+
+| workload | before | after |
+|---|---|---|
+| join + filter | 0.49× | **0.79×** (20.4 ms → 12.8 ms) |
+
+Two gates keep it from regressing what already works. A *selective* equality is
+the general path's home turf (index probe → small driver → index-nested-loop,
+microseconds); selectivity cannot be read off the query, so it is bounded by a
+capped index walk — more than `INL_MAX_LEFT` matches (or no index) means the
+general path would scan too. And INNER being symmetric, the sides are oriented
+by measurement: an equality-filtered side becomes the indexed side, otherwise
+the smaller table does.
+
+The differential test (each query run bare and with a `LIMIT` big enough to
+change nothing, which the streamed path declines) had to be shaped twice before
+it tested anything: with the indexed side keyed uniquely every bucket chain had
+length one, so a fold that stopped after a chain's first match still passed —
+and a fixture smaller than `INL_MAX_LEFT` declined every equality query before
+the code under test ran. The current fixture puts duplicate keys on the indexed
+side and an equality past the cap, and fails under three separate sabotages
+(chain walk, scratch fill, residual-filter re-check).
+
+One pre-existing slowness surfaced while guarding this: `… JOIN … WHERE c.id =
+42` — a point equality on the join's far side — takes ~13 ms on the general
+path in disk-first mode, because `choose_driver` does not swap toward it and
+the left side is scanned in full. The streamed path correctly declines it (the
+index-nested-loop *should* serve it); making the general path actually do so is
+separate work.
+
+### Masking the index-driven fetch too
+
+The low-selectivity workload (`country = 'TR' AND created > … AND id > …`) is
+served from the `country` index, not a scan — so none of the scan-side masking
+applied, and each of the ~20,000 candidates was materialized whole: five
+columns, two of them text cells (`email`, `name`) that neither the key
+verification nor the fold ever reads.
+
+`index_visit_eq_cols` carries the same wanted-column set the scan path uses
+into the index fetch; the mask always includes the index's own columns, since
+the base-is-a-hint contract requires every candidate verified against the live
+row. A table with a dropped column falls back to the full fetch, for the same
+positional reason the scan path declines there.
+
+| workload | before | after |
+|---|---|---|
+| index, low selectivity | 0.52× | **0.65×** (3.17 ms → 2.54 ms) |
+
+The streamed join's right-side build fetches through the same mask. The
+remaining gap on this workload is per-candidate machinery, not decode: resident
+mode — which fetches from a map and decodes nothing — runs the same query at
+0.77×, so at most that much is reachable by fetch-side work. PostgreSQL's
+advantage here is its bitmap heap scan (candidates sorted, pages visited
+sequentially), which is a different execution shape, not a cheaper fetch.
+
 ## What this does not measure
 
 Concurrency (both were driven by one connection), larger datasets, a tuned

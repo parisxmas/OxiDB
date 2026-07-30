@@ -1965,6 +1965,21 @@ impl SqlEngine {
         eqs: &[(String, Value)],
         visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
     ) -> Result<Option<()>> {
+        self.index_visit_eq_masked(table, eqs, None, visit)
+    }
+
+    /// [`index_visit_eq_inner`], decoding only the columns in `want` (plus the
+    /// index's own columns, which verification must read) for each candidate.
+    /// `None` decodes everything. Positions are preserved — unwanted cells are
+    /// `Null` — so the visitor's column indices mean what they always meant,
+    /// and the caller guarantees it reads only `want`.
+    fn index_visit_eq_masked(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        want: Option<&[usize]>,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
         // `mut` because a qualifying index may not be populated yet — see
         // `SecondaryIndex::populated`. Reads still take the same single lock.
         let mut inner = self.inner.lock().unwrap();
@@ -2046,10 +2061,28 @@ impl SqlEngine {
         // verification needs, and unless a column has been dropped it *is* the
         // logical row. Fetching both cost a second full row build for every
         // candidate — 20,000 of them on a low-selectivity predicate.
+        // The mask is the caller's wanted columns plus the index's own — the
+        // key verification below reads those. Built once, in physical
+        // positions; `physical_ref_masked` declines it (full fetch) when a
+        // dropped column makes physical and visible positions differ.
+        let mask: Option<Vec<bool>> = want.map(|cols| {
+            let arity = state.def.columns.len();
+            let hi = cols.iter().chain(idx.col_pos.iter()).copied().max();
+            let mut m = vec![false; arity.max(hi.map_or(0, |c| c + 1))];
+            for &c in cols.iter().chain(idx.col_pos.iter()) {
+                m[c] = true;
+            }
+            m
+        });
         for id in idx.candidates(&key)? {
             // Borrowed, not cloned: verification reads the row and the visitor
-            // reads the row. Only the disk-first base has to materialize.
-            let Some(phys) = state.rows.physical_ref(id) else {
+            // reads the row. Only the disk-first base has to materialize — and
+            // it decodes only the columns something will read.
+            let phys = match &mask {
+                Some(m) => state.rows.physical_ref_masked(id, m),
+                None => state.rows.physical_ref(id),
+            };
+            let Some(phys) = phys else {
                 continue;
             };
             if idx.key_of(&phys) != key {
@@ -3820,6 +3853,15 @@ impl Store for SqlEngine {
         visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
     ) -> Result<Option<()>> {
         SqlEngine::index_visit_eq_inner(self, table, eqs, &mut |_, cells| visit(cells))
+    }
+    fn index_visit_eq_cols(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        SqlEngine::index_visit_eq_masked(self, table, eqs, Some(want), &mut |_, cells| visit(cells))
     }
 }
 
