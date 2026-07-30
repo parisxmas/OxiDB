@@ -396,6 +396,15 @@ on open time. 100M rows now costs ~69 MB where it would have cost ~3.1 GB, and
 disk-first mode holds no per-row structure of any kind: rows, secondary indexes,
 primary keys, `UNIQUE` columns and now the row index are all files.
 
+Re-measured end to end in the cgroup harness after the sparse index (and after
+the ten query-speed changes that followed, which — verified — moved memory not
+at all): opening the bulk-loaded database now peaks at **137 MB and settles at
+72**, and a clean reopen runs at **39 MB flat**, against the 180/108 and 83/73
+this document recorded before the index went sparse. One wrinkle stated rather
+than hidden: the restart *ratio* looks worse (3.5× against 2.5×) precisely
+because the floor fell by more than the peak — the replay transient is now
+measured against a much smaller base. Every absolute number improved.
+
 Two notes on how the size was chosen and what it cost. A sweep at 9.6M showed the
 walk barely registers (7.1 µs at 16 records per block, 7.4 µs at 128) while memory
 falls 8×, which makes big blocks look free — but that run has the file in page
