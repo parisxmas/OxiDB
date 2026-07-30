@@ -27,7 +27,7 @@ OXIDB_SQL=1 oxidb-server
 | `OXIDB_SQL_SYNC` | `full` | WAL durability: `full` = true storage flush per commit (survives power loss); `data` = OS-cache-level sync (PostgreSQL's default class, several times faster) |
 | `OXIDB_SQL_DISK_FIRST` | off | Keep table data on disk (mmap'd last-checkpoint snapshot) with only post-checkpoint changes in RAM, instead of holding every row resident. Same on-disk format either way — a database can be reopened in either mode. Indexes and the PRIMARY KEY map stay in RAM. |
 | `OXIDB_SQL_CHECKPOINT_BYTES` | 64 MiB | Auto-checkpoint when the live WAL exceeds this many bytes: folds the WAL into per-table `.rdat` snapshots and truncates it (bounds restart replay time, and bounds the RAM overlay in disk-first mode). `0` disables auto-checkpointing. |
-| `OXIDB_SQL_REPLAY_FOLD_OPS` | 50 000 | Row operations replayed between folds when opening a disk-first database — which is what sets the open-time memory peak, since a replayed record stays in RAM until a fold moves it to disk. The trade against open time is linear (see [the memory benchmark](pg-memory-benchmark.md)): lower it on a memory-constrained host, raise it for the fastest possible open. `0` never folds mid-replay. |
+| `OXIDB_SQL_REPLAY_FOLD_OPS` | `rows / 24`, at least 50 000 | Row operations replayed between folds when opening a disk-first database — which is what sets the open-time memory peak, since a replayed record stays in RAM until a fold moves it to disk. Derived from the database's own row count by default, because both sides of the trade are per-row: a fixed interval holds the peak to 1.7× the steady state at 1.2M rows but spends 9 extra seconds reaching 1.3× at 9.6M, where the transient is already small next to what the database costs to run. Set this to override; `0` never folds mid-replay (fastest open, largest peak). See [the memory benchmark](pg-memory-benchmark.md). |
 
 At 1M rows (4 columns, PK), disk-first cuts resident memory roughly in half
 (272 → 143 MB) and opens faster; full scans pay a decode cost (11 → 43 ms).
@@ -49,9 +49,20 @@ Two things the engine deliberately does *not* do when it opens a database:
   moves them into the mmap'd snapshot — so without this a restart inherited the
   previous process's pending WAL as resident memory and held it until the next
   write. Measured at 1M rows, a 55 MB tail cost 60 MB of overlay. The replay
-  therefore folds every 50k row operations, which is what bounds the open-time
-  peak: it is a straight line in pending operations, so the interval *is* the
-  peak (~55 MB plus ~370 bytes an operation, measured over a 1.2M-row database).
+  therefore folds periodically, which is what bounds the open-time peak: it is a
+  straight line in pending operations (~370 bytes each), so the fold interval
+  *is* the peak. Because the steady state is per-row too, that interval scales
+  with the row count rather than being fixed, which holds the peak near 1.65× the
+  steady state at any size.
+
+The steady state used to be unbounded too — about 33 bytes a row, essentially all
+of it the `.rdat` row-offset index, so 100M rows would have cost ~3.1 GB of
+anonymous memory. That index is now **sparse**: one entry per 32 records, with a
+walk of record headers to reach a specific row, which is 0.69 bytes a row (~69 MB
+at 100M). Sequential readers use a cursor and never walk, so scans are unaffected.
+Disk-first mode now holds no per-row structure at all — rows, secondary indexes,
+primary keys, `UNIQUE` columns and the row index are all mapped files. Measured in
+[the memory benchmark](pg-memory-benchmark.md).
 
 A checkpoint **reuses the files of any table that has not changed** since the
 generation it is based on, hard-linking them into the new generation instead of

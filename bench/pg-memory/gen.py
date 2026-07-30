@@ -66,7 +66,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=500, help="rows per INSERT")
     ap.add_argument("--out", default="-")
+    # Everything above is sized for ~1.2M rows, which is where the memory work
+    # was measured. Some costs in the engine are bounded (the open-time peak is
+    # bounded by the fold interval) and some are per-row (the row-offset index),
+    # and the two are only told apart by changing the row count.
+    ap.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="multiply every table's row count (1.0 = the ~1.2M-row default)",
+    )
     args = ap.parse_args()
+    global CUSTOMERS, PRODUCTS, ORDERS, ORDER_ITEMS
+    CUSTOMERS = int(CUSTOMERS * args.scale)
+    PRODUCTS = int(PRODUCTS * args.scale)
+    ORDERS = int(ORDERS * args.scale)
+    # Kept a multiple of 3: three lines per order, which is what makes the
+    # composite key a real one.
+    ORDER_ITEMS = int(ORDER_ITEMS * args.scale) // 3 * 3
     out = open(args.out, "w") if args.out != "-" else __import__("sys").stdout
 
     rng = random.Random(20260728)

@@ -68,14 +68,15 @@ pub struct SqlOptions {
     /// (also how a deadlock resolves). Env: `OXIDB_SQL_LOCK_TIMEOUT_MS`.
     pub lock_timeout_ms: u64,
     /// Row operations replayed between folds when opening a disk-first
-    /// database. Bounds how much of a WAL tail is ever materialized at once.
+    /// database, or `None` to derive it from the database's own size (see
+    /// [`auto_fold_ops`]). Bounds how much of a WAL tail is ever materialized at
+    /// once, which is what sets the open-time memory peak.
     ///
-    /// Small enough that a large tail cannot dominate the process, large enough
-    /// that an ordinary restart folds once or not at all — a fold rewrites
-    /// every table, so a tiny value turns recovery into repeated full rewrites.
-    /// Exposed mainly so tests can reach the mid-replay path without writing
-    /// hundreds of thousands of rows.
-    pub replay_fold_ops: usize,
+    /// `Some(usize::MAX)` never folds mid-replay: the fastest open and the
+    /// largest peak. Set explicitly by `OXIDB_SQL_REPLAY_FOLD_OPS`, and by tests
+    /// that need to reach the mid-replay path without writing hundreds of
+    /// thousands of rows.
+    pub replay_fold_ops: Option<usize>,
 }
 
 impl Default for SqlOptions {
@@ -84,7 +85,7 @@ impl Default for SqlOptions {
             disk_first: false,
             checkpoint_bytes: 64 << 20, // 64 MiB
             lock_timeout_ms: 5_000,
-            replay_fold_ops: REPLAY_FOLD_OPS,
+            replay_fold_ops: None,
         }
     }
 }
@@ -114,10 +115,10 @@ impl SqlOptions {
         if let Ok(v) = std::env::var("OXIDB_SQL_REPLAY_FOLD_OPS")
             && let Ok(n) = v.trim().parse::<usize>()
         {
-            opts.replay_fold_ops = match n {
+            opts.replay_fold_ops = Some(match n {
                 0 => usize::MAX,
                 n => n,
-            };
+            });
         }
         opts
     }
@@ -980,32 +981,43 @@ thread_local! {
 /// inlined into SQL, which shouldn't be cached anyway).
 const STMT_CACHE_CAP: usize = 512;
 
-/// Row operations replayed between folds when opening a disk-first database.
+/// Smallest sensible fold interval, for a database too small for the size-
+/// derived one to mean anything.
+const MIN_REPLAY_FOLD_OPS: usize = 50_000;
+
+/// One twenty-fourth of the row count, which is the interval that holds the
+/// open-time peak at about 1.65× the steady state — see [`auto_fold_ops`].
+const REPLAY_FOLD_ROW_DIVISOR: usize = 24;
+
+/// How many row operations to replay between folds, for a database holding
+/// `rows` rows.
 ///
-/// Bounds how much of a WAL tail is ever materialized at once, which is what
-/// sets the open-time memory peak: replaying a record puts a row in the overlay
-/// and entries in the in-memory index maps, and only a fold moves them to disk.
-/// Measured on a 1.2M-row, 5-table database, the peak is a straight line —
-/// about 55 MB fixed plus ~370 bytes per pending row operation — so this
-/// constant *is* the peak, in the only units the engine can count cheaply.
-///
-/// The value is the measured knee of the trade against open time (204 MB tail):
+/// Folding bounds how much of a WAL tail is materialized at once, which is what
+/// sets the open-time memory peak: a replayed record becomes an overlay row plus
+/// in-memory index entries, and only a fold moves them to disk. Both sides of
+/// the trade are linear in the same unit — the transient costs ~370 bytes per
+/// pending row operation, the steady state ~33 bytes per row — so a *fixed*
+/// interval means a different ratio at every scale, and gets one of them wrong:
 ///
 /// ```text
-///   fold every   open time   peak
-///       25_000      10.2 s   59 MB
-///       50_000       6.1 s   63 MB
-///      100_000       4.5 s   78 MB
-///      200_000       3.5 s  121 MB
+///                    fold every 50k          fold every rows/24
+///   1.2M rows    6.1 s   63 MB  = 1.67×    (same: 50k is the floor)
+///   9.6M rows   13.0 s  387 MB  = 1.29×      3.9 s  494 MB = 1.65×
 /// ```
 ///
-/// It was 200_000, when a fold rewrote every table whether or not it had
-/// changed and walked each table once per index: folding this often then cost
-/// 23 s, so the peak had to be traded away instead. Reusing untouched tables'
-/// files made a fold proportional to what changed, which bought this row of the
-/// table outright — the default is now both faster and less than half the peak
-/// of what it replaced (8.0 s / 129 MB).
-const REPLAY_FOLD_OPS: usize = 50_000;
+/// At 1.2M rows a fixed 50 000 is right: it halves a 3.2× margin for 2.6 s. At
+/// 9.6M it spends 9 seconds to shave 46 MB off a 300 MB steady state, which no
+/// operator wants — the transient is already a modest fraction of what the
+/// database costs to run. Scaling the interval with the row count fixes the
+/// *ratio* instead, so restarting costs about 1.65× running at any size, and the
+/// cost of folding stays proportional to what folding protects.
+///
+/// The interval only bites while it is below the tail's own length, and the tail
+/// is bounded by `checkpoint_bytes` — so a large database naturally folds once
+/// or not at all, which is what makes its open fast.
+fn auto_fold_ops(rows: usize) -> usize {
+    (rows / REPLAY_FOLD_ROW_DIVISOR).max(MIN_REPLAY_FOLD_OPS)
+}
 
 /// Longest statement text worth caching.
 ///
@@ -1201,6 +1213,14 @@ impl SqlEngine {
         // whatever happens, so a fold would cost IO and save nothing. Records
         // are consumed rather than borrowed, freeing each as it is applied.
         let fold_during_replay = opts.disk_first && opts.checkpoint_bytes > 0;
+        // Derived from the rows already loaded from the snapshots, which is the
+        // database's size as of the last checkpoint — the tail about to be
+        // replayed is bounded by `checkpoint_bytes` and so cannot move this
+        // materially.
+        let fold_every = opts.replay_fold_ops.unwrap_or_else(|| {
+            let inner = engine.inner.lock().unwrap();
+            auto_fold_ops(inner.tables.values().map(|t| t.rows.len()).sum())
+        });
         {
             let mut inner = engine.inner.lock().unwrap();
             let mut since_fold = 0usize;
@@ -1216,7 +1236,7 @@ impl SqlEngine {
                     catalog, tables, ..
                 } = &mut *inner;
                 Self::apply_live(catalog, tables, &rec, opts.disk_first);
-                if fold_during_replay && since_fold >= opts.replay_fold_ops {
+                if fold_during_replay && since_fold >= fold_every {
                     // Best-effort: a fold that fails leaves the overlay larger
                     // than intended, which is the old behaviour, not a
                     // correctness problem.
@@ -4116,9 +4136,31 @@ mod replay_fold_tests {
         SqlOptions {
             disk_first: true,
             // Small enough that a handful of rows crosses it.
-            replay_fold_ops: fold_every,
+            replay_fold_ops: Some(fold_every),
             ..SqlOptions::default()
         }
+    }
+
+    /// The interval scales with the database, because both sides of the trade it
+    /// makes are per-row. A fixed value gets one scale wrong: measured, 50 000
+    /// holds the peak to 1.67× the steady state at 1.2M rows but spends 9 extra
+    /// seconds to reach 1.29× at 9.6M, where the transient was already a small
+    /// fraction of what the database costs to run.
+    #[test]
+    fn the_fold_interval_is_proportional_above_the_floor() {
+        // Small databases sit on the floor — a proportional interval would be
+        // meaninglessly small, and folding is nearly free at that size anyway.
+        assert_eq!(auto_fold_ops(0), MIN_REPLAY_FOLD_OPS);
+        assert_eq!(auto_fold_ops(1_000), MIN_REPLAY_FOLD_OPS);
+        assert_eq!(auto_fold_ops(1_200_000), MIN_REPLAY_FOLD_OPS);
+
+        // Above it, proportional — and the ratio it targets holds at any scale.
+        assert_eq!(auto_fold_ops(9_600_000), 400_000);
+        assert_eq!(auto_fold_ops(96_000_000), 4_000_000);
+        assert!(
+            auto_fold_ops(50_000_000) > auto_fold_ops(10_000_000),
+            "a bigger database must tolerate a bigger interval, not the same one"
+        );
     }
 
     fn rows_of(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
@@ -4223,7 +4265,7 @@ mod replay_fold_tests {
             dir.path(),
             SqlOptions {
                 disk_first: false,
-                replay_fold_ops: 5,
+                replay_fold_ops: Some(5),
                 ..SqlOptions::default()
             },
         )

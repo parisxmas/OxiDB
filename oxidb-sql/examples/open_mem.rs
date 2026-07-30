@@ -82,7 +82,7 @@ fn main() {
     if let Ok(v) = std::env::var("FOLD_OPS")
         && let Ok(n) = v.parse::<usize>()
     {
-        opts.replay_fold_ops = n;
+        opts.replay_fold_ops = Some(n);
     }
     let t = std::time::Instant::now();
     let db = oxidb_sql::SqlEngine::open_with_options(&dir, opts).expect("open");
@@ -94,8 +94,38 @@ fn main() {
         .execute("SELECT count(*) FROM orders")
         .map(|r| format!("{r:?}").len())
         .unwrap_or(0);
-    report("after one query");
-    println!("  (query result size {n}, keeps the engine alive)");
+    report("after a scan");
+
+    // A secondary index, which is the one cost that behaves completely
+    // differently between the two modes: disk-first opens a `.sidx` and reads it
+    // in place, while resident mode has no such file to use and builds the index
+    // into RAM on first use. So this line is where resident mode grows and
+    // disk-first mode does not.
+    let m = db
+        .execute("SELECT count(*) FROM orders WHERE customer_id = 42")
+        .map(|r| format!("{r:?}").len())
+        .unwrap_or(0);
+    report("after an indexed lookup");
+    println!("  (result sizes {n}/{m}, which keep the engine alive)");
+
+    // Read timings, because the sparse row-offset index trades memory for a
+    // bounded walk on lookup-by-id: a scan must be unaffected (it reads records
+    // in order, through a cursor) and a point lookup must not become slow.
+    let t = std::time::Instant::now();
+    db.execute("SELECT sum(total) FROM orders").expect("scan");
+    let scan_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let probes = 5_000;
+    let t = std::time::Instant::now();
+    for i in 0..probes {
+        db.execute(&format!(
+            "SELECT total FROM orders WHERE id = {}",
+            i * 7 + 1
+        ))
+        .expect("point lookup");
+    }
+    let per_probe_us = t.elapsed().as_secs_f64() * 1e6 / probes as f64;
+    println!("  full scan {scan_ms:.0} ms   point lookup by PK {per_probe_us:.1} µs");
 
     drop(db);
     report("after drop");

@@ -338,6 +338,95 @@ One step, not the 1.9× the peak figure suggests. Both numbers are real and they
 answer different questions: the peak is what the process transiently needs, the
 limit sweep is what it survives.
 
+### Does it hold at 10M rows? Two answers, and only one is comfortable
+
+Everything above is 1.2M rows. `gen.py --scale 8` gives the same schema at 9.6M
+(1.6M customers, 3.2M orders, 2.4M order items, 2M inventory, 400k products),
+loaded the same way, which separates the costs that are bounded from the ones
+that are per-row.
+
+**The open transient is bounded, and stays bounded.** It is set by how much of
+the WAL tail is materialized at once, and the tail is itself bounded by
+`checkpoint_bytes` — so it does not grow with the table. At 9.6M rows the
+default settings left a 56 MB tail, and the peak sat 189 MB above the steady
+state, in the same range as at 1.2M. That is the part this work fixed, and it
+scales.
+
+**The steady state is not bounded at all.** Live bytes after opening:
+
+| Rows | Steady state |
+|---:|---:|
+| 1.2M | 37.5 MB |
+| 9.6M | 300.0 MB |
+
+That is **32.8 bytes per row with no meaningful fixed part** — the fit passes
+through the origin. Extrapolating: 10M rows ≈ 310 MB, 50M ≈ 1.5 GB, 100M ≈
+3.1 GB, all of it anonymous and none of it evictable. Almost all of it is the
+`.rdat` row-offset index, `Vec<(u64, u64, u32)>` = 24 bytes per row, built at
+open for every table.
+
+So the honest answer to "is there an OOM risk past 10M rows" was **yes, and it is
+not the open peak** — a per-row resident cost that a mode called *disk-first*
+should not have, survivable at 10M (310 MB) and decisive at 100M (3.1 GB), where
+the data is on disk and the index to it is not.
+
+### Making the row index sparse
+
+The records are fixed-header and laid out in ascending row-id order, so the file
+is already its own index: one entry per 32 records is enough, and reaching a
+specific record from there is a walk of 16-byte headers. No format change — the
+`.rdat` layout already supported this; only what is built at open changed.
+
+The catch is that the scan path reads records **positionally and sequentially**.
+Asking a sparse index for "record *i*" would re-walk its block every row and make
+a scan quadratic in the block size, so sequential readers now take a
+`SnapshotCursor` that carries its own byte offset and advances in constant time.
+Only lookup-by-id walks.
+
+| | 1.2M before | after | 9.6M before | after |
+|---|---:|---:|---:|---:|
+| steady state | 37.5 MB | **0.8 MB** | 300.0 MB | **6.3 MB** |
+| open peak | 62.5 MB | 37.1 MB | 489.3 MB | 137.0 MB |
+| open time | 6101 ms | 6119 ms | 3954 ms | 3963 ms |
+| full scan | 16 ms | 17 ms | 132 ms | 135 ms |
+| point lookup by PK | 6.8 µs | 7.0 µs | 7.2 µs | 7.3 µs |
+
+**32.8 bytes per row became 0.69** — 47× less, for about 2% on reads and nothing
+on open time. 100M rows now costs ~69 MB where it would have cost ~3.1 GB, and
+disk-first mode holds no per-row structure of any kind: rows, secondary indexes,
+primary keys, `UNIQUE` columns and now the row index are all files.
+
+Two notes on how the size was chosen and what it cost. A sweep at 9.6M showed the
+walk barely registers (7.1 µs at 16 records per block, 7.4 µs at 128) while memory
+falls 8×, which makes big blocks look free — but that run has the file in page
+cache, and a walk skips over payloads, so a 128-record block spans ~14 KB: four
+pages faulted to read one row against one page at 32. Every size already turns
+gigabytes into megabytes, so the remaining megabytes were not worth buying with
+page faults this benchmark cannot charge for. And the dense index used to sort
+itself defensively at open; a sparse one cannot, since it does not hold the rows,
+so ascending order is now an enforced invariant and a file violating it fails to
+open rather than answering lookups wrongly for the rest of its life.
+
+### The fold interval has to scale too
+
+Measuring at 9.6M caught a default this work had just got wrong. The trade
+folding makes is between a transient that costs ~370 bytes per pending row
+operation and a steady state that costs ~33 bytes per row — both linear in the
+same unit, so a *fixed* interval means a different ratio at every scale:
+
+| | fold every 50k | fold every `rows/24` |
+|---|---|---|
+| 1.2M rows | 6.1 s, 63 MB (1.67× steady) | same — 50k is the floor |
+| 9.6M rows | 13.0 s, 387 MB (1.29×) | **4.0 s, 489 MB (1.63×)** |
+
+At 1.2M, 50 000 is right: it halves a 3.2× margin for 2.6 seconds. At 9.6M the
+same value spends 9 extra seconds to shave 46 MB off a 300 MB steady state,
+which is not a trade any operator asked for. Scaling the interval with the row
+count fixes the *ratio* instead — restarting costs about 1.65× running at either
+size — and it means a large database folds once or not at all, because the
+interval only bites while it is shorter than the tail. `OXIDB_SQL_REPLAY_FOLD_OPS`
+still overrides it.
+
 Reuse is the kind of optimization that loses data quietly, so it is deliberately
 conservative — a table qualifies only if its row store *is* its base snapshot
 (derived from the store, not tracked as a dirty flag that a new write path could

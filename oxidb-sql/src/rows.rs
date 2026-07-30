@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use crate::storage::MappedSnapshot;
+use crate::storage::{MappedSnapshot, SnapshotCursor};
 use crate::types::Value;
 
 enum RowMode {
@@ -397,8 +397,7 @@ impl RowStore {
                 Box::new(m.iter().map(|(id, c)| (*id, Cow::Borrowed(c.as_slice()))))
             }
             RowMode::DiskFirst(d) => Box::new(MergeIter {
-                base: d.base.as_ref(),
-                base_pos: 0,
+                base: d.base.as_ref().map(|b| b.cursor()),
                 overlay: d.overlay.iter().peekable(),
             }),
         }
@@ -509,14 +508,13 @@ impl RowStore {
             }
             RowMode::DiskFirst(d) => {
                 let mut buf: Vec<Value> = Vec::new();
-                let mut base_pos = 0usize;
+                // A cursor rather than a position: the base is read strictly in
+                // order here, and its index is sparse, so asking for record `i`
+                // would re-walk the block holding it on every row.
+                let mut base = d.base.as_ref().map(|b| b.cursor());
                 let mut overlay = d.overlay.iter().peekable();
                 loop {
-                    let base_id = d
-                        .base
-                        .as_ref()
-                        .filter(|b| base_pos < b.len())
-                        .map(|b| b.row_id_at(base_pos));
+                    let base_id = base.as_ref().and_then(|c| c.row_id());
                     let over_id = overlay.peek().map(|(id, _)| **id);
                     let take_base = match (base_id, over_id) {
                         (None, None) => break,
@@ -526,10 +524,10 @@ impl RowStore {
                         (Some(b), Some(o)) => b < o,
                     };
                     if take_base {
-                        let b = d.base.as_ref().expect("base id implies a base");
-                        b.decode_at_into(base_pos, &mut buf);
-                        let id = b.row_id_at(base_pos);
-                        base_pos += 1;
+                        let cur = base.as_mut().expect("a base id implies a cursor");
+                        cur.decode_into(&mut buf);
+                        let id = base_id.expect("checked above");
+                        cur.advance();
                         if !f(id, &buf)? {
                             break;
                         }
@@ -538,7 +536,7 @@ impl RowStore {
                         // A tombstone, or an upsert shadowing the base row of
                         // the same id — skip the base copy either way.
                         if base_id == Some(*id) {
-                            base_pos += 1;
+                            base.as_mut().expect("a base id implies a cursor").advance();
                         }
                         match change {
                             Some(cells) => {
@@ -563,9 +561,11 @@ impl RowStore {
 
 /// Ordered merge of the mmap'd base snapshot with the RAM overlay. On an id
 /// collision the overlay wins (upsert shadows, tombstone hides).
+///
+/// The base side is a [`SnapshotCursor`] for the same reason the push walk uses
+/// one: it reads records in order, and the snapshot's index is sparse.
 struct MergeIter<'a> {
-    base: Option<&'a MappedSnapshot>,
-    base_pos: usize,
+    base: Option<SnapshotCursor<'a>>,
     overlay: std::iter::Peekable<std::collections::btree_map::Iter<'a, u64, Option<Vec<Value>>>>,
 }
 
@@ -574,19 +574,16 @@ impl<'a> Iterator for MergeIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let base_id = self
-                .base
-                .filter(|b| self.base_pos < b.len())
-                .map(|b| b.row_id_at(self.base_pos));
+            let base_id = self.base.as_ref().and_then(|c| c.row_id());
             let over_id = self.overlay.peek().map(|(id, _)| **id);
 
             match (base_id, over_id) {
                 (None, None) => return None,
                 (Some(bid), None) => {
-                    let b = self.base.unwrap();
-                    let i = self.base_pos;
-                    self.base_pos += 1;
-                    return Some((bid, Cow::Owned(b.decode_at(i))));
+                    let cur = self.base.as_mut().expect("a base id implies a cursor");
+                    let row = cur.decode();
+                    cur.advance();
+                    return Some((bid, Cow::Owned(row)));
                 }
                 (None, Some(_)) => {
                     let (id, change) = self.overlay.next().unwrap();
@@ -597,13 +594,17 @@ impl<'a> Iterator for MergeIter<'a> {
                 }
                 (Some(bid), Some(oid)) => {
                     if bid < oid {
-                        let b = self.base.unwrap();
-                        let i = self.base_pos;
-                        self.base_pos += 1;
-                        return Some((bid, Cow::Owned(b.decode_at(i))));
+                        let cur = self.base.as_mut().expect("a base id implies a cursor");
+                        let row = cur.decode();
+                        cur.advance();
+                        return Some((bid, Cow::Owned(row)));
                     }
                     if bid == oid {
-                        self.base_pos += 1; // overlay shadows the base row
+                        // The overlay shadows the base row.
+                        self.base
+                            .as_mut()
+                            .expect("a base id implies a cursor")
+                            .advance();
                     }
                     let (id, change) = self.overlay.next().unwrap();
                     match change {
