@@ -3824,10 +3824,14 @@ fn semi_join_scan<S: Store>(
     let pushed = where_filter.and_then(|f| pushdown_filter(Some(f), full, params));
     let mut cells = Vec::new();
     let mut n = 0usize;
+    let simple = pushed.as_ref().and_then(SimpleFilter::build);
     store.scan_visit_cols(&join.table.name, keep, &mut |row| {
-        if let Some(f) = &pushed
-            && !truthy(&eval_scalar(f, full, row, params)?)
-        {
+        let keep_row = match (&simple, &pushed) {
+            (Some(s), _) => s.passes(row)?,
+            (None, Some(f)) => truthy(&eval_scalar(f, full, row, params)?),
+            (None, None) => true,
+        };
+        if !keep_row {
             return Ok(true);
         }
         let Value::Int(k) = eval_scalar(&right_key, full, row, params)? else {
@@ -4823,6 +4827,120 @@ fn hash_value_ref(v: &ValueRef<'_>, h: &mut FxHasher) {
     }
 }
 
+/// A filter reduced to the decisions that do not change from row to row.
+///
+/// `eval_scalar` re-derives the shape of a comparison for **every row**: try both
+/// operands as borrowed strings, then as borrowed values, then dispatch on the
+/// operator. Measured over 400k rows, each `AND`ed term of a filter costs about
+/// 12.8 ns — against roughly 1 ns for PostgreSQL, and against the ~1 ns the
+/// actual `f64` comparison takes. Almost all of it is re-deciding what to do.
+///
+/// So the deciding happens once, here, and what is left per row is a column
+/// index, an operator and a value. This covers the dominant shape — a conjunction
+/// of `column <cmp> literal` — and declines everything else, in which case the
+/// caller keeps using `eval_scalar` and nothing changes.
+///
+/// Deliberately *not* a general expression compiler: one was built for this
+/// engine and reverted as net-negative (`4398402e`, `e7d0da69`), because a
+/// bytecode interpreter's dispatch loop costs more than Rust's inlined recursive
+/// match on a small tree. This removes work rather than relocating it.
+struct SimpleFilter {
+    /// `(column, operator, value)`, all of which must hold for the row to pass.
+    terms: Vec<(usize, BinOp, Value)>,
+}
+
+impl SimpleFilter {
+    /// Reduce `e` if every conjunct is `column <cmp> literal` (either way round).
+    fn build(e: &Expr) -> Option<SimpleFilter> {
+        let mut terms = Vec::new();
+        SimpleFilter::flatten(e, &mut terms).then_some(SimpleFilter { terms })
+    }
+
+    fn flatten(e: &Expr, out: &mut Vec<(usize, BinOp, Value)>) -> bool {
+        match e {
+            Expr::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => SimpleFilter::flatten(left, out) && SimpleFilter::flatten(right, out),
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Col(i), Expr::Literal(v)) => {
+                        out.push((*i, *op, v.clone()));
+                        true
+                    }
+                    // Mirrored: `5 < x` is `x > 5`. The operator has to flip with
+                    // the operands or the comparison is backwards.
+                    (Expr::Literal(v), Expr::Col(i)) => {
+                        let flipped = match op {
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Le => BinOp::Ge,
+                            BinOp::Ge => BinOp::Le,
+                            other => *other, // Eq / Ne are symmetric
+                        };
+                        out.push((*i, flipped, v.clone()));
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `true` when the row passes every term.
+    ///
+    /// Must answer exactly what `truthy(eval_scalar(...))` answers, including the
+    /// parts that are easy to get subtly wrong: a NULL on either side makes the
+    /// comparison NULL, which is not TRUE and so filters the row out; and two
+    /// values that cannot be compared at all are an **error** there, so they are
+    /// an error here too rather than a quietly dropped row.
+    /// `simple_filter_agrees_with_eval_scalar` checks the two against each other.
+    #[inline]
+    fn passes(&self, row: &[Value]) -> Result<bool> {
+        // Three-valued, and the distinction matters for more than the answer.
+        // `AND` short-circuits only on a definite FALSE — `NULL AND FALSE` is
+        // FALSE, so a NULL term cannot decide anything and evaluation continues.
+        // Stopping early on NULL would skip a later term that *errors*, turning a
+        // query that fails into one that quietly returns rows. The differential
+        // test against `eval_scalar` caught exactly that on its first run.
+        let mut unknown = false;
+        for (col, op, want) in &self.terms {
+            let Some(cell) = row.get(*col) else {
+                return Err(SqlError::Eval(format!("bound column {col} out of range")));
+            };
+            if matches!(cell, Value::Null) || matches!(want, Value::Null) {
+                unknown = true;
+                continue;
+            }
+            let Some(ord) = cmp_values(cell, want) else {
+                return Err(SqlError::Eval(format!(
+                    "cannot compare {cell:?} and {want:?}"
+                )));
+            };
+            let ok = match op {
+                BinOp::Eq => ord == Ordering::Equal,
+                BinOp::Ne => ord != Ordering::Equal,
+                BinOp::Lt => ord == Ordering::Less,
+                BinOp::Le => ord != Ordering::Greater,
+                BinOp::Gt => ord == Ordering::Greater,
+                BinOp::Ge => ord != Ordering::Less,
+                _ => unreachable!("build only admits comparison operators"),
+            };
+            if !ok {
+                return Ok(false); // a definite FALSE decides, and stops here
+            }
+        }
+        Ok(!unknown)
+    }
+}
+
 fn hash_value(v: &Value, h: &mut FxHasher) {
     match v {
         Value::Null => h.write_u8(0),
@@ -5151,11 +5269,21 @@ fn streamed_aggregate<S: Store>(
     // plain-column group key is read from. They are the same slice on the owned
     // path, and on the borrowed path `row` holds just the cells evaluation needs
     // while `keys` borrows the rest from storage.
+    let simple = filter.as_ref().and_then(SimpleFilter::build);
     let mut fold_row = |row: &[Value], keys: &dyn KeyCells| -> Result<()> {
-        if let Some(f) = &filter
-            && !truthy(&eval_scalar(f, &full, row, params)?)
-        {
-            return Ok(());
+        match (&simple, &filter) {
+            // The same predicate with the per-row decisions already made.
+            (Some(s), _) => {
+                if !s.passes(row)? {
+                    return Ok(());
+                }
+            }
+            (None, Some(f)) => {
+                if !truthy(&eval_scalar(f, &full, row, params)?) {
+                    return Ok(());
+                }
+            }
+            (None, None) => {}
         }
         let at = if group.is_empty() {
             0
@@ -5496,10 +5624,14 @@ fn streamed_chunk<S: Store>(
         let mut best: Vec<(Vec<Value>, usize, Vec<Value>)> = Vec::with_capacity(k.min(64) + 1);
         let mut kbuf: Vec<Value> = Vec::with_capacity(keys.len());
         let mut seq = 0usize;
+        let simple = filter.as_ref().and_then(SimpleFilter::build);
         store.scan_visit_cols(&from.name, keep, &mut |row| {
-            if let Some(f) = &filter
-                && !truthy(&eval_scalar(f, full, row, params)?)
-            {
+            let keep_row = match (&simple, &filter) {
+                (Some(s), _) => s.passes(row)?,
+                (None, Some(f)) => truthy(&eval_scalar(f, full, row, params)?),
+                (None, None) => true,
+            };
+            if !keep_row {
                 return Ok(true);
             }
             let i = seq;
@@ -5563,13 +5695,18 @@ fn filtered_scan<S: Store>(
 ) -> Result<Chunk> {
     let mut cells = Vec::new();
     let mut n = 0usize;
+    // The predicate's per-row decisions are made once where its shape allows it.
+    let simple = filter.and_then(SimpleFilter::build);
     // Only the columns this statement reads are decoded. `keep` comes from
     // `collect_needed`, which walks the filter as well as the projection, so the
     // predicate evaluated below can never want a column that was skipped.
     store.scan_visit_cols(table, keep, &mut |row| {
-        if let Some(f) = filter
-            && !truthy(&eval_scalar(f, full, row, params)?)
-        {
+        let keep_row = match (&simple, filter) {
+            (Some(s), _) => s.passes(row)?,
+            (None, Some(f)) => truthy(&eval_scalar(f, full, row, params)?),
+            (None, None) => true,
+        };
+        if !keep_row {
             return Ok(true);
         }
         for &c in keep {
@@ -8495,6 +8632,195 @@ mod borrowed_key_tests {
                 &mut out
             ),
             "an unbound column reference must not report success"
+        );
+    }
+}
+
+#[cfg(test)]
+mod simple_filter_tests {
+    //! `SimpleFilter` is a second implementation of something `eval_scalar`
+    //! already does, which is the most dangerous kind of optimization: it is only
+    //! correct while it answers *exactly* what the general path answers, for
+    //! every pairing of values and operators — including the ones nobody thinks
+    //! about, like comparing a number to a string, or anything to NULL.
+    //!
+    //! So it is checked against `eval_scalar` directly, over the cross product.
+    use super::*;
+
+    fn values() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Double(0.0),
+            Value::Double(1.0),
+            Value::Double(-0.5),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Text("".into()),
+            Value::Text("a".into()),
+            Value::Text("b".into()),
+            Value::Timestamp(0),
+            Value::Timestamp(5),
+        ]
+    }
+
+    const OPS: &[BinOp] = &[
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+    ];
+
+    /// What the general path decides for this row and predicate: `Ok(true)` /
+    /// `Ok(false)` / an error. Errors are compared as "is an error", since the
+    /// messages are not required to match.
+    fn general(e: &Expr, row: &[Value]) -> std::result::Result<bool, ()> {
+        let schema = [
+            ColRef {
+                table: String::new(),
+                name: "c0".into(),
+                ty: None,
+            },
+            ColRef {
+                table: String::new(),
+                name: "c1".into(),
+                ty: None,
+            },
+        ];
+        match eval_scalar(e, &schema, row, &[]) {
+            Ok(v) => Ok(truthy(&v)),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn simple(e: &Expr, row: &[Value]) -> std::result::Result<bool, ()> {
+        match SimpleFilter::build(e)
+            .expect("shape should reduce")
+            .passes(row)
+        {
+            Ok(b) => Ok(b),
+            Err(_) => Err(()),
+        }
+    }
+
+    #[test]
+    fn simple_filter_agrees_with_eval_scalar() {
+        for cell in values() {
+            for lit in values() {
+                for op in OPS {
+                    let row = vec![cell.clone(), Value::Int(7)];
+                    // `column op literal`
+                    let e = Expr::Binary {
+                        op: *op,
+                        left: Box::new(Expr::Col(0)),
+                        right: Box::new(Expr::Literal(lit.clone())),
+                    };
+                    assert_eq!(
+                        simple(&e, &row),
+                        general(&e, &row),
+                        "disagreement: {cell:?} {op:?} {lit:?}"
+                    );
+
+                    // `literal op column` — the operator must flip with the
+                    // operands, which is easy to get backwards.
+                    let e = Expr::Binary {
+                        op: *op,
+                        left: Box::new(Expr::Literal(lit.clone())),
+                        right: Box::new(Expr::Col(0)),
+                    };
+                    assert_eq!(
+                        simple(&e, &row),
+                        general(&e, &row),
+                        "disagreement (mirrored): {lit:?} {op:?} {cell:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Conjunctions, including one where an earlier term is false and a later one
+    /// would error — the two paths must agree on whether the error is reached.
+    #[test]
+    fn conjunctions_agree_including_short_circuit() {
+        for a in values() {
+            for b in values() {
+                let row = vec![a.clone(), b.clone()];
+                let e = Expr::Binary {
+                    op: BinOp::And,
+                    left: Box::new(Expr::Binary {
+                        op: BinOp::Gt,
+                        left: Box::new(Expr::Col(0)),
+                        right: Box::new(Expr::Literal(Value::Int(0))),
+                    }),
+                    right: Box::new(Expr::Binary {
+                        op: BinOp::Lt,
+                        left: Box::new(Expr::Col(1)),
+                        right: Box::new(Expr::Literal(Value::Text("m".into()))),
+                    }),
+                };
+                assert_eq!(
+                    simple(&e, &row),
+                    general(&e, &row),
+                    "conjunction disagreement for {a:?}, {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Shapes it must decline, so the caller keeps the general path rather than
+    /// getting a wrong answer from a reduction that does not apply.
+    #[test]
+    fn declines_shapes_it_cannot_represent() {
+        // column op column
+        assert!(
+            SimpleFilter::build(&Expr::Binary {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Col(0)),
+                right: Box::new(Expr::Col(1)),
+            })
+            .is_none()
+        );
+        // OR is not a conjunction
+        assert!(
+            SimpleFilter::build(&Expr::Binary {
+                op: BinOp::Or,
+                left: Box::new(Expr::Binary {
+                    op: BinOp::Gt,
+                    left: Box::new(Expr::Col(0)),
+                    right: Box::new(Expr::Literal(Value::Int(0))),
+                }),
+                right: Box::new(Expr::Binary {
+                    op: BinOp::Gt,
+                    left: Box::new(Expr::Col(1)),
+                    right: Box::new(Expr::Literal(Value::Int(0))),
+                }),
+            })
+            .is_none()
+        );
+        // arithmetic on the column side
+        assert!(
+            SimpleFilter::build(&Expr::Binary {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(Expr::Col(0)),
+                    right: Box::new(Expr::Literal(Value::Int(1))),
+                }),
+                right: Box::new(Expr::Literal(Value::Int(0))),
+            })
+            .is_none()
+        );
+        // IS NULL is not a comparison
+        assert!(
+            SimpleFilter::build(&Expr::IsNull {
+                expr: Box::new(Expr::Col(0)),
+                negated: false,
+            })
+            .is_none()
         );
     }
 }

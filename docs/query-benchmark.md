@@ -231,6 +231,53 @@ precisely how this engine previously ended up with two paths that grouped
 differently — one comparing with `==` while the other used `total_order`, which
 disagree on `Int(1)` versus `Double(1.0)`.
 
+### The predicate, evaluated once instead of per row
+
+With the decode work done, the remaining gap had a shape worth isolating. Varying
+only the *number of `AND`ed terms* in a filter — same column, so the decoded cells
+are identical and only evaluation changes:
+
+| | OxiDB | PostgreSQL |
+|---|---:|---:|
+| `sum(total)`, no filter | 8.5 ms | 7.0 ms |
+| per extra predicate term | **+5.1 ms** | **+0.35 ms** |
+
+With no predicate at all, disk-first is within 1.2× of PostgreSQL. The entire
+remaining gap on filtered scans was predicate evaluation, at **12.8 ns per term
+per row against PostgreSQL's ~1 ns**. Since comparing two `f64`s is about 1 ns,
+nearly all of it was `eval_scalar` re-deciding *what to do* on every row: try both
+operands as borrowed strings, then as borrowed values, then dispatch the operator
+— a fixed sequence of decisions repeated 400,000 times for an expression that
+never changes.
+
+`SimpleFilter` makes those decisions once. A conjunction of `column <cmp>
+literal` — the dominant filter shape — reduces to a list of `(column index,
+operator, value)`, and anything else is declined so the general path handles it
+unchanged. Per term: **12.8 ns → 2.7 ns**.
+
+| workload | before | after |
+|---|---|---|
+| full scan aggregate | 0.60× | **0.71×** |
+| GROUP BY | 0.63× | **0.75×** |
+| join + filter | 0.46× | **0.49×** |
+| 5-term predicate | 0.26× | **0.62×** |
+
+This is *not* the expression compiler this engine already tried and reverted
+(`4398402e` → `e7d0da69`, "net-negative, wrong lever"). That linearized
+expressions into a bytecode program, and a Rust interpreter's dispatch loop —
+without computed goto — costs more than the inlined recursive match it replaced.
+This removes the per-row work rather than relocating it, and leaves the general
+evaluator in place for everything it does not cover.
+
+A second evaluator is only correct while it agrees with the first, so it is
+checked against `eval_scalar` over every pairing of values and operators. That
+caught a real divergence on its first run: for `c0 > 0 AND c1 < 'm'` with a NULL
+`c0`, the reduction short-circuited on the NULL and returned "no rows", while SQL's
+three-valued `AND` short-circuits only on a definite FALSE — so the general path
+continues to the second term and *errors*. The reduction was quietly answering a
+query that should fail. It now tracks unknown separately from false, and the test
+compares error-reachability rather than only the boolean.
+
 ## What this does not measure
 
 Concurrency (both were driven by one connection), larger datasets, a tuned
