@@ -345,6 +345,22 @@ enum Stage {
         /// Additional field pairs for composite join conditions.
         extra_pairs: Vec<(String, String)>,
     },
+    /// `$graphLookup`: breadth-first traversal over `from`. Starting from
+    /// `start_with`'s value(s), repeatedly find documents whose
+    /// `connect_to_field` matches the frontier, then continue from their
+    /// `connect_from_field` values — until nothing new, or `max_depth`.
+    /// Found documents (deduplicated by `_id`) land in `as_field`;
+    /// `depth_field`, when set, records the round each was found in.
+    GraphLookup {
+        from: String,
+        start_with: Expression,
+        connect_from_field: String,
+        connect_to_field: String,
+        as_field: String,
+        max_depth: Option<u64>,
+        depth_field: Option<String>,
+        restrict: Option<Value>,
+    },
     Out(String),
     /// `$facet`: run several independent sub-pipelines over the **same** input
     /// documents and emit one document whose fields are each sub-pipeline's
@@ -3178,6 +3194,107 @@ fn exec_add_fields(docs: Vec<Value>, fields: &[(String, Expression)]) -> Vec<Val
         .collect()
 }
 
+/// `$graphLookup`: per input document, breadth-first search over `from`.
+///
+/// Each round is ONE `$in` query over the frontier values (plus the
+/// `restrictSearchWithMatch` filter), so an index on `connect_to` serves the
+/// traversal exactly as it would serve `$lookup`. Cycle safety comes from two
+/// sets: connection *values* already expanded (a value is queried once) and
+/// document `_id`s already collected (a document appears in `as` once) —
+/// without the value set a cycle re-queries forever, without the id set a
+/// diamond (A→B→D, A→C→D) emits D twice.
+#[allow(clippy::too_many_arguments)]
+fn exec_graph_lookup<F>(
+    docs: Vec<Value>,
+    from: &str,
+    start_with: &Expression,
+    connect_from: &str,
+    connect_to: &str,
+    as_field: &str,
+    max_depth: Option<u64>,
+    depth_field: Option<&str>,
+    restrict: Option<&Value>,
+    lookup_fn: &F,
+) -> Result<Vec<Value>>
+where
+    F: Fn(&str, &Value) -> Result<Vec<Value>>,
+{
+    use std::collections::BTreeSet;
+    /// Traversal ceiling per input document — a graph bigger than this is a
+    /// runaway, and an error beats an OOM. Narrow with `maxDepth` or
+    /// `restrictSearchWithMatch`.
+    const MAX_FOUND: usize = 100_000;
+
+    let mut out = Vec::with_capacity(docs.len());
+    for mut doc in docs {
+        // Seed the frontier from startWith; an array seeds one value per
+        // element (MongoDB semantics), null seeds nothing.
+        let mut frontier: Vec<Value> = match start_with.eval(&doc) {
+            Value::Array(a) => a,
+            Value::Null => Vec::new(),
+            v => vec![v],
+        };
+        let mut seen_vals: BTreeSet<IndexValue> =
+            frontier.iter().map(IndexValue::from_json).collect();
+        let mut seen_ids: BTreeSet<IndexValue> = BTreeSet::new();
+        let mut found: Vec<Value> = Vec::new();
+        let mut depth: u64 = 0;
+        while !frontier.is_empty() {
+            if let Some(md) = max_depth
+                && depth > md
+            {
+                break;
+            }
+            let base = json!({ connect_to: { "$in": frontier } });
+            let query = match restrict {
+                Some(r) => json!({ "$and": [base, r] }),
+                None => base,
+            };
+            let mut next: Vec<Value> = Vec::new();
+            for m in lookup_fn(from, &query)? {
+                let id_key = IndexValue::from_json(&resolve_field(&m, "_id"));
+                if !seen_ids.insert(id_key) {
+                    continue;
+                }
+                match resolve_field(&m, connect_from) {
+                    Value::Array(a) => {
+                        for v in a {
+                            if seen_vals.insert(IndexValue::from_json(&v)) {
+                                next.push(v);
+                            }
+                        }
+                    }
+                    Value::Null => {}
+                    v => {
+                        if seen_vals.insert(IndexValue::from_json(&v)) {
+                            next.push(v);
+                        }
+                    }
+                }
+                let mut m = m;
+                if let Some(df) = depth_field
+                    && let Value::Object(o) = &mut m
+                {
+                    o.insert(df.to_string(), json!(depth));
+                }
+                found.push(m);
+                if found.len() > MAX_FOUND {
+                    return Err(Error::InvalidPipeline(format!(
+                        "$graphLookup found more than {MAX_FOUND} documents for one input                          document — narrow the traversal with maxDepth or                          restrictSearchWithMatch"
+                    )));
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        if let Value::Object(o) = &mut doc {
+            o.insert(as_field.to_string(), Value::Array(found));
+        }
+        out.push(doc);
+    }
+    Ok(out)
+}
+
 fn exec_lookup<F>(
     docs: Vec<Value>,
     from: &str,
@@ -4790,6 +4907,48 @@ impl Pipeline {
                         extra_pairs,
                     }
                 }
+                "$graphLookup" => {
+                    let obj = stage_body.as_object().ok_or_else(|| {
+                        Error::InvalidPipeline("$graphLookup must be an object".into())
+                    })?;
+                    let req = |key: &str| -> Result<String> {
+                        obj.get(key).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
+                            Error::InvalidPipeline(format!("$graphLookup requires '{key}' string"))
+                        })
+                    };
+                    let start_with = parse_expression(obj.get("startWith").ok_or_else(|| {
+                        Error::InvalidPipeline("$graphLookup requires 'startWith'".into())
+                    })?)?;
+                    let restrict = match obj.get("restrictSearchWithMatch") {
+                        None => None,
+                        Some(r) => {
+                            // Fail now, not on the first traversal round.
+                            crate::query::parse_query(r)?;
+                            Some(r.clone())
+                        }
+                    };
+                    let max_depth = match obj.get("maxDepth") {
+                        None => None,
+                        Some(d) => Some(d.as_u64().ok_or_else(|| {
+                            Error::InvalidPipeline(
+                                "$graphLookup maxDepth must be a non-negative integer".into(),
+                            )
+                        })?),
+                    };
+                    Stage::GraphLookup {
+                        from: req("from")?,
+                        start_with,
+                        connect_from_field: req("connectFromField")?,
+                        connect_to_field: req("connectToField")?,
+                        as_field: req("as")?,
+                        max_depth,
+                        depth_field: obj
+                            .get("depthField")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        restrict,
+                    }
+                }
                 "$out" => {
                     let coll = stage_body.as_str().ok_or_else(|| {
                         Error::InvalidPipeline("$out must be a collection name string".into())
@@ -5014,6 +5173,27 @@ impl Pipeline {
                     foreign_field,
                     as_field,
                     extra_pairs,
+                    lookup_fn,
+                )?,
+                Stage::GraphLookup {
+                    from,
+                    start_with,
+                    connect_from_field,
+                    connect_to_field,
+                    as_field,
+                    max_depth,
+                    depth_field,
+                    restrict,
+                } => exec_graph_lookup(
+                    current,
+                    from,
+                    start_with,
+                    connect_from_field,
+                    connect_to_field,
+                    as_field,
+                    *max_depth,
+                    depth_field.as_deref(),
+                    restrict.as_ref(),
                     lookup_fn,
                 )?,
                 Stage::Out(_) => {
