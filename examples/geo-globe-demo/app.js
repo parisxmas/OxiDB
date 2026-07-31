@@ -452,17 +452,10 @@ const mkEnd = (color) => {
 };
 const endA = mkEnd(0x66bb6a);
 const endB = mkEnd(0xff5252);
-let routeA = null; // {lon, lat} once A is picked
-
 function clearRoute() {
   routeGroup.clear();
   endA.visible = false;
   endB.visible = false;
-  routeA = null;
-  document.getElementById("routeQ").textContent = "click A, then B…";
-  document.getElementById("snapMs").textContent = "–";
-  document.getElementById("routeMs").textContent = "–";
-  document.getElementById("routeStat").textContent = "–";
 }
 
 function drawPolyline(pts, color, dashed = false) {
@@ -490,31 +483,20 @@ function drawPolyline(pts, color, dashed = false) {
   routeGroup.add(line);
 }
 
-async function runRoute(b) {
-  return routeBetween(routeA, b);
-}
-
 async function routeBetween(a, b) {
-  document.getElementById("routeQ").textContent =
-    `$near ×2 → $shortestPath [${a.lon.toFixed(1)},${a.lat.toFixed(1)}] → [${b.lon.toFixed(1)},${b.lat.toFixed(1)}]`;
   // Snap both ends to the road graph with $near (nearest node document).
   const snap = (p) => {
     const q = { loc: { $near: { $geometry: { type: "Point", coordinates: [p.lon, p.lat] }, $maxDistance: 1_000_000 } } };
     const r = JSON.parse(oxidb.find("nodes", JSON.stringify(q)));
     return r.length ? r[0].i : null;
   };
-  let t = performance.now();
   const src = snap(a);
   const dst = snap(b);
-  const snapMs = performance.now() - t;
-  document.getElementById("snapMs").textContent = `${snapMs.toFixed(1)} ms (n${src} → n${dst})`;
   if (src === null || dst === null) {
-    document.getElementById("routeStat").textContent = "no road within 1000 km";
     return { ok: false, msg: "no road within 1000 km" };
   }
   // The whole route is ONE aggregation: match the source node document,
   // then $shortestPath over the edge collection.
-  t = performance.now();
   const pipeline = [
     { $match: { i: src } },
     { $shortestPath: {
@@ -531,17 +513,13 @@ async function routeBetween(a, b) {
     out = JSON.parse(oxidb.aggregate("nodes", JSON.stringify(pipeline)));
   } catch (e) {
     const msg = `error: ${String(e).slice(0, 80)}`;
-    document.getElementById("routeStat").textContent = msg;
     return { ok: false, msg };
   }
-  const routeMs = performance.now() - t;
-  document.getElementById("routeMs").textContent = `${routeMs.toFixed(1)} ms`;
   const doc = out[0] ?? {};
   if (!doc.route || !doc.route.length) {
     // Honest failure: the network is real-world disconnected in places.
     drawPolyline([[a.lon, a.lat], [b.lon, b.lat]], 0x7d8fac, true);
     const msg = doc.totalKm === 0 ? "same node" : "no route (disconnected network)";
-    document.getElementById("routeStat").textContent = msg;
     return { ok: false, msg };
   }
   let ferries = 0;
@@ -555,7 +533,6 @@ async function routeBetween(a, b) {
   const stat =
     `${Math.round(doc.totalKm).toLocaleString()} km · ${doc.route.length} segments` +
     (ferries ? ` · ${ferries} ferry/bridge` : "");
-  document.getElementById("routeStat").textContent = stat;
   return { ok: true, msg: stat };
 }
 
@@ -771,26 +748,8 @@ canvas.addEventListener("pointerup", (e) => {
   const hit = ray.intersectObject(globe, false)[0];
   if (!hit) return;
   const p = toLonLat(hit.point);
-  if (document.getElementById("routemode").checked) {
-    if (!routeA) {
-      clearRoute();
-      routeA = p;
-      endA.position.copy(toXYZ(p.lon, p.lat, R * 1.004));
-      endA.visible = true;
-      document.getElementById("routeQ").textContent = "A set — click B…";
-    } else {
-      endB.position.copy(toXYZ(p.lon, p.lat, R * 1.004));
-      endB.visible = true;
-      runRoute(p).then(() => (routeA = null));
-    }
-    return;
-  }
   picked = p;
   runQueries();
-});
-document.getElementById("routemode").addEventListener("change", (e) => {
-  document.getElementById("routeInfo").style.display = e.target.checked ? "" : "none";
-  clearRoute();
 });
 document.getElementById("nearList").addEventListener("click", (e) => {
   const li = e.target.closest("li[data-i]");
