@@ -36,7 +36,10 @@
            color: var(--dim); margin: 10px 0 4px; white-space: nowrap; overflow: hidden;
            text-overflow: ellipsis; }
   .qline b { color: var(--warm); font-weight: 600; }
-  ol { list-style: none; margin: 6px 0 2px; }
+  ol { list-style: none; margin: 6px 0 2px; max-height: 38vh; overflow-y: auto;
+       scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  ol::-webkit-scrollbar { width: 6px; }
+  ol::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
   ol li { display: flex; justify-content: space-between; gap: 8px; padding: 3.5px 0;
           border-top: 1px solid var(--line); font-size: 13px; }
   ol li:first-child { border-top: 0; }
@@ -72,6 +75,7 @@
   <div class="stat"><span>geohash index build</span><b id="indexMs">–</b></div>
   <div class="qline" id="nearQ">click the globe to run $near…</div>
   <div class="stat"><span>query time</span><b id="nearMs">–</b></div>
+  <div class="stat"><span>matches (sorted by distance)</span><b id="nearCount">–</b></div>
   <ol id="nearList"></ol>
   <div id="radiusRow">
     <span>$geoWithin</span>

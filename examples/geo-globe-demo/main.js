@@ -267,7 +267,7 @@ function runQueries() {
     loc: { $near: { $geometry: { type: "Point", coordinates: [lon, lat] }, $maxDistance: 3_000_000 } },
   };
   let t = performance.now();
-  const near = JSON.parse(oxidb.find("cities", JSON.stringify(nearQ))).slice(0, 10);
+  const near = JSON.parse(oxidb.find("cities", JSON.stringify(nearQ)));
   const nearMs = performance.now() - t;
 
   // $geoWithin — spherical cap of the slider's radius.
@@ -282,6 +282,7 @@ function runQueries() {
   document.getElementById("nearQ").innerHTML =
     `{loc: {<b>$near</b>: [${lon.toFixed(2)}, ${lat.toFixed(2)}]}}`;
   document.getElementById("nearMs").textContent = `${nearMs.toFixed(1)} ms`;
+  document.getElementById("nearCount").textContent = near.length.toLocaleString();
   document.getElementById("withinMs").textContent = `${withinMs.toFixed(1)} ms`;
   document.getElementById("withinCount").textContent = `${within.length} cities`;
   const hav = (a, b) => {
@@ -294,7 +295,9 @@ function runQueries() {
         Math.sin(dlo / 2) ** 2;
     return 2 * EARTH_KM * Math.asin(Math.sqrt(h));
   };
-  document.getElementById("nearList").innerHTML = near
+  const listEl = document.getElementById("nearList");
+  listEl.scrollTop = 0;
+  listEl.innerHTML = near
     .map((d) => {
       const km = hav([lon, lat], d.loc);
       return `<li><span class="name">${flag(d.c)} ${d.n}</span><span class="km">${
@@ -310,7 +313,7 @@ function runQueries() {
     const i = indexByKey.get(`${d.loc[0]},${d.loc[1]}`);
     if (i !== undefined) COL_WITHIN.toArray(colorAttr.array, i * 3);
   }
-  for (const d of near) {
+  for (const d of near.slice(0, 10)) {
     const i = indexByKey.get(`${d.loc[0]},${d.loc[1]}`);
     if (i !== undefined) COL_NEAR.toArray(colorAttr.array, i * 3);
   }
