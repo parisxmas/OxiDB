@@ -11,12 +11,60 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.42.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.42.0</h3>
+        <span class="version-date">2026-07-31</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; PostgreSQL wire protocol</h4>
+        <ul>
+          <li><strong>OxiDB now speaks the PostgreSQL v3 protocol</strong> (<code>OXIDB_PG_PORT</code>, requires <code>OXIDB_SQL=1</code>). Verified with real drivers, not against the spec: <strong>psql 18, psycopg 3.3, Npgsql 8 in its default mode, pgjdbc 42.7</strong> (including <code>DatabaseMetaData</code> introspection), and <strong>DBeaver 25.3</strong> connects and browses with its native PostgreSQL driver. TLS works (<code>sslmode=require</code>); authentication is the same SCRAM-SHA-256 as the native port, so the same accounts work on both.</li>
+          <li><strong>EF Core runs over the unmodified Npgsql provider</strong>: <code>EnsureCreated</code>, generated keys via RETURNING, joins, transactions, LATERAL &mdash; end to end. Getting there added binary timestamp parameters and results, <code>AT TIME ZONE 'UTC'</code>, PostgreSQL&nbsp;14's 3-argument <code>date_trunc</code>, and calendar <code>INTERVAL</code> arithmetic desugared onto the calendar-correct <code>add_months</code>.</li>
+          <li>System-catalog queries are answered with PostgreSQL's real column sets, filled from OxiDB's own schema; what cannot be answered truthfully is refused by name rather than answered empty &mdash; an empty result would be believed. Query results are buffered per message rather than written per row, which took a 1,000-row read from 526 to 1,796 ops/s.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; embedded EF Core (.NET)</h4>
+        <ul>
+          <li><strong><code>UseOxiDb("Path=./mydata")</code> runs the whole EF Core stack in-process</strong> &mdash; no server, SQLite-style: the database is a directory next to your application. The same <code>DbContext</code> points at a server by changing one connection string. One engine per directory is shared process-wide while each connection keeps its own interactive transaction, so concurrent transactions from multiple contexts work exactly as they do over TCP. Minimal example at <code>examples/dotnet/EmbeddedEfCore/</code>.</li>
+          <li><strong>Closing an embedded database now checkpoints it</strong>: a cleanly exited application leaves a snapshot-only data directory (the WAL folded down to its bare header) &mdash; what a backup or sync tool wants to see. A crash still loses nothing; the log tail replays at the next open.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Changed &mdash; SQL engine: disk-first by default, measured against PostgreSQL</h4>
+        <ul>
+          <li><strong>The SQL engine's disk-first mode is now the default</strong> (<code>OXIDB_SQL_DISK_FIRST=0</code> restores all-resident rows): a warm 1.2M-row, index-heavy database costs ~39&nbsp;MB of process memory instead of hundreds, and rows, primary keys, and every index live in mapped files bounded by the checkpoint interval &mdash; not by row count. The sparse row index costs 0.69 bytes per row, so 100M rows need ~69&nbsp;MB resident where the previous layout needed 3.1&nbsp;GB.</li>
+          <li><strong>Measured against stock PostgreSQL 18 on identical data, 5 of 8 query workloads are at parity</strong> (0.93&ndash;1.10x: point lookups, composite-key lookups, secondary-index equality, range + ORDER BY + LIMIT, and low-selectivity index scans via a bitmap-heap-scan-equivalent cursor walk); full scans and joins run at 0.72&ndash;0.78x. The benchmark, method, and the honest remainder are in <code>docs/query-benchmark.md</code>.</li>
+          <li><strong>Group commit</strong>: concurrent SQL writers now share fsyncs &mdash; a flat ~266 writes/s at every concurrency became ~1.2k/s at 16 connections.</li>
+          <li>Opening a database with a large unfolded log peaks far lower (a checkpoint now hard-links unchanged tables instead of rewriting them), and <code>OXIDB_DOC=0</code> runs the server without the document engine entirely &mdash; 9.8&nbsp;MB idle RSS for a SQL/TSDB-only deployment.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; SQL surface</h4>
+        <ul>
+          <li><strong>Composite PRIMARY KEY</strong> (<code>CONSTRAINT pk PRIMARY KEY (a, b)</code>), enforced on every write path including transactions.</li>
+          <li><strong>Integer width enforcement</strong>: <code>SMALLINT</code>/<code>INT</code>/<code>TINYINT</code> are range-checked constraints (PostgreSQL error code <code>22003</code>) rather than silently widened; storage stays i64, and existing catalogs keep their old semantics.</li>
+          <li><strong><code>CREATE UNIQUE INDEX</code> is enforced</strong> &mdash; it validates existing rows, then rides the same uniqueness machinery as declared <code>UNIQUE</code> columns, on the live path, WAL replay, and after checkpoints alike. Shapes that cannot be enforced (multi-column, inside a transaction) are refused by name; before this, EF's <code>IsUnique()</code> quietly produced a plain index and duplicates sailed through a constraint the application believed in.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>A concurrent writer could silently overwrite another's row.</strong> A transaction reserved row ids by peeking a counter, so a simultaneous writer could be handed the same id and the later commit replaced the earlier row with no error anywhere. Ids and AUTO_INCREMENT values are now reserved from the engine as the transaction buffers each write, and the commit re-validates every key against committed state under the commit lock.</li>
+          <li><strong>An indexed TIMESTAMP column probed with an integer parameter answered 0 rows</strong> &mdash; exactly what EF Core sends for every <code>DateTime</code> parameter. The index found the entries and the candidate verification then rejected all of them, because index-key equality disagreed with index-key ordering about cross-type numerics. Equality now agrees with ordering.</li>
+          <li><strong><code>HAVING</code> on a group key mis-read the projection</strong> on the streamed aggregation path (comparing the count where the key should be), and <code>HAVING count(*)</code> without an ORDER BY was rejected outright. Both answer correctly now.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.40.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.40.0</h3>
         <span class="version-date">2026-07-28</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Changed &mdash; OxiDB is source-available</h4>
