@@ -2573,6 +2573,7 @@ dependencies = [
  "oxidb",
  "oxidb-sql",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

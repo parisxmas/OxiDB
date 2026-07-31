@@ -2322,6 +2322,18 @@ impl SqlEngine {
         Self::checkpoint_locked(&mut inner, &self.commit)
     }
 
+    /// [`checkpoint`](Self::checkpoint), but only when the WAL holds anything
+    /// to fold. The embedded close path calls this on every handle close; a
+    /// clean engine must keep its current generation rather than mint a new
+    /// one per open/close cycle.
+    pub fn checkpoint_if_dirty(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.wal.is_empty() {
+            return Ok(());
+        }
+        Self::checkpoint_locked(&mut inner, &self.commit)
+    }
+
     /// `gate` is told what the checkpoint made durable: the snapshot it wrote
     /// (and fsynced, and committed by MANIFEST rename) covers every record
     /// applied so far, including any whose WAL append has not been flushed. A

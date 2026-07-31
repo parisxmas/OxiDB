@@ -318,6 +318,13 @@ impl Wal {
         self.bytes
     }
 
+    /// Whether the WAL holds no records — its size is the bare header. This,
+    /// not `bytes() == 0`, is the "nothing to fold" test: a live WAL is never
+    /// zero-length.
+    pub fn is_empty(&self) -> bool {
+        self.bytes <= HEADER_LEN
+    }
+
     /// The highest sequence appended so far (0 if none) — written, though not
     /// necessarily flushed. A checkpoint records this as the manifest
     /// watermark: its snapshots reflect every record up to and including it.

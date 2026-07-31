@@ -701,12 +701,22 @@ pub unsafe extern "C" fn oxidb_open_encrypted(
 
 /// Close the database and free the handle. Safe to call with NULL.
 ///
+/// A close folds the SQL engine's WAL into a fresh generation
+/// (checkpoint-on-close) when there is anything to fold, so a cleanly
+/// closed data directory is snapshot-only — what a backup or sync tool
+/// wants to see. Best-effort by design: close cannot fail, and a skipped
+/// fold costs nothing — the WAL tail simply replays at the next open,
+/// exactly as it would after a crash.
+///
 /// # Safety
 /// `handle` must be a pointer returned by `oxidb_open` / `oxidb_open_encrypted`, or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_close(handle: *mut Handle) {
     if !handle.is_null() {
-        let _ = unsafe { Box::from_raw(handle as *mut OxiDbHandle) };
+        let h = unsafe { Box::from_raw(handle as *mut OxiDbHandle) };
+        if let Some(Some(engine)) = h.sql.get() {
+            let _ = engine.checkpoint_if_dirty();
+        }
     }
 }
 

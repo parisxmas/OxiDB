@@ -21,9 +21,9 @@ using (var tx = db.Database.BeginTransaction())
 {
     db.Todos.Add(new Todo { Title = "temp", Done = false });
     db.SaveChanges();
-    tx.Rollback(); // gone
+    tx.Commit();
 }
-db.ChangeTracker.Clear();
+//db.ChangeTracker.Clear();
 
 foreach (var t in db.Todos.Where(t => !t.Done).OrderBy(t => t.Id))
     Console.WriteLine($"{t.Id}: {t.Title}");

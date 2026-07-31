@@ -7,7 +7,7 @@ license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
@@ -19,3 +19,6 @@ oxidb-sql = { path = "../oxidb-sql" }
 serde_json = "1"
 base64 = "0.22"
 jni = { version = "0.21", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

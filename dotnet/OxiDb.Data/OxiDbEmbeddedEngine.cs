@@ -25,9 +25,33 @@ internal sealed class OxiDbEmbeddedEngine
 {
     private static readonly ConcurrentDictionary<string, Lazy<OxiDbEmbeddedEngine>> Engines = new();
 
+    static OxiDbEmbeddedEngine()
+    {
+        // Engines live for the process — so the process's end is the one
+        // close they get. Disposing runs the engine's checkpoint-on-close,
+        // folding the WAL so a cleanly exited application leaves a
+        // snapshot-only data directory. A crash skips this and loses
+        // nothing: the WAL tail replays at the next open.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            foreach (var lazy in Engines.Values)
+            {
+                if (lazy.IsValueCreated && lazy.Value._client is IDisposable d)
+                {
+                    try { d.Dispose(); } catch { /* nothing useful to do at exit */ }
+                }
+            }
+        };
+    }
+
+    private readonly object _client;
     private readonly Func<string, byte[]> _executeRaw;
 
-    private OxiDbEmbeddedEngine(Func<string, byte[]> executeRaw) => _executeRaw = executeRaw;
+    private OxiDbEmbeddedEngine(object client, Func<string, byte[]> executeRaw)
+    {
+        _client = client;
+        _executeRaw = executeRaw;
+    }
 
     /// <summary>The engine for <paramref name="path"/>, opened on first use.</summary>
     public static OxiDbEmbeddedEngine Get(string path)
@@ -58,7 +82,7 @@ internal sealed class OxiDbEmbeddedEngine
             ?? throw new InvalidOperationException(
                 "this OxiDb.Client.Embedded version has no ExecuteRawBytes — " +
                 "embedded ADO.NET needs 0.41.35 or later");
-        return new OxiDbEmbeddedEngine(raw.CreateDelegate<Func<string, byte[]>>(client));
+        return new OxiDbEmbeddedEngine(client, raw.CreateDelegate<Func<string, byte[]>>(client));
     }
 
     /// <summary>Run a raw request; returns the raw response envelope bytes.</summary>
