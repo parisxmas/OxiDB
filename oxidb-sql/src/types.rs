@@ -312,9 +312,20 @@ fn decode_cell_ref<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<ValueRef<'a>>
 
 /// A wrapper giving [`Value`] a total `Ord`, so values can be used as keys in a
 /// `BTreeMap` (secondary indexes). Ordering is [`Value::total_order`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct IndexKey(pub Value);
 
+/// Equality must agree with `Ord`, and a derived `PartialEq` does not:
+/// `total_order` compares numerics across types (`Int(x)` equals
+/// `Timestamp(x)`), so a map probe finds the entry and a subsequent `==`
+/// on the same two keys must not then deny the match. It did exactly that
+/// for an index on a TIMESTAMP column probed with an integer parameter —
+/// the candidate verification rejected every row the B-tree had just found.
+impl PartialEq for IndexKey {
+    fn eq(&self, other: &Self) -> bool {
+        Value::total_order(&self.0, &other.0) == std::cmp::Ordering::Equal
+    }
+}
 impl Eq for IndexKey {}
 impl PartialOrd for IndexKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {

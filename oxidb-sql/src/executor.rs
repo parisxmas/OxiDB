@@ -5706,7 +5706,13 @@ fn streamed_aggregate<S: Store>(
             if has_aggregate(h) {
                 return Ok(None);
             }
-            Some(bind_expr(h, &full)?)
+            // Kept UNBOUND until emit: it is evaluated against the finished
+            // group row, whose schema is the projection, not the base table.
+            // Binding against `full` here and "rebinding" later was a no-op —
+            // already-bound `Col(i)` nodes pass through — so a HAVING on a
+            // group key read whatever projection slot shared the key's *input*
+            // position (`HAVING "CustomerID" = 'ALFKI'` compared the count).
+            Some(h)
         }
     };
 
