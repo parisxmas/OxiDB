@@ -524,7 +524,15 @@ impl Store for Transaction<'_> {
         Ok(())
     }
 
-    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
+    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()> {
+        // Enabling a uniqueness constraint validates and seeds against
+        // committed state under the engine lock; a buffered transaction has
+        // neither. Refused rather than half-enforced.
+        if unique {
+            return Err(SqlError::Unsupported(
+                "CREATE UNIQUE INDEX inside a transaction".into(),
+            ));
+        }
         let def = self
             .visible_def(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
@@ -541,6 +549,7 @@ impl Store for Transaction<'_> {
             name: name.to_string(),
             table: table.to_string(),
             columns: columns.to_vec(),
+            unique: false, // unique refused above
         };
         st.indexes_dropped.remove(name);
         st.indexes_created.insert(name.to_string(), idx.clone());

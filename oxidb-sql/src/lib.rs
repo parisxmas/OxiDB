@@ -1452,6 +1452,39 @@ impl SqlEngine {
                 catalog.indexes.insert(def.name.clone(), def.clone());
                 if let Some(state) = tables.get_mut(&def.table) {
                     let _ = state.declare_index(&def.name, &def.columns);
+                    // A UNIQUE index turns the column-UNIQUE machinery on:
+                    // flag the catalog column and seed a `UniqueCol` from the
+                    // rows as they stand (during replay that is the state at
+                    // this record's point in time — later inserts maintain
+                    // the map through `index_insert`, like any unique
+                    // column's). Validation happened before the record was
+                    // logged, under the same lock; apply must not fail.
+                    if def.unique
+                        && let Some(t) = catalog.tables.get_mut(&def.table)
+                        && let Some(pos) = t
+                            .columns
+                            .iter()
+                            .position(|c| Some(&c.name) == def.columns.first() && !c.dropped)
+                    {
+                        t.columns[pos].unique = true;
+                        if let Some(c) = state.def.columns.get_mut(pos) {
+                            c.unique = true;
+                        }
+                        if !state.uniques.iter().any(|u| u.pos == pos) {
+                            let mut map: BTreeMap<IndexKey, u64> = BTreeMap::new();
+                            let _ = state.rows.visit_physical(&mut |row_id, cells| {
+                                if !matches!(cells[pos], Value::Null) {
+                                    map.insert(IndexKey(cells[pos].clone()), row_id);
+                                }
+                                Ok(true)
+                            });
+                            state.uniques.push(UniqueCol {
+                                pos,
+                                map,
+                                base: None,
+                            });
+                        }
+                    }
                 }
             }
             WalRecord::DropIndex(name) => {
@@ -1459,6 +1492,23 @@ impl SqlEngine {
                     && let Some(state) = tables.get_mut(&def.table)
                 {
                     state.indexes.remove(name);
+                    // The uniqueness this index carried goes with it. A
+                    // column declared UNIQUE (or the PK) never gets here —
+                    // its constraint was recorded on the column, not on an
+                    // index, and `create_index` refuses to double-claim it.
+                    if def.unique
+                        && let Some(t) = catalog.tables.get_mut(&def.table)
+                        && let Some(pos) = t
+                            .columns
+                            .iter()
+                            .position(|c| Some(&c.name) == def.columns.first() && !c.dropped)
+                    {
+                        t.columns[pos].unique = false;
+                        if let Some(c) = state.def.columns.get_mut(pos) {
+                            c.unique = false;
+                        }
+                        state.uniques.retain(|u| u.pos != pos);
+                    }
                 }
             }
             WalRecord::CreateView { name, sql } => {
@@ -1548,7 +1598,13 @@ impl SqlEngine {
 
     /// Create a secondary index over one or more columns. Errors if the index
     /// name is taken or the table / any column does not exist.
-    pub fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
+    pub fn create_index(
+        &self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.indexes.contains_key(name) {
             return Err(SqlError::IndexExists(name.to_string()));
@@ -1567,10 +1623,59 @@ impl SqlEngine {
                 return Err(SqlError::NoSuchColumn(column.to_string()));
             }
         }
+        // A UNIQUE index rides the column-UNIQUE machinery — the enforcement
+        // path writes, transactions, and checkpoints already share. Single
+        // column only (like every other constraint here); refused loudly
+        // otherwise, because an unenforced uniqueness constraint is a wrong
+        // answer waiting for its query. (Silently accepting it as a plain
+        // index is exactly the bug this closes: EF's IsUnique() emitted
+        // CREATE UNIQUE INDEX and duplicates sailed through.)
+        let mut unique = unique;
+        if unique {
+            let [column] = columns else {
+                return Err(SqlError::Unsupported(
+                    "multi-column UNIQUE INDEX (single column only)".into(),
+                ));
+            };
+            let pos = def
+                .columns
+                .iter()
+                .position(|c| &c.name == column && !c.dropped)
+                .ok_or_else(|| SqlError::NoSuchColumn(column.to_string()))?;
+            if def.columns[pos].unique || def.columns[pos].primary_key {
+                // Already unique (declared, or via the PK): the constraint
+                // exists independently of this index, so the index must not
+                // carry it — DROP INDEX would otherwise take away a
+                // constraint the schema declared.
+                unique = false;
+            } else {
+                // Existing rows must already be unique, NULLs exempt (SQL's
+                // rule, and the written-NULL trap the column machinery pins).
+                let state = inner.tables.get(table).expect("checked above");
+                let mut seen: BTreeMap<IndexKey, u64> = BTreeMap::new();
+                let mut dup: Option<Value> = None;
+                state.rows.visit_physical(&mut |row_id, cells| {
+                    let v = &cells[pos];
+                    if !matches!(v, Value::Null)
+                        && seen.insert(IndexKey(v.clone()), row_id).is_some()
+                    {
+                        dup = Some(v.clone());
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })?;
+                if let Some(v) = dup {
+                    return Err(SqlError::DuplicateKey(format!(
+                        "cannot create unique index {name:?}: column {column:?} holds duplicate value {v:?}"
+                    )));
+                }
+            }
+        }
         let rec = WalRecord::CreateIndex(IndexDef {
             name: name.to_string(),
             table: table.to_string(),
             columns: columns.to_vec(),
+            unique,
         });
         let seq = Self::log_and_apply(&mut inner, &self.commit, &rec)?;
         // Applying the record only *declares* the index — that is what makes a
@@ -3829,8 +3934,8 @@ impl Store for SqlEngine {
     fn drop_table(&self, name: &str) -> Result<()> {
         SqlEngine::drop_table(self, name)
     }
-    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
-        SqlEngine::create_index(self, name, table, columns)
+    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()> {
+        SqlEngine::create_index(self, name, table, columns, unique)
     }
     fn drop_index(&self, name: &str) -> Result<()> {
         SqlEngine::drop_index(self, name)

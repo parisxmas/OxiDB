@@ -334,6 +334,11 @@ pub struct IndexDef {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
+    /// `CREATE UNIQUE INDEX`: this index carries a uniqueness constraint. The
+    /// *enforcement* rides the column's `unique` flag (single column only) —
+    /// this flag records that the constraint came from this index, so
+    /// `DROP INDEX` knows to take it away again.
+    pub unique: bool,
 }
 
 // Older catalogs / WAL records store a single `"column": "x"` field; accept
@@ -351,6 +356,8 @@ impl<'de> Deserialize<'de> for IndexDef {
             column: Option<String>,
             #[serde(default)]
             columns: Vec<String>,
+            #[serde(default)]
+            unique: bool,
         }
         let w = Wire::deserialize(deserializer)?;
         let columns = if w.columns.is_empty() {
@@ -367,6 +374,7 @@ impl<'de> Deserialize<'de> for IndexDef {
             name: w.name,
             table: w.table,
             columns,
+            unique: w.unique,
         })
     }
 }

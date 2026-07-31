@@ -329,6 +329,23 @@ public sealed class OxiDbMigrationsSqlGenerator : MigrationsSqlGenerator
     }
 
     protected override void Generate(
+        CreateIndexOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        // A UNIQUE index enables a constraint: the engine validates and seeds
+        // it against committed state, which a buffered transaction does not
+        // have — so, like the ALTER-class commands above, it runs standalone.
+        base.Generate(operation, model, builder, terminate: false);
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder, suppressTransaction: operation.IsUnique);
+        }
+    }
+
+    protected override void Generate(
         DropIndexOperation operation,
         IModel? model,
         MigrationCommandListBuilder builder,

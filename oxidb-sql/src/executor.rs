@@ -70,8 +70,9 @@ pub(crate) fn execute<S: Store>(
             table,
             columns,
             if_not_exists,
+            unique,
         } => {
-            match store.create_index(&name, &table, &columns) {
+            match store.create_index(&name, &table, &columns, unique) {
                 Ok(()) => {}
                 Err(SqlError::IndexExists(_)) if if_not_exists => {}
                 Err(e) => return Err(e),

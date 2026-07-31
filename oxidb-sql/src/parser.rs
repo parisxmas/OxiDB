@@ -1094,6 +1094,7 @@ fn translate_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         table,
         columns,
         if_not_exists: ci.if_not_exists,
+        unique: ci.unique,
     })
 }
 

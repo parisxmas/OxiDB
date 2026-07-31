@@ -216,7 +216,7 @@ pub(crate) trait Store {
     fn drop_table(&self, name: &str) -> Result<()>;
     /// `ALTER TABLE` — one operation (autocommit only in v1).
     fn alter_table(&self, table: &str, op: &crate::ast::AlterOp) -> Result<()>;
-    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()>;
+    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()>;
     fn drop_index(&self, name: &str) -> Result<()>;
     fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()>;
     fn drop_view(&self, name: &str) -> Result<()>;

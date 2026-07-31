@@ -23,6 +23,8 @@ pub enum Statement {
         table: String,
         columns: Vec<String>,
         if_not_exists: bool,
+        /// `CREATE UNIQUE INDEX` — a uniqueness constraint rides the index.
+        unique: bool,
     },
     DropIndex {
         name: String,
