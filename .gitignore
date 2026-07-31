@@ -18,6 +18,8 @@ dotnet/**/bin/
 dotnet/**/obj/
 tests/**/bin/
 tests/**/obj/
+examples/**/bin/
+examples/**/obj/
 test_output.log
 test_output_innetwork.log
 
