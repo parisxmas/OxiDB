@@ -361,6 +361,24 @@ enum Stage {
         depth_field: Option<String>,
         restrict: Option<Value>,
     },
+    /// `$shortestPath`: Dijkstra over an **edge collection** (`from`), each
+    /// document one edge `{edge_from: node, edge_to: node, weight: number}`.
+    /// `as_field` receives the ordered edge documents source→target;
+    /// `cost_field`, when set, the total cost (null when unreachable).
+    /// Not a MongoDB stage — this is deliberately graph-database territory.
+    ShortestPath {
+        from: String,
+        source: Expression,
+        target: Expression,
+        edge_from: String,
+        edge_to: String,
+        weight: Option<String>,
+        undirected: bool,
+        as_field: String,
+        cost_field: Option<String>,
+        restrict: Option<Value>,
+        max_cost: Option<f64>,
+    },
     Out(String),
     /// `$facet`: run several independent sub-pipelines over the **same** input
     /// documents and emit one document whose fields are each sub-pipeline's
@@ -3295,6 +3313,244 @@ where
     Ok(out)
 }
 
+/// `$shortestPath`: textbook Dijkstra whose adjacency is fetched lazily.
+///
+/// Settling order is never compromised — the heap always yields the cheapest
+/// unsettled node (correctness requires non-negative weights, checked
+/// loudly). What IS batched is the data: when the cheapest node's adjacency
+/// is not cached yet, edges for up to 64 uncached heap nodes are fetched in
+/// one `$in` query (two for `undirected` — one per direction), through the
+/// same `lookup_fn` as `$lookup`/`$graphLookup`, so an index on the edge
+/// endpoint fields serves the search.
+#[allow(clippy::too_many_arguments)]
+fn exec_shortest_path<F>(
+    docs: Vec<Value>,
+    from: &str,
+    source: &Expression,
+    target: &Expression,
+    edge_from: &str,
+    edge_to: &str,
+    weight: Option<&str>,
+    undirected: bool,
+    as_field: &str,
+    cost_field: Option<&str>,
+    restrict: Option<&Value>,
+    max_cost: Option<f64>,
+    lookup_fn: &F,
+) -> Result<Vec<Value>>
+where
+    F: Fn(&str, &Value) -> Result<Vec<Value>>,
+{
+    use std::cmp::Ordering;
+    use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+
+    /// Search ceiling — a graph this stage settles more nodes in is a
+    /// runaway; an error beats an OOM.
+    const MAX_SETTLED: usize = 500_000;
+    /// Nodes whose adjacency is fetched per query round.
+    const FETCH_BATCH: usize = 64;
+
+    struct Entry {
+        cost: f64,
+        seq: u64,
+        node: IndexValue,
+    }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.cost == o.cost && self.seq == o.seq
+        }
+    }
+    impl Eq for Entry {}
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            // Reversed: BinaryHeap is a max-heap, Dijkstra wants the min.
+            o.cost
+                .partial_cmp(&self.cost)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| o.seq.cmp(&self.seq))
+        }
+    }
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+
+    let edge_weight = |edge: &Value| -> Result<f64> {
+        match weight {
+            None => Ok(1.0),
+            Some(wf) => {
+                let v = resolve_field(edge, wf);
+                let w = v.as_f64().ok_or_else(|| {
+                    Error::InvalidPipeline(format!(
+                        "$shortestPath: edge has no numeric '{wf}' weight: {edge}"
+                    ))
+                })?;
+                if w < 0.0 || !w.is_finite() {
+                    return Err(Error::InvalidPipeline(format!(
+                        "$shortestPath: negative or non-finite weight {w} — Dijkstra requires \
+                         non-negative weights"
+                    )));
+                }
+                Ok(w)
+            }
+        }
+    };
+
+    let mut out = Vec::with_capacity(docs.len());
+    for mut doc in docs {
+        let src_val = source.eval(&doc);
+        let dst_val = target.eval(&doc);
+        let src = IndexValue::from_json(&src_val);
+        let dst = IndexValue::from_json(&dst_val);
+
+        // node -> (best cost, seq of raw JSON for $in), prev edge on the best
+        // path, cached adjacency: neighbor node -> (weight, edge doc).
+        let mut dist: BTreeMap<IndexValue, f64> = BTreeMap::new();
+        let mut prev: BTreeMap<IndexValue, (IndexValue, Value)> = BTreeMap::new();
+        let mut raw: BTreeMap<IndexValue, Value> = BTreeMap::new();
+        let mut adj: BTreeMap<IndexValue, Vec<(IndexValue, f64, Value)>> = BTreeMap::new();
+        let mut settled: BTreeSet<IndexValue> = BTreeSet::new();
+        let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+        let mut seq = 0u64;
+
+        raw.insert(src.clone(), src_val.clone());
+        dist.insert(src.clone(), 0.0);
+        heap.push(Entry {
+            cost: 0.0,
+            seq,
+            node: src.clone(),
+        });
+
+        let mut found_cost: Option<f64> = None;
+        if matches!(src_val, Value::Null) || matches!(dst_val, Value::Null) {
+            heap.clear(); // no endpoints, no search
+        }
+        while let Some(Entry { cost, node, .. }) = heap.pop() {
+            if settled.contains(&node) {
+                continue; // lazy deletion
+            }
+            if let Some(mc) = max_cost
+                && cost > mc
+            {
+                break; // everything else in the heap costs at least this much
+            }
+            if node == dst {
+                found_cost = Some(cost);
+                break;
+            }
+            settled.insert(node.clone());
+            if settled.len() > MAX_SETTLED {
+                return Err(Error::InvalidPipeline(format!(
+                    "$shortestPath settled more than {MAX_SETTLED} nodes — bound the search \
+                     with maxCost or restrictSearchWithMatch"
+                )));
+            }
+
+            // Fetch adjacency for this node (and, while a query is being paid
+            // for anyway, up to FETCH_BATCH-1 other heap nodes without one).
+            if !adj.contains_key(&node) {
+                let mut batch_keys: Vec<IndexValue> = vec![node.clone()];
+                let mut batch_seen: BTreeSet<IndexValue> = batch_keys.iter().cloned().collect();
+                for e in heap.iter() {
+                    if batch_keys.len() >= FETCH_BATCH {
+                        break;
+                    }
+                    if !adj.contains_key(&e.node)
+                        && !settled.contains(&e.node)
+                        && batch_seen.insert(e.node.clone())
+                    {
+                        batch_keys.push(e.node.clone());
+                    }
+                }
+                let in_list: Vec<Value> = batch_keys
+                    .iter()
+                    .filter_map(|k| raw.get(k).cloned())
+                    .collect();
+                for k in &batch_keys {
+                    adj.entry(k.clone()).or_default();
+                }
+                let with_restrict = |base: Value| -> Value {
+                    match restrict {
+                        Some(r) => json!({ "$and": [base, r] }),
+                        None => base,
+                    }
+                };
+                let mut rounds: Vec<(String, String)> =
+                    vec![(edge_from.to_string(), edge_to.to_string())];
+                if undirected {
+                    rounds.push((edge_to.to_string(), edge_from.to_string()));
+                }
+                for (tail, head) in rounds {
+                    let query = with_restrict(json!({ &tail: { "$in": in_list.clone() } }));
+                    for edge in lookup_fn(from, &query)? {
+                        let t = IndexValue::from_json(&resolve_field(&edge, &tail));
+                        let head_val = resolve_field(&edge, &head);
+                        let h = IndexValue::from_json(&head_val);
+                        let w = edge_weight(&edge)?;
+                        raw.entry(h.clone()).or_insert(head_val);
+                        adj.entry(t).or_default().push((h, w, edge));
+                    }
+                }
+            }
+
+            let neighbors = adj.get(&node).cloned().unwrap_or_default();
+            for (nb, w, edge) in neighbors {
+                if settled.contains(&nb) {
+                    continue;
+                }
+                let cand = cost + w;
+                if dist.get(&nb).is_none_or(|d| cand < *d) {
+                    dist.insert(nb.clone(), cand);
+                    prev.insert(nb.clone(), (node.clone(), edge));
+                    seq += 1;
+                    heap.push(Entry {
+                        cost: cand,
+                        seq,
+                        node: nb,
+                    });
+                }
+            }
+        }
+
+        // Source == target is a zero-length path, not "unreachable".
+        if src == dst && !matches!(src_val, Value::Null) {
+            found_cost = Some(0.0);
+        }
+
+        let route: Vec<Value> = match found_cost {
+            None => Vec::new(),
+            Some(_) => {
+                let mut edges = Vec::new();
+                let mut cur = dst.clone();
+                while cur != src {
+                    let Some((p, edge)) = prev.get(&cur) else {
+                        break;
+                    };
+                    edges.push(edge.clone());
+                    cur = p.clone();
+                }
+                edges.reverse();
+                edges
+            }
+        };
+        if let Value::Object(o) = &mut doc {
+            o.insert(as_field.to_string(), Value::Array(route));
+            if let Some(cf) = cost_field {
+                o.insert(
+                    cf.to_string(),
+                    match found_cost {
+                        Some(c) => json!(c),
+                        None => Value::Null,
+                    },
+                );
+            }
+        }
+        out.push(doc);
+    }
+    Ok(out)
+}
+
 fn exec_lookup<F>(
     docs: Vec<Value>,
     from: &str,
@@ -4949,6 +5205,60 @@ impl Pipeline {
                         restrict,
                     }
                 }
+                "$shortestPath" => {
+                    let obj = stage_body.as_object().ok_or_else(|| {
+                        Error::InvalidPipeline("$shortestPath must be an object".into())
+                    })?;
+                    let req = |key: &str| -> Result<String> {
+                        obj.get(key).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
+                            Error::InvalidPipeline(format!("$shortestPath requires '{key}' string"))
+                        })
+                    };
+                    let expr = |key: &str| -> Result<Expression> {
+                        parse_expression(obj.get(key).ok_or_else(|| {
+                            Error::InvalidPipeline(format!("$shortestPath requires '{key}'"))
+                        })?)
+                    };
+                    let restrict = match obj.get("restrictSearchWithMatch") {
+                        None => None,
+                        Some(r) => {
+                            crate::query::parse_query(r)?;
+                            Some(r.clone())
+                        }
+                    };
+                    let max_cost = match obj.get("maxCost") {
+                        None => None,
+                        Some(c) => Some(
+                            c.as_f64().filter(|c| *c >= 0.0 && c.is_finite()).ok_or_else(
+                                || {
+                                    Error::InvalidPipeline(
+                                        "$shortestPath maxCost must be a non-negative number"
+                                            .into(),
+                                    )
+                                },
+                            )?,
+                        ),
+                    };
+                    Stage::ShortestPath {
+                        from: req("from")?,
+                        source: expr("source")?,
+                        target: expr("target")?,
+                        edge_from: req("edgeFrom")?,
+                        edge_to: req("edgeTo")?,
+                        weight: obj.get("weight").and_then(|v| v.as_str()).map(String::from),
+                        undirected: obj
+                            .get("undirected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        as_field: req("as")?,
+                        cost_field: obj
+                            .get("costField")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        restrict,
+                        max_cost,
+                    }
+                }
                 "$out" => {
                     let coll = stage_body.as_str().ok_or_else(|| {
                         Error::InvalidPipeline("$out must be a collection name string".into())
@@ -5194,6 +5504,33 @@ impl Pipeline {
                     *max_depth,
                     depth_field.as_deref(),
                     restrict.as_ref(),
+                    lookup_fn,
+                )?,
+                Stage::ShortestPath {
+                    from,
+                    source,
+                    target,
+                    edge_from,
+                    edge_to,
+                    weight,
+                    undirected,
+                    as_field,
+                    cost_field,
+                    restrict,
+                    max_cost,
+                } => exec_shortest_path(
+                    current,
+                    from,
+                    source,
+                    target,
+                    edge_from,
+                    edge_to,
+                    weight.as_deref(),
+                    *undirected,
+                    as_field,
+                    cost_field.as_deref(),
+                    restrict.as_ref(),
+                    *max_cost,
                     lookup_fn,
                 )?,
                 Stage::Out(_) => {
