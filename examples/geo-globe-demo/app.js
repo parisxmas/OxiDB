@@ -509,7 +509,7 @@ function clearRoute() {
   endBLabel.visible = false;
 }
 
-function drawPolyline(pts, color, dashed = false) {
+function drawPolyline(pts, color, dashed = false, glow = null) {
   const verts = [];
   for (let i = 1; i < pts.length; i++) {
     const [lon0, lat0] = pts[i - 1];
@@ -523,6 +523,16 @@ function drawPolyline(pts, color, dashed = false) {
       verts.push(prev.x, prev.y, prev.z, cur.x, cur.y, cur.z);
       prev = cur;
     }
+    if (glow) {
+      // Much finer sampling (~5 km) — the glow is round additive dots, and
+      // they must overlap into a continuous stroke even zoomed well in.
+      const gs = Math.max(1, Math.ceil(Math.max(Math.abs(lon1 - lon0), Math.abs(lat1 - lat0)) / 0.05));
+      for (let s = 0; s <= gs; s++) {
+        const t = s / gs;
+        const v = toXYZ(lon0 + (lon1 - lon0) * t, lat0 + (lat1 - lat0) * t, R * 1.0015);
+        glow.push(v.x, v.y, v.z);
+      }
+    }
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
@@ -532,6 +542,35 @@ function drawPolyline(pts, color, dashed = false) {
   const line = new THREE.LineSegments(g, mat);
   if (dashed) line.computeLineDistances();
   routeGroup.add(line);
+}
+
+// The glow itself: one additive Points draw over the whole route. The
+// point size divides by view distance (clamped), so the stroke visibly
+// thickens as you zoom in and never collapses when zoomed out.
+function addRouteGlow(verts) {
+  if (!verts.length) return;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+  const mat = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: { uColor: { value: new THREE.Color(0xff4838) } },
+    vertexShader:
+      `void main() {\n` +
+      `  vec4 mv = modelViewMatrix * vec4(position, 1.0);\n` +
+      `  gl_PointSize = clamp(${(9 * Math.min(devicePixelRatio, 2)).toFixed(1)} / -mv.z, 2.5, 26.0);\n` +
+      `  gl_Position = projectionMatrix * mv;\n` +
+      `}`,
+    fragmentShader:
+      `uniform vec3 uColor;\n` +
+      `void main() {\n` +
+      `  float d = length(gl_PointCoord - vec2(0.5));\n` +
+      `  float a = smoothstep(0.5, 0.05, d);\n` +
+      `  gl_FragColor = vec4(uColor, a * 0.5);\n` +
+      `}`,
+  });
+  routeGroup.add(new THREE.Points(g, mat));
 }
 
 async function routeBetween(a, b) {
@@ -574,13 +613,15 @@ async function routeBetween(a, b) {
     return { ok: false, msg };
   }
   let ferries = 0;
+  const glowPts = [];
   for (const e of doc.route) {
     const pts = roadEdges[e.i]?.pts;
     if (!pts) continue;
     const isFerry = e.t === "ferry" || e.t === "bridge";
     if (isFerry) ferries++;
-    drawPolyline(pts, isFerry ? 0x4dd0e1 : 0xffe082, isFerry);
+    drawPolyline(pts, isFerry ? 0x4dd0e1 : 0xff5548, isFerry, isFerry ? null : glowPts);
   }
+  addRouteGlow(glowPts);
   const stat =
     `${Math.round(doc.totalKm).toLocaleString()} km · ${doc.route.length} segments` +
     (ferries ? ` · ${ferries} ferry/bridge` : "");
@@ -860,6 +901,17 @@ function runQueries() {
   };
   wire("fromCity", "fromSug", "from");
   wire("toCity", "toSug", "to");
+  document.getElementById("dirClear").addEventListener("click", (e) => {
+    e.preventDefault();
+    picked.from = picked.to = null;
+    document.getElementById("fromCity").value = "";
+    document.getElementById("toCity").value = "";
+    clearRoute();
+    renderVia(null);
+    const st = document.getElementById("dirStat");
+    st.textContent = "pick two cities";
+    st.style.color = "var(--dim)";
+  });
 }
 
 // ── interaction ────────────────────────────────────────────────────────────
