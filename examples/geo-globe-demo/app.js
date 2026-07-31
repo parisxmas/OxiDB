@@ -174,6 +174,14 @@ controls.enablePan = false;
 controls.autoRotate = false; // the panel checkbox drives this
 controls.autoRotateSpeed = 0.5;
 
+// Camera fly-to: smoothstep the position along the sphere (slerp direction,
+// lerp altitude). A drag cancels it — the user always wins.
+let camTween = null;
+function flyTo(dir, dist) {
+  camTween = { from: camera.position.clone(), to: dir.clone().multiplyScalar(dist), start: performance.now() };
+}
+canvas.addEventListener("pointerdown", () => (camTween = null));
+
 function toXYZ(lon, lat, r = R) {
   const la = THREE.MathUtils.degToRad(lat);
   const lo = THREE.MathUtils.degToRad(lon);
@@ -533,7 +541,17 @@ async function routeBetween(a, b) {
   const stat =
     `${Math.round(doc.totalKm).toLocaleString()} km · ${doc.route.length} segments` +
     (ferries ? ` · ${ferries} ferry/bridge` : "");
-  return { ok: true, msg: stat };
+  // The ordered waypoints: chain the (undirected) edges from the source,
+  // carrying cumulative distance — the via-cities list samples these.
+  const nodesSeq = [{ id: src, km: 0 }];
+  let cur = src;
+  let acc = 0;
+  for (const e of doc.route) {
+    cur = e.a === cur ? e.b : e.a;
+    acc += e.km;
+    nodesSeq.push({ id: cur, km: acc });
+  }
+  return { ok: true, msg: stat, nodes: nodesSeq };
 }
 
 let blinkStart = 0;
@@ -727,7 +745,73 @@ function runQueries() {
     routeBetween(a, b).then((r) => {
       document.getElementById("dirStat").textContent = r ? r.msg : "?";
       document.getElementById("dirStat").style.color = r?.ok ? "" : "var(--warm)";
+      renderVia(r?.ok ? r.nodes : null);
+      // Frame the trip: aim at the endpoints' midpoint, back off just far
+      // enough that both fit in the (vertical) field of view.
+      const va = toXYZ(a.lon, a.lat);
+      const vb = toXYZ(b.lon, b.lat);
+      const mid = va.clone().add(vb);
+      if (mid.lengthSq() > 1e-6) {
+        const half = va.angleTo(vb) / 2;
+        const dist = THREE.MathUtils.clamp(
+          Math.cos(half) + Math.sin(half) / 0.23,
+          1.08,
+          5.5
+        );
+        flyTo(mid.normalize(), dist);
+      }
     });
+  };
+  // Google-Maps-style via list: sample the route every ~15-25 km and ask
+  // the database which city that waypoint is passing (a real $near with a
+  // population floor, so the list reads Gebze/İzmit, not every village).
+  const renderVia = (nodes) => {
+    const el = document.getElementById("viaList");
+    if (!nodes || nodes.length < 2) {
+      el.style.display = "none";
+      el.innerHTML = "";
+      return;
+    }
+    const total = nodes[nodes.length - 1].km;
+    const step = Math.max(15, total / 60); // ≤ ~60 queries on any route
+    const seen = new Set();
+    const via = [];
+    let lastKm = -1e9;
+    for (const n of nodes) {
+      const isLast = n === nodes[nodes.length - 1];
+      if (!isLast && n.km - lastKm < step) continue;
+      lastKm = n.km;
+      const [lon, lat] = roadNodes[n.id];
+      const q = {
+        loc: { $near: { $geometry: { type: "Point", coordinates: [lon, lat] }, $maxDistance: 12_000 } },
+        p: { $gte: 15000 },
+      };
+      let hits;
+      try {
+        hits = JSON.parse(oxidb.find("cities", JSON.stringify(q)));
+      } catch {
+        hits = [];
+      }
+      const c = hits[0];
+      if (!c || seen.has(c.n)) continue;
+      seen.add(c.n);
+      via.push({ n: c.n, c: c.c, km: n.km, loc: c.loc });
+    }
+    el.innerHTML = via
+      .map(
+        (v, i) =>
+          `<li data-i="${i}"><span class="name">${flag(v.c)} ${v.n}</span>` +
+          `<span class="km">${Math.round(v.km)} km</span></li>`
+      )
+      .join("");
+    el.style.display = via.length ? "block" : "none";
+    el.onclick = (e) => {
+      const li = e.target.closest("li[data-i]");
+      if (li) {
+        const v = via[Number(li.dataset.i)];
+        blinkAt(v.loc[0], v.loc[1]);
+      }
+    };
   };
   wire("fromCity", "fromSug", "from");
   wire("toCity", "toSug", "to");
@@ -775,6 +859,18 @@ function resize() {
 addEventListener("resize", resize);
 resize();
 renderer.setAnimationLoop(() => {
+  if (camTween) {
+    const t = Math.min(1, (performance.now() - camTween.start) / 900);
+    const e = t * t * (3 - 2 * t); // smoothstep
+    const dir = camTween.from
+      .clone()
+      .normalize()
+      .lerp(camTween.to.clone().normalize(), e)
+      .normalize();
+    const len = THREE.MathUtils.lerp(camTween.from.length(), camTween.to.length(), e);
+    camera.position.copy(dir.multiplyScalar(len));
+    if (t >= 1) camTween = null;
+  }
   // Drag speed proportional to altitude, or the last zoom levels are
   // untouchably twitchy (a fixed angular speed sweeps a whole small
   // country per pixel of drag when the camera is 300 km up).
