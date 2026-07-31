@@ -2005,11 +2005,41 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
                 expr: Box::new(translate_expr(*expr, p)?),
             })
         }
-        sp::Expr::BinaryOp { left, op, right } => Ok(Expr::Binary {
-            op: map_binary_op(&op)?,
-            left: Box::new(translate_expr(*left, p)?),
-            right: Box::new(translate_expr(*right, p)?),
-        }),
+        sp::Expr::BinaryOp { left, op, right } => {
+            // `ts ± INTERVAL '…'` with calendar (month/year) parts: months
+            // have no fixed length, so this cannot fold to ms arithmetic —
+            // desugar onto the calendar-correct `add_months` instead (plus
+            // plain ms arithmetic for any fixed remainder, e.g. '1 mon 2h').
+            // Npgsql renders EF's AddMonths/AddYears exactly this way.
+            if let (sp::BinaryOperator::Plus | sp::BinaryOperator::Minus, sp::Expr::Interval(iv)) =
+                (&op, right.as_ref())
+            {
+                let (months, ms) = interval_parts(iv)?;
+                if months != 0 {
+                    let sign = if matches!(op, sp::BinaryOperator::Minus) { -1 } else { 1 };
+                    let mut e = Expr::Func {
+                        func: ScalarFunc::AddMonths,
+                        args: vec![
+                            translate_expr(*left, p)?,
+                            Expr::Literal(Value::Int(sign * months)),
+                        ],
+                    };
+                    if ms != 0 {
+                        e = Expr::Binary {
+                            op: BinOp::Add,
+                            left: Box::new(e),
+                            right: Box::new(Expr::Literal(Value::Int(sign * ms))),
+                        };
+                    }
+                    return Ok(e);
+                }
+            }
+            Ok(Expr::Binary {
+                op: map_binary_op(&op)?,
+                left: Box::new(translate_expr(*left, p)?),
+                right: Box::new(translate_expr(*right, p)?),
+            })
+        }
         sp::Expr::Function(f) => translate_function(f, p),
         sp::Expr::InList {
             expr,
@@ -2241,8 +2271,34 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
         }),
         // `INTERVAL '...'` — a fixed-length duration folded to a millisecond
         // integer literal, so `ts + INTERVAL '1 hour'` is plain arithmetic.
-        // Calendar units (month/year) have no fixed length and are rejected.
+        // Calendar units (month/year) have no fixed length and are rejected
+        // here; `ts ± INTERVAL` desugars them onto add_months above.
         sp::Expr::Interval(iv) => Ok(Expr::Literal(Value::Int(interval_ms(&iv)?))),
+        // `x AT TIME ZONE 'UTC'` is the identity here: the engine's
+        // timestamps *are* UTC epoch-ms, and every date_part/date_trunc
+        // already does UTC calendar math. Any other zone would need a tz
+        // database the engine deliberately does not carry — refused by name.
+        sp::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            let zone = match time_zone.as_ref() {
+                sp::Expr::Value(v) => match &v.value {
+                    sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
+                        s.clone()
+                    }
+                    other => format!("{other}"),
+                },
+                other => format!("{other}"),
+            };
+            if zone.eq_ignore_ascii_case("utc") || zone.eq_ignore_ascii_case("etc/utc") {
+                translate_expr(*timestamp, p)
+            } else {
+                Err(SqlError::Unsupported(format!(
+                    "AT TIME ZONE {zone:?} (only 'UTC' — the engine's timestamps are UTC)"
+                )))
+            }
+        }
         other => Err(SqlError::Unsupported(format!("expression {other:?}"))),
     }
 }
@@ -2365,12 +2421,34 @@ fn fixed_unit_ms(unit: &str) -> Option<i64> {
     })
 }
 
-/// Fold an `INTERVAL` literal to milliseconds. Two source shapes:
-/// `INTERVAL '7' DAY` (unit in `leading_field`) and the PostgreSQL string
-/// form `INTERVAL '7 days'` / `'1 day 2 hours'` (units inside the string).
+/// Months per calendar interval unit; `None` for fixed-length units.
+fn calendar_unit_months(unit: &str) -> Option<i64> {
+    Some(match unit.trim_end_matches('s') {
+        "mon" | "month" => 1,
+        "year" | "yr" => 12,
+        _ => return None,
+    })
+}
+
+/// Fold an `INTERVAL` literal to milliseconds. Calendar (month/year) parts
+/// have no fixed length, so a literal carrying any is refused here — the one
+/// place they are meaningful is direct `ts ± INTERVAL` arithmetic, which
+/// [`translate_expr`] desugars onto `add_months` before this is consulted.
 fn interval_ms(iv: &sp::Interval) -> Result<i64> {
-    let calendar =
-        |u: &str| SqlError::Unsupported(format!("calendar INTERVAL unit {u} (month/year)"));
+    let (months, ms) = interval_parts(iv)?;
+    if months != 0 {
+        return Err(SqlError::Unsupported(
+            "calendar INTERVAL unit months (month/year) outside timestamp ± INTERVAL".into(),
+        ));
+    }
+    Ok(ms)
+}
+
+/// Decompose an `INTERVAL` literal into `(calendar months, fixed ms)`. Two
+/// source shapes: `INTERVAL '7' DAY` (unit in `leading_field`) and the
+/// PostgreSQL string form `INTERVAL '7 days'` / `'1 mon 2 hours'` (units
+/// inside the string — Npgsql renders `AddMonths` as `+ INTERVAL '1 mons'`).
+fn interval_parts(iv: &sp::Interval) -> Result<(i64, i64)> {
     let bad = || SqlError::Parse(format!("bad INTERVAL literal {:?}", iv.value));
     if iv.last_field.is_some() {
         return Err(SqlError::Unsupported("INTERVAL ... TO ... ranges".into()));
@@ -2393,23 +2471,45 @@ fn interval_ms(iv: &sp::Interval) -> Result<i64> {
             DatePart::Hour => 3_600_000,
             DatePart::Day => 86_400_000,
             DatePart::Week => 604_800_000,
-            _ => return Err(calendar(&format!("{field}"))),
+            DatePart::Month | DatePart::Year => {
+                if n.fract() != 0.0 {
+                    return Err(SqlError::Unsupported(
+                        "fractional calendar INTERVAL".into(),
+                    ));
+                }
+                let per = if matches!(map_date_part(field)?, DatePart::Year) { 12 } else { 1 };
+                return Ok((n as i64 * per, 0));
+            }
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "INTERVAL unit {other:?}"
+                )));
+            }
         };
-        return Ok((n * unit as f64).round() as i64);
+        return Ok((0, (n * unit as f64).round() as i64));
     }
     // String form: one or more `<number> <unit>` pairs.
     let tokens: Vec<&str> = body.split_whitespace().collect();
     if tokens.is_empty() || tokens.len() % 2 != 0 {
         return Err(bad());
     }
-    let mut total = 0i64;
+    let (mut months, mut total) = (0i64, 0i64);
     for pair in tokens.chunks(2) {
         let n: f64 = pair[0].parse().map_err(|_| bad())?;
         let unit = pair[1].to_ascii_lowercase();
-        let ms = fixed_unit_ms(&unit).ok_or_else(|| calendar(&unit))?;
+        if let Some(per) = calendar_unit_months(&unit) {
+            if n.fract() != 0.0 {
+                return Err(SqlError::Unsupported("fractional calendar INTERVAL".into()));
+            }
+            months += n as i64 * per;
+            continue;
+        }
+        let ms = fixed_unit_ms(&unit).ok_or_else(|| {
+            SqlError::Unsupported(format!("INTERVAL unit {unit}"))
+        })?;
         total += (n * ms as f64).round() as i64;
     }
-    Ok(total)
+    Ok((months, total))
 }
 
 /// Rewrite an EXISTS subquery body's projection to the literal `1` (its
@@ -2540,6 +2640,21 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             return Err(SqlError::Unsupported("date_trunc() OVER (...)".into()));
         }
         let mut exprs = unnamed_args(args, p)?;
+        // The PostgreSQL 14+ 3-argument form names a time zone. 'UTC' is the
+        // identity here (the engine's calendar math is UTC); anything else is
+        // refused, same rule as `AT TIME ZONE`. Npgsql renders `.Date` on a
+        // timestamptz exactly this way.
+        if exprs.len() == 3 {
+            match exprs.pop() {
+                Some(Expr::Literal(Value::Text(z)))
+                    if z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("etc/utc") => {}
+                other => {
+                    return Err(SqlError::Unsupported(format!(
+                        "date_trunc() time zone {other:?} (only 'UTC' — the engine's timestamps are UTC)"
+                    )));
+                }
+            }
+        }
         if exprs.len() != 2 {
             return Err(SqlError::Unsupported(format!(
                 "date_trunc() with {} arguments",

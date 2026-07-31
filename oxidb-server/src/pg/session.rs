@@ -186,7 +186,26 @@ impl PgSession {
         params: &[Value],
         formats: &[i16],
     ) -> Result<Vec<Reply>, PgError> {
-        if let Some(replies) = super::catalog::intercept(self, sql)? {
+        if let Some(mut replies) = super::catalog::intercept(self, sql)? {
+            // Canned replies are built in text format, but this portal's Bind
+            // may have asked for binary — and Npgsql decodes *only* binary
+            // for the types it has handlers for, so a text-format bool comes
+            // back to the application as the string "t" (how EF Core's
+            // EnsureCreated broke: its HasTables boolean materialized as a
+            // string). Honour the requested formats exactly as engine
+            // results do, where the encoding is actually available.
+            for r in &mut replies {
+                if let Reply::Rows { fields, .. } = r {
+                    for (i, f) in fields.iter_mut().enumerate() {
+                        let want = format_for(formats, i);
+                        if want == super::types::FORMAT_BINARY
+                            && super::types::can_binary(f.type_oid)
+                        {
+                            f.format = super::types::FORMAT_BINARY;
+                        }
+                    }
+                }
+            }
             return Ok(replies);
         }
         self.guard(sql)?;

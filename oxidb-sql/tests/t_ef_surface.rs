@@ -126,11 +126,51 @@ fn interval_arithmetic() {
         ),
         vec![vec![i(3_600_000)]]
     );
-    // Calendar units have no fixed length.
-    assert!(db.execute("SELECT NOW() + INTERVAL '1 month'").is_err());
-    assert!(db.execute("SELECT NOW() + INTERVAL '1' YEAR").is_err());
+    // Calendar units have no fixed length, so `ts ± INTERVAL` desugars them
+    // onto the calendar-correct add_months (Npgsql renders EF's
+    // AddMonths/AddYears exactly this way). Day-clamping like add_months.
+    eq("TIMESTAMP '2026-01-31' + INTERVAL '1 month' = TIMESTAMP '2026-02-28'");
+    eq("TIMESTAMP '2026-03-31' - INTERVAL '1 mons' = TIMESTAMP '2026-02-28'");
+    eq("TIMESTAMP '2026-07-13' + INTERVAL '1' YEAR = TIMESTAMP '2027-07-13'");
+    // Mixed calendar + fixed parts: months via add_months, remainder as ms.
+    eq("TIMESTAMP '2026-07-13' + INTERVAL '1 mon 2 hours' = TIMESTAMP '2026-08-13 02:00:00'");
+    // Outside ± arithmetic a calendar interval still has no ms value.
+    assert!(db.execute("SELECT INTERVAL '1 month'").is_err());
+    assert!(db.execute("SELECT 2 * INTERVAL '1 month'").is_err());
     // Fractional-ms arithmetic (EF AddDays(double)) stays a timestamp.
     eq("TIMESTAMP '2026-07-13' + 0.5 * 86400000 = TIMESTAMP '2026-07-13 12:00:00'");
+}
+
+#[test]
+fn at_time_zone_utc_is_identity() {
+    let (_d, db) = open();
+    // Npgsql wraps every timestamptz member access in `AT TIME ZONE 'UTC'`;
+    // the engine's timestamps are UTC epoch-ms, so it is the identity. Any
+    // other zone would need a tz database and is refused by name — silently
+    // ignoring it would answer with the wrong clock.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT date_part('year', TIMESTAMP '2026-07-13' AT TIME ZONE 'UTC')"
+        ),
+        vec![vec![i(2026)]]
+    );
+    assert!(
+        db.execute("SELECT TIMESTAMP '2026-07-13' AT TIME ZONE 'Europe/Istanbul'")
+            .is_err()
+    );
+    // The PostgreSQL 14+ 3-argument date_trunc names a zone too — same rule.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT date_trunc('day', TIMESTAMP '2026-07-13 14:30:00', 'UTC') = TIMESTAMP '2026-07-13'"
+        ),
+        vec![vec![b(true)]]
+    );
+    assert!(
+        db.execute("SELECT date_trunc('day', NOW(), 'Europe/Istanbul')")
+            .is_err()
+    );
 }
 
 #[test]

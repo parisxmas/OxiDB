@@ -422,6 +422,26 @@ fn catalog_query(
         ));
     }
 
+    // Npgsql EF's `RelationalDatabaseCreator.HasTables` probe (EnsureCreated
+    // runs it to decide whether to create the schema): an aggregate over
+    // pg_class asking one boolean — "does any user table exist?". Matched on
+    // its own shape and answered as that boolean; without this it fell
+    // through to the table-list handler below, whose 4-column reply EF
+    // scalar-reads and null-refs on. Values from the engine's catalog, as
+    // everywhere in this module.
+    if norm.contains("pg_class") && norm.contains("case when count(*)") {
+        let any = session
+            .engine
+            .execute("SHOW TABLES")
+            .map_err(PgError::from)?
+            .first()
+            .is_some_and(|r| matches!(r, oxidb_sql::QueryResult::Select { rows, .. } if !rows.is_empty()));
+        return Ok(Some(vec![typed_rows(
+            &[("case", types::OID_BOOL)],
+            vec![vec![Value::Bool(any)]],
+        )]));
+    }
+
     // psql's \dt — answered from the engine's own catalog. Guarded by what it
     // must *not* mention, so a catalog query about indexes, constraints or
     // settings falls through to the refusal instead of being handed a list of
@@ -435,6 +455,9 @@ fn catalog_query(
         "pg_get_indexdef",
         "indisprimary",
         "information_schema.",
+        // An aggregate wants a number (or the bool above), never a table
+        // list — a count answered with rows is believed and mis-read.
+        "count(",
     ];
     if norm.contains("pg_class")
         && norm.contains("relkind")

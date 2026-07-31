@@ -157,9 +157,13 @@ fn bytea_to_text(b: &[u8]) -> String {
 /// Render a value in binary format for a column advertised as `oid`.
 ///
 /// Only the types whose binary layout is unambiguous and cheap are supported;
-/// `numeric` (base-10000 digit groups) and the date/time types are refused by
-/// [`can_binary`] before we get here, so a client asking for them gets a clear
-/// error rather than mis-decoded data.
+/// `numeric` (base-10000 digit groups) is refused by [`can_binary`] before we
+/// get here, so a client asking for it gets a clear error rather than
+/// mis-decoded data. Timestamps are supported: the binary layout is a single
+/// int64 of microseconds since 2000-01-01T00:00:00 (both with and without
+/// time zone — the engine's timestamps are UTC epoch-ms, so the two are the
+/// same instant), and Npgsql requests binary results for every type it has a
+/// handler for, timestamps included.
 pub fn to_binary(v: &Value, oid: i32) -> Option<Vec<u8>> {
     let b = match v {
         Value::Null => return None,
@@ -175,9 +179,12 @@ pub fn to_binary(v: &Value, oid: i32) -> Option<Vec<u8>> {
         Value::Bool(b) => vec![u8::from(*b)],
         Value::Text(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => b.to_vec(),
-        // Refused by can_binary; rendering the text form is the least-wrong
-        // fallback if one ever slips through.
-        Value::Timestamp(ms) => timestamp_to_text(*ms).into_bytes(),
+        Value::Timestamp(ms) => match oid {
+            OID_TIMESTAMP | OID_TIMESTAMPTZ => ((*ms - PG_EPOCH_MS) * 1000).to_be_bytes().to_vec(),
+            // A timestamp headed for a column advertised as something else
+            // (text, say): the text form is the least-wrong rendering.
+            _ => timestamp_to_text(*ms).into_bytes(),
+        },
         Value::Decimal(d) => d.to_string().into_bytes(),
     };
     Some(b)
@@ -188,9 +195,13 @@ pub fn can_binary(oid: i32) -> bool {
     matches!(
         oid,
         OID_BOOL | OID_BYTEA | OID_INT2 | OID_INT4 | OID_INT8 | OID_FLOAT4 | OID_FLOAT8 | OID_TEXT
-            | OID_VARCHAR
+            | OID_VARCHAR | OID_TIMESTAMP | OID_TIMESTAMPTZ
     )
 }
+
+/// 2000-01-01T00:00:00Z (the PostgreSQL binary timestamp epoch) in Unix
+/// epoch milliseconds.
+const PG_EPOCH_MS: i64 = 946_684_800_000;
 
 /// The name a type OID is known by, for error messages.
 pub fn oid_name(oid: i32) -> &'static str {
@@ -289,6 +300,12 @@ fn decode_binary_param(bytes: &[u8], oid: i32) -> Result<Value, String> {
                 .map_err(|_| "binary text parameter is not valid UTF-8".to_string())?
                 .into(),
         ),
+        // int64 microseconds since 2000-01-01T00:00:00 (UTC either way — the
+        // engine's timestamps are UTC epoch-ms). div_euclid so pre-2000
+        // instants round toward earlier, not toward zero.
+        OID_TIMESTAMP | OID_TIMESTAMPTZ => {
+            Value::Timestamp(int(8)?.div_euclid(1000) + PG_EPOCH_MS)
+        }
         other => {
             return Err(format!(
                 "binary parameter format for type {} is not supported — send it as text",
