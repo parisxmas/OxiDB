@@ -20,11 +20,19 @@ oxidb.init();
 // the Cache API (versioned) and later visits never touch the network — the
 // database itself rebuilds locally in about a second, so caching the FILES
 // (byte-identical, no staleness logic) beats persisting the DB image.
-const DATA_CACHE = "geo-globe-data-v1";
+const DATA_CACHE = "geo-globe-data-v2";
+// Old data versions must not linger (19 MB each); the empty new cache also
+// resets the consent flow below, so a returning "yes" refetches and re-asks.
+if ("caches" in window)
+  caches.keys().then((ks) =>
+    ks.forEach((k) => {
+      if (k.startsWith("geo-globe-data-") && k !== DATA_CACHE) caches.delete(k);
+    })
+  );
 const FILE_BYTES = {
   "./cities.json": 8559352,
-  "./roads.json": 9718386,
-  "./nodes.json": 867422,
+  "./roads.json": 9719480,
+  "./nodes.json": 867519,
   "./borders.json": 153875,
   "./land.json": 76677,
 };

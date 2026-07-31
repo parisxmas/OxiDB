@@ -30,6 +30,19 @@ KEEP_TYPES = {
 }
 EARTH_KM = 6371.0088
 
+# Fixed links newer than Natural Earth's digitization. NE has NO crossing of
+# the İzmit Gulf (its two Marmara "ferries" are Black Sea international
+# routes), so Istanbul→Bursa routed 300 km around the gulf. Each polyline's
+# join vertices land in the same SNAP cell as an existing road vertex, which
+# is exactly the near-miss-junction mechanism the grid pass implements.
+CURATED = [
+    # O-5 / Osmangazi Bridge (2016): D-100 at Dilovası → bridge → Orhangazi
+    # → Bursa ring. Joins: (29.5275,40.7874), (29.3031,40.4796), (29.0872,40.2728).
+    [(29.528, 40.787), (29.513, 40.757), (29.512, 40.712), (29.45, 40.63),
+     (29.36, 40.52), (29.303, 40.48), (29.19, 40.40), (29.10, 40.31),
+     (29.087, 40.273)],
+]
+
 
 def hav(a, b):
     dla = math.radians(b[1] - a[1])
@@ -53,6 +66,8 @@ def main(path):
         for coords in parts:
             if len(coords) >= 2:
                 raw_lines.append(([(round(x, 4), round(y, 4)) for x, y, *_ in coords], ferry))
+    for coords in CURATED:
+        raw_lines.append(([(round(x, 4), round(y, 4)) for x, y in coords], False))
 
     # TRUE planar noding: Natural Earth junctions are crossings, not shared
     # vertices — union the whole network so every intersection becomes a
