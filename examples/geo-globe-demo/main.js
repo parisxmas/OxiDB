@@ -32,6 +32,9 @@ const t1 = performance.now();
 oxidb.create_geo_index("cities", "loc");
 const indexMs = performance.now() - t1;
 
+document.getElementById("sub").textContent =
+  `${cities.length.toLocaleString()} cities in a document database compiled to ` +
+  `WebAssembly — every query below runs in this tab. No server.`;
 document.getElementById("docCount").textContent =
   `${cities.length.toLocaleString()} (${insertMs.toFixed(0)} ms)`;
 document.getElementById("indexMs").textContent = `${indexMs.toFixed(0)} ms`;
@@ -189,7 +192,9 @@ cities.forEach((c, i) => {
   const v = toXYZ(c.lon, c.lat);
   positions.set([v.x, v.y, v.z], i * 3);
   COL_BASE.toArray(colors, i * 3);
-  sizes[i] = 1.4 + Math.min(2.2, Math.log10(c.p) - 4.5); // population-weighted
+  // Population-weighted; GeoNames sometimes records 0 — clamp to the
+  // dataset's 15k floor so log10 stays finite.
+  sizes[i] = 1.4 + Math.min(2.2, Math.log10(Math.max(c.p, 15000)) - 4.5);
   indexByKey.set(`${c.lon},${c.lat}`, i);
 });
 const cityGeo = new THREE.BufferGeometry();
@@ -275,16 +280,30 @@ const flag = (cc) =>
 let picked = { lon: 28.9784, lat: 41.0082 }; // start on Istanbul
 let lastNear = [];
 
+// Slider position 1..100 → 15k..3M on a log scale; 0 = no filter.
+function minPopValue() {
+  const v = Number(document.getElementById("minpop").value);
+  if (v === 0) return 0;
+  return Math.round(10 ** (4.18 + (v / 100) * 2.12) / 1000) * 1000;
+}
+const fmtPop = (n) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
+
 function runQueries() {
   const { lon, lat } = picked;
   const radiusKm = Number(document.getElementById("radius").value);
+  const minPop = minPopValue();
+  document.getElementById("minPopLabel").textContent = minPop ? fmtPop(minPop) : "any";
 
   // $near — the cities inside the slider's radius, ranked by the engine.
   // Same radius as the $geoWithin below: the ring, the count and the list
   // tell one story (and two different operators agree on the answer).
+  // Geo composes with ordinary predicates: one query, both conditions,
+  // every candidate verified against the whole thing.
   const nearQ = {
     loc: { $near: { $geometry: { type: "Point", coordinates: [lon, lat] }, $maxDistance: radiusKm * 1000 } },
   };
+  if (minPop) nearQ.p = { $gte: minPop };
   let t = performance.now();
   const near = JSON.parse(oxidb.find("cities", JSON.stringify(nearQ)));
   const nearMs = performance.now() - t;
@@ -293,6 +312,7 @@ function runQueries() {
   const withinQ = {
     loc: { $geoWithin: { $centerSphere: [[lon, lat], radiusKm / EARTH_KM] } },
   };
+  if (minPop) withinQ.p = { $gte: minPop };
   t = performance.now();
   const within = JSON.parse(oxidb.find("cities", JSON.stringify(withinQ)));
   const withinMs = performance.now() - t;
@@ -374,6 +394,7 @@ document.getElementById("radius").addEventListener("input", (e) => {
   document.getElementById("radiusKm").textContent = e.target.value;
   runQueries();
 });
+document.getElementById("minpop").addEventListener("input", runQueries);
 
 // ── loop ───────────────────────────────────────────────────────────────────
 function resize() {

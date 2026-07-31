@@ -72,7 +72,7 @@
 
 <div id="panel">
   <h1><span>OxiDB</span> Geo Globe</h1>
-  <div class="sub">10,000 cities in a document database compiled to WebAssembly — every query below runs in this tab. No server.</div>
+  <div class="sub" id="sub">Cities in a document database compiled to WebAssembly — every query below runs in this tab. No server.</div>
   <div class="stat"><span>documents</span><b id="docCount">–</b></div>
   <div class="stat"><span>geohash index build</span><b id="indexMs">–</b></div>
   <div class="qline" id="nearQ">click the globe to run $near…</div>
@@ -83,6 +83,11 @@
     <span>$geoWithin</span>
     <input type="range" id="radius" min="50" max="2500" value="500" step="25">
     <span><span id="radiusKm">500</span> km → <span id="withinCount">–</span></span>
+  </div>
+  <div id="radiusRow" style="border-top:0; margin-top:4px; padding-top:0">
+    <span>population ≥</span>
+    <input type="range" id="minpop" min="0" max="100" value="0" step="1">
+    <span id="minPopLabel">any</span>
   </div>
   <div class="stat" style="margin-top:2px"><span>query time</span><b id="withinMs">–</b></div>
   <label class="stat" style="margin-top:8px; cursor:pointer; user-select:none">
@@ -100,6 +105,6 @@
 <script type="importmap">
   { "imports": { "three": "./three.module.js" } }
 </script>
-<script type="module" src="./main.js?v=10"></script>
+<script type="module" src="./main.js?v=12"></script>
 </body>
 </html>
