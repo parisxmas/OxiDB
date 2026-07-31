@@ -34,7 +34,7 @@ const FILE_BYTES = {
   "./cities.json": 8559352,
   "./roads.json": 9719480,
   "./nodes.json": 867519,
-  "./borders.json": 153875,
+  "./borders.json?v=2": 155031,
   "./land.json": 76677,
   // ?v=2: the file gained ISO codes; the query string gives it a fresh
   // cache key so a stored v2 cache refetches just this file (the stale
@@ -245,13 +245,20 @@ for (let lon = 0; lon < 360; lon += 30) {
 }
 scene.add(grat);
 
-// Country borders (Natural Earth 110m admin-0, compacted to rings).
-// Long edges are subdivided so a segment hugs the sphere instead of
-// chording through it.
+// Country borders (Natural Earth 110m admin-0, compacted to rings). Each
+// ring carries a color class from a build-time greedy graph coloring
+// (adjacency = shared boundary vertices; 5 classes cover the map), so
+// neighbouring countries always contrast. Long edges are subdivided so a
+// segment hugs the sphere instead of chording through it.
 {
-  const rings = await loadData("./borders.json", "country borders");
+  const rings = await loadData("./borders.json?v=2", "country borders");
+  const PALETTE = [0x7fb2e5, 0xe08a8a, 0x8fc98f, 0xe5c97a, 0xc09ad6].map(
+    (c) => new THREE.Color(c)
+  );
   const verts = [];
-  for (const ring of rings) {
+  const cols = [];
+  for (const [k, ring] of rings) {
+    const col = PALETTE[k % PALETTE.length];
     for (let i = 1; i < ring.length; i++) {
       const [lon0, lat0] = ring[i - 1];
       const [lon1, lat1] = ring[i];
@@ -263,16 +270,18 @@ scene.add(grat);
         const t = s / steps;
         const cur = toXYZ(lon0 + dlon * t, lat0 + (lat1 - lat0) * t, R * 0.999);
         verts.push(prev.x, prev.y, prev.z, cur.x, cur.y, cur.z);
+        cols.push(col.r, col.g, col.b, col.r, col.g, col.b);
         prev = cur;
       }
     }
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+  g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(cols), 3));
   scene.add(
     new THREE.LineSegments(
       g,
-      new THREE.LineBasicMaterial({ color: 0x5f83b3, transparent: true, opacity: 1.0 })
+      new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 })
     )
   );
 }
