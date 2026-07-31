@@ -255,7 +255,7 @@ scene.add(grat);
   scene.add(
     new THREE.LineSegments(
       g,
-      new THREE.LineBasicMaterial({ color: 0x28425f, transparent: true, opacity: 0.9 })
+      new THREE.LineBasicMaterial({ color: 0x5f83b3, transparent: true, opacity: 1.0 })
     )
   );
 }
