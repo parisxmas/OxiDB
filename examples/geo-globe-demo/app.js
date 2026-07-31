@@ -303,10 +303,17 @@ function buildCountryLabels() {
     ctx.fillText(c.n, w / 2, h / 2);
     const tex = new THREE.CanvasTexture(cv);
     tex.anisotropy = 4;
+    // sizeAttenuation off = constant screen size, like a map label — zooming
+    // changes what fits around a name, never the name itself.
     const s = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+      new THREE.SpriteMaterial({
+        map: tex,
+        transparent: true,
+        depthWrite: false,
+        sizeAttenuation: false,
+      })
     );
-    const scale = big ? 0.00072 : 0.0006;
+    const scale = big ? 0.00035 : 0.00029;
     s.scale.set(w * scale, h * scale, 1);
     s.position.copy(toXYZ(c.lon, c.lat, R * 1.005));
     s.userData.r = c.r;
