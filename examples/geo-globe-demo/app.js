@@ -192,9 +192,9 @@ cities.forEach((c, i) => {
   const v = toXYZ(c.lon, c.lat);
   positions.set([v.x, v.y, v.z], i * 3);
   COL_BASE.toArray(colors, i * 3);
-  // Population-weighted; GeoNames sometimes records 0 — clamp to the
-  // dataset's 15k floor so log10 stays finite.
-  sizes[i] = 1.4 + Math.min(2.2, Math.log10(Math.max(c.p, 15000)) - 4.5);
+  // Population-weighted; the dataset floor is now 1k (and GeoNames
+  // sometimes records 0) — clamp both the log argument and the size.
+  sizes[i] = Math.max(0.6, 1.4 + Math.min(2.2, Math.log10(Math.max(c.p, 1000)) - 4.5));
   indexByKey.set(`${c.lon},${c.lat}`, i);
 });
 const cityGeo = new THREE.BufferGeometry();
@@ -280,14 +280,13 @@ const flag = (cc) =>
 let picked = { lon: 28.9784, lat: 41.0082 }; // start on Istanbul
 let lastNear = [];
 
-// Slider position 1..100 → 15k..3M on a log scale; 0 = no filter.
+// Slider position 1..100 → 1k..3M on a log scale; 0 = no filter.
 function minPopValue() {
   const v = Number(document.getElementById("minpop").value);
   if (v === 0) return 0;
-  const raw = 10 ** (4.18 + (v / 100) * 2.12);
-  // Friendly steps: 5k granularity once past 25k (the default notch v=25
-  // lands exactly on 50,000).
-  const step = raw >= 25000 ? 5000 : 1000;
+  const raw = 10 ** (3.0 + (v / 100) * 3.48);
+  // Friendly steps; the default notch v=49 lands exactly on 50,000.
+  const step = raw >= 25000 ? 5000 : raw >= 5000 ? 1000 : 100;
   return Math.round(raw / step) * step;
 }
 const fmtPop = (n) =>
