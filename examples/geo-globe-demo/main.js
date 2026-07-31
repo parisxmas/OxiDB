@@ -261,10 +261,11 @@ function runQueries() {
   const { lon, lat } = picked;
   const radiusKm = Number(document.getElementById("radius").value);
 
-  // $near — nearest cities, ranked by the engine (capped at 3000 km so the
-  // index cover, not a whole-planet scan, serves it).
+  // $near — the cities inside the slider's radius, ranked by the engine.
+  // Same radius as the $geoWithin below: the ring, the count and the list
+  // tell one story (and two different operators agree on the answer).
   const nearQ = {
-    loc: { $near: { $geometry: { type: "Point", coordinates: [lon, lat] }, $maxDistance: 3_000_000 } },
+    loc: { $near: { $geometry: { type: "Point", coordinates: [lon, lat] }, $maxDistance: radiusKm * 1000 } },
   };
   let t = performance.now();
   const near = JSON.parse(oxidb.find("cities", JSON.stringify(nearQ)));
