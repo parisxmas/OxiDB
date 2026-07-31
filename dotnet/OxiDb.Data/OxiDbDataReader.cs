@@ -98,7 +98,7 @@ public sealed class OxiDbDataReader : DbDataReader
         _ => null,
     };
 
-    private static Type MapType(object? t) => t as string switch
+    private static Type MapType(object? t) => (t as string) switch
     {
         "INT" => typeof(long),
         "DOUBLE" => typeof(double),
