@@ -94,6 +94,16 @@
   </div>
   <div class="stat" style="margin-top:2px"><span>query time</span><b id="withinMs">–</b></div>
   <label class="stat" style="margin-top:8px; cursor:pointer; user-select:none">
+    <span>route mode (A → B on roads)</span>
+    <input type="checkbox" id="routemode" style="accent-color: var(--accent)">
+  </label>
+  <div id="routeInfo" style="display:none; margin-top:6px; padding-top:8px; border-top:1px solid var(--line)">
+    <div class="qline" id="routeQ">click A, then B…</div>
+    <div class="stat"><span>$near (snap A, B)</span><b id="snapMs">–</b></div>
+    <div class="stat"><span>$shortestPath</span><b id="routeMs">–</b></div>
+    <div class="stat"><span>route</span><b id="routeStat">–</b></div>
+  </div>
+  <label class="stat" style="margin-top:8px; cursor:pointer; user-select:none">
     <span>auto-rotate</span>
     <input type="checkbox" id="autorotate" style="accent-color: var(--accent)">
   </label>

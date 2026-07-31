@@ -6,6 +6,10 @@ rendered as a Three.js point-cloud globe. Click the globe to run a real
 `$geoWithin` with a spherical cap. Every query executes in the browser tab —
 there is no server.
 
+Route mode snaps two clicks to the road graph with `$near` and runs the
+engine's `$shortestPath` (Dijkstra) — the whole route is one aggregation
+in the tab.
+
 Live: https://oxidb.baltavista.com/demo/geo/
 
 ## Run locally
@@ -21,4 +25,7 @@ Live: https://oxidb.baltavista.com/demo/geo/
 - `cities.json` — 131,831 populated places from GeoNames cities1000
   (population ≥ 1,000; metro-thinned so districts merge into their city;
   CC BY 4.0, https://www.geonames.org/)
+- `roads.json` / `nodes.json` — routable graph from Natural Earth 10m roads
+  (public domain): planar-noded via shapely, dangling ends bridged ≤10 km,
+  ferries kept as sea links; built by `tools/build-roads.py`
 - `three.module.js`, `OrbitControls.js` — vendored three.js 0.166.1 (MIT)

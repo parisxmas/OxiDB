@@ -4,7 +4,7 @@
 // with a spherical cap. No server anywhere — the database is in this tab.
 import * as THREE from "three";
 import { OrbitControls } from "./OrbitControls.js";
-import init, * as oxidb from "./pkg/oxidb_wasm.js";
+import init, * as oxidb from "./pkg/oxidb_wasm.js?v=r1";
 
 const R = 1; // globe radius in scene units
 const EARTH_KM = 6371.0088;
@@ -32,12 +32,46 @@ const t1 = performance.now();
 oxidb.create_geo_index("cities", "loc");
 const indexMs = performance.now() - t1;
 
+bootmsg.textContent = "loading road network…";
+const [roadEdges, roadNodes] = await Promise.all([
+  (await fetch("./roads.json")).json(),
+  (await fetch("./nodes.json")).json(),
+]);
+// The engine gets LEAN edge documents (a, b, km, i); the drawing detail
+// (pts) stays in JS, looked up by the edge's `i` when a route comes back.
+const t2 = performance.now();
+const NB = 5000;
+for (let i = 0; i < roadNodes.length; i += NB) {
+  oxidb.insert_many(
+    "nodes",
+    JSON.stringify(roadNodes.slice(i, i + NB).map((p, k) => ({ i: i + k, loc: p })))
+  );
+}
+oxidb.create_geo_index("nodes", "loc");
+for (let i = 0; i < roadEdges.length; i += NB) {
+  oxidb.insert_many(
+    "roads",
+    JSON.stringify(
+      roadEdges.slice(i, i + NB).map((e, k) => {
+        const d = { i: i + k, a: e.a, b: e.b, km: e.km };
+        if (e.t) d.t = e.t;
+        return d;
+      })
+    )
+  );
+}
+oxidb.create_index("roads", "a");
+oxidb.create_index("roads", "b");
+const roadsMs = performance.now() - t2;
+
 document.getElementById("sub").textContent =
   `${cities.length.toLocaleString()} cities in a document database compiled to ` +
   `WebAssembly — every query below runs in this tab. No server.`;
 document.getElementById("docCount").textContent =
   `${cities.length.toLocaleString()} (${insertMs.toFixed(0)} ms)`;
-document.getElementById("indexMs").textContent = `${indexMs.toFixed(0)} ms`;
+document.getElementById("indexMs").textContent =
+  `${indexMs.toFixed(0)} ms · roads ${roadsMs.toFixed(0)} ms ` +
+  `(${roadEdges.length.toLocaleString()} edges)`;
 
 // ── scene ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById("scene");
@@ -244,6 +278,121 @@ const blinkMat = new THREE.MeshBasicMaterial({
 const blink = new THREE.Mesh(new THREE.SphereGeometry(0.011, 16, 16), blinkMat);
 blink.visible = false;
 scene.add(blink);
+// Route mode state: A/B endpoint markers and the drawn route.
+const routeGroup = new THREE.Group();
+scene.add(routeGroup);
+const mkEnd = (color) => {
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(0.007, 16, 16),
+    new THREE.MeshBasicMaterial({ color })
+  );
+  m.visible = false;
+  scene.add(m);
+  return m;
+};
+const endA = mkEnd(0x66bb6a);
+const endB = mkEnd(0xff5252);
+let routeA = null; // {lon, lat} once A is picked
+
+function clearRoute() {
+  routeGroup.clear();
+  endA.visible = false;
+  endB.visible = false;
+  routeA = null;
+  document.getElementById("routeQ").textContent = "click A, then B…";
+  document.getElementById("snapMs").textContent = "–";
+  document.getElementById("routeMs").textContent = "–";
+  document.getElementById("routeStat").textContent = "–";
+}
+
+function drawPolyline(pts, color, dashed = false) {
+  const verts = [];
+  for (let i = 1; i < pts.length; i++) {
+    const [lon0, lat0] = pts[i - 1];
+    const [lon1, lat1] = pts[i];
+    if (Math.abs(lon1 - lon0) > 180) continue;
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(lon1 - lon0), Math.abs(lat1 - lat0)) / 1));
+    let prev = toXYZ(lon0, lat0, R * 1.001);
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      const cur = toXYZ(lon0 + (lon1 - lon0) * t, lat0 + (lat1 - lat0) * t, R * 1.001);
+      verts.push(prev.x, prev.y, prev.z, cur.x, cur.y, cur.z);
+      prev = cur;
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+  const mat = dashed
+    ? new THREE.LineDashedMaterial({ color, dashSize: 0.02, gapSize: 0.015 })
+    : new THREE.LineBasicMaterial({ color, linewidth: 2 });
+  const line = new THREE.LineSegments(g, mat);
+  if (dashed) line.computeLineDistances();
+  routeGroup.add(line);
+}
+
+async function runRoute(b) {
+  const a = routeA;
+  document.getElementById("routeQ").textContent =
+    `$near ×2 → $shortestPath [${a.lon.toFixed(1)},${a.lat.toFixed(1)}] → [${b.lon.toFixed(1)},${b.lat.toFixed(1)}]`;
+  // Snap both ends to the road graph with $near (nearest node document).
+  const snap = (p) => {
+    const q = { loc: { $near: { $geometry: { type: "Point", coordinates: [p.lon, p.lat] }, $maxDistance: 1_000_000 } } };
+    const r = JSON.parse(oxidb.find("nodes", JSON.stringify(q)));
+    return r.length ? r[0].i : null;
+  };
+  let t = performance.now();
+  const src = snap(a);
+  const dst = snap(b);
+  const snapMs = performance.now() - t;
+  document.getElementById("snapMs").textContent = `${snapMs.toFixed(1)} ms (n${src} → n${dst})`;
+  if (src === null || dst === null) {
+    document.getElementById("routeStat").textContent = "no road within 1000 km";
+    return;
+  }
+  // The whole route is ONE aggregation: match the source node document,
+  // then $shortestPath over the edge collection.
+  t = performance.now();
+  const pipeline = [
+    { $match: { i: src } },
+    { $shortestPath: {
+        from: "roads",
+        source: "$i", target: dst,
+        edgeFrom: "a", edgeTo: "b",
+        weight: "km", undirected: true,
+        as: "route", costField: "totalKm",
+        maxCost: 30000,
+    } },
+  ];
+  let out;
+  try {
+    out = JSON.parse(oxidb.aggregate("nodes", JSON.stringify(pipeline)));
+  } catch (e) {
+    document.getElementById("routeStat").textContent = `error: ${String(e).slice(0, 80)}`;
+    return;
+  }
+  const routeMs = performance.now() - t;
+  document.getElementById("routeMs").textContent = `${routeMs.toFixed(1)} ms`;
+  const doc = out[0] ?? {};
+  if (!doc.route || !doc.route.length) {
+    // Honest failure: the network is real-world disconnected in places.
+    drawPolyline([[a.lon, a.lat], [b.lon, b.lat]], 0x7d8fac, true);
+    document.getElementById("routeStat").textContent =
+      doc.totalKm === 0 ? "same node" : "no route (disconnected network)";
+    return;
+  }
+  let ferries = 0;
+  for (const e of doc.route) {
+    const pts = roadEdges[e.i]?.pts;
+    if (!pts) continue;
+    const isFerry = e.t === "ferry" || e.t === "bridge";
+    if (isFerry) ferries++;
+    drawPolyline(pts, isFerry ? 0x4dd0e1 : 0xffe082, isFerry);
+  }
+  document.getElementById("routeStat").textContent =
+    `${Math.round(doc.totalKm).toLocaleString()} km · ${doc.route.length} segments` +
+    (ferries ? ` · ${ferries} ferry/bridge` : "");
+}
+
 let blinkStart = 0;
 function blinkAt(lon, lat) {
   blink.position.copy(toXYZ(lon, lat, R * 1.004));
@@ -383,8 +532,27 @@ canvas.addEventListener("pointerup", (e) => {
   ray.setFromCamera(ndc, camera);
   const hit = ray.intersectObject(globe, false)[0];
   if (!hit) return;
-  picked = toLonLat(hit.point);
+  const p = toLonLat(hit.point);
+  if (document.getElementById("routemode").checked) {
+    if (!routeA) {
+      clearRoute();
+      routeA = p;
+      endA.position.copy(toXYZ(p.lon, p.lat, R * 1.004));
+      endA.visible = true;
+      document.getElementById("routeQ").textContent = "A set — click B…";
+    } else {
+      endB.position.copy(toXYZ(p.lon, p.lat, R * 1.004));
+      endB.visible = true;
+      runRoute(p).then(() => (routeA = null));
+    }
+    return;
+  }
+  picked = p;
   runQueries();
+});
+document.getElementById("routemode").addEventListener("change", (e) => {
+  document.getElementById("routeInfo").style.display = e.target.checked ? "" : "none";
+  clearRoute();
 });
 document.getElementById("nearList").addEventListener("click", (e) => {
   const li = e.target.closest("li[data-i]");
@@ -416,6 +584,12 @@ renderer.setAnimationLoop(() => {
   if (marker.visible) {
     const d = camera.position.distanceTo(marker.position);
     marker.scale.setScalar(Math.min(1, d / 1.8));
+  }
+  for (const m of [endA, endB]) {
+    if (m.visible) {
+      const d = camera.position.distanceTo(m.position);
+      m.scale.setScalar(Math.min(1, d / 1.8));
+    }
   }
   if (blink.visible) {
     // Exactly two pulses: |sin| gives one 0→1→0 hump per 450 ms.
