@@ -460,10 +460,53 @@ const mkEnd = (color) => {
 };
 const endA = mkEnd(0x66bb6a);
 const endB = mkEnd(0xff5252);
+// Endpoint name tags: constant-screen-size sprites (like the country
+// labels), anchored just above their marker via sprite.center.
+const mkEndLabel = () => {
+  const s = new THREE.Sprite(
+    new THREE.SpriteMaterial({ transparent: true, depthWrite: false, sizeAttenuation: false })
+  );
+  s.center.set(0.5, -0.55); // render above the anchor point
+  s.visible = false;
+  scene.add(s);
+  return s;
+};
+const endALabel = mkEndLabel();
+const endBLabel = mkEndLabel();
+function setEndLabel(sprite, text, lon, lat) {
+  const fs = 30;
+  const font = `650 ${fs}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  const cv = document.createElement("canvas");
+  let ctx = cv.getContext("2d");
+  ctx.font = font;
+  const w = Math.ceil(ctx.measureText(text).width) + 16;
+  const h = fs + 14;
+  cv.width = w;
+  cv.height = h;
+  ctx = cv.getContext("2d");
+  ctx.font = font;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "rgba(4, 8, 16, 0.95)";
+  ctx.shadowBlur = 7;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, w / 2, h / 2);
+  sprite.material.map?.dispose();
+  const tex = new THREE.CanvasTexture(cv);
+  tex.anisotropy = 4;
+  sprite.material.map = tex;
+  sprite.material.needsUpdate = true;
+  const k = 0.00034;
+  sprite.scale.set(w * k, h * k, 1);
+  sprite.position.copy(toXYZ(lon, lat, R * 1.006));
+  sprite.visible = true;
+}
 function clearRoute() {
   routeGroup.clear();
   endA.visible = false;
   endB.visible = false;
+  endALabel.visible = false;
+  endBLabel.visible = false;
 }
 
 function drawPolyline(pts, color, dashed = false) {
@@ -741,6 +784,8 @@ function runQueries() {
     endA.position.copy(toXYZ(a.lon, a.lat, R * 1.004));
     endB.position.copy(toXYZ(b.lon, b.lat, R * 1.004));
     endA.visible = endB.visible = true;
+    setEndLabel(endALabel, `${flag(from.c)} ${from.n}`, a.lon, a.lat);
+    setEndLabel(endBLabel, `${flag(to.c)} ${to.n}`, b.lon, b.lat);
     document.getElementById("dirStat").textContent = "routing…";
     routeBetween(a, b).then((r) => {
       document.getElementById("dirStat").textContent = r ? r.msg : "?";
