@@ -344,7 +344,9 @@ function runQueries() {
   listEl.innerHTML = near
     .map((d, i) => {
       const km = hav([lon, lat], d.loc);
-      return `<li data-i="${i}"><span class="name">${flag(d.c)} ${d.n}</span><span class="km">${
+      return `<li data-i="${i}"><span class="name">${flag(d.c)} ${d.n}</span><span class="pop">${
+        d.p > 0 ? fmtPop(d.p) : ""
+      }</span><span class="km">${
         km < 10 ? km.toFixed(1) : Math.round(km).toLocaleString()
       } km</span></li>`;
     })

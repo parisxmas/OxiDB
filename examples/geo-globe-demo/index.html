@@ -45,7 +45,10 @@
           border-radius: 5px; }
   ol li:hover { background: rgba(77, 208, 225, 0.10); }
   ol li:first-child { border-top: 0; }
-  ol li .km { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  ol li .km { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap;
+              min-width: 52px; text-align: right; }
+  ol li .pop { color: var(--warm); opacity: 0.75; font-size: 11.5px; white-space: nowrap;
+               font-variant-numeric: tabular-nums; margin-left: auto; }
   ol li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #radiusRow { display: flex; align-items: center; gap: 10px; margin-top: 12px;
                padding-top: 10px; border-top: 1px solid var(--line); font-size: 12.5px; }
