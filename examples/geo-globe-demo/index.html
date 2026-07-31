@@ -40,8 +40,10 @@
        scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
   ol::-webkit-scrollbar { width: 6px; }
   ol::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
-  ol li { display: flex; justify-content: space-between; gap: 8px; padding: 3.5px 0;
-          border-top: 1px solid var(--line); font-size: 13px; }
+  ol li { display: flex; justify-content: space-between; gap: 8px; padding: 3.5px 6px;
+          border-top: 1px solid var(--line); font-size: 13px; cursor: pointer;
+          border-radius: 5px; }
+  ol li:hover { background: rgba(77, 208, 225, 0.10); }
   ol li:first-child { border-top: 0; }
   ol li .km { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
   ol li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -83,6 +85,10 @@
     <span><span id="radiusKm">500</span> km → <span id="withinCount">–</span></span>
   </div>
   <div class="stat" style="margin-top:2px"><span>query time</span><b id="withinMs">–</b></div>
+  <label class="stat" style="margin-top:8px; cursor:pointer; user-select:none">
+    <span>auto-rotate</span>
+    <input type="checkbox" id="autorotate" style="accent-color: var(--accent)">
+  </label>
 </div>
 
 <div id="hint">
@@ -94,6 +100,6 @@
 <script type="importmap">
   { "imports": { "three": "./three.module.js" } }
 </script>
-<script type="module" src="./main.js?v=5"></script>
+<script type="module" src="./main.js?v=10"></script>
 </body>
 </html>

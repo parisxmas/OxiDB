@@ -57,7 +57,7 @@ controls.dampingFactor = 0.06;
 controls.minDistance = 1.3;
 controls.maxDistance = 6;
 controls.enablePan = false;
-controls.autoRotate = true;
+controls.autoRotate = false; // the panel checkbox drives this
 controls.autoRotateSpeed = 0.5;
 
 function toXYZ(lon, lat, r = R) {
@@ -204,7 +204,7 @@ const cityMat = new THREE.ShaderMaterial({
     void main() {
       vc = color;
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      gl_PointSize = psize * (8.0 / -mv.z) * ${Math.min(devicePixelRatio, 2).toFixed(1)};
+      gl_PointSize = min(psize * (8.0 / -mv.z), psize * 5.0) * ${Math.min(devicePixelRatio, 2).toFixed(1)};
       gl_Position = projectionMatrix * mv;
     }`,
   fragmentShader: `
@@ -221,13 +221,30 @@ scene.add(cityPoints);
 
 // Pick marker + radius ring.
 const marker = new THREE.Mesh(
-  new THREE.SphereGeometry(0.012, 16, 16),
+  new THREE.SphereGeometry(0.007, 16, 16),
   new THREE.MeshBasicMaterial({ color: 0xff5252 })
 );
 marker.visible = false;
 scene.add(marker);
 const ringMat = new THREE.LineBasicMaterial({ color: 0xffb74d, transparent: true, opacity: 0.85 });
 let ring = null;
+
+// Blink halo: clicking a city in the list pulses this at its point.
+const blinkMat = new THREE.MeshBasicMaterial({
+  color: 0x4dd0e1,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+});
+const blink = new THREE.Mesh(new THREE.SphereGeometry(0.011, 16, 16), blinkMat);
+blink.visible = false;
+scene.add(blink);
+let blinkStart = 0;
+function blinkAt(lon, lat) {
+  blink.position.copy(toXYZ(lon, lat, R * 1.004));
+  blinkStart = performance.now();
+  blink.visible = true;
+}
 
 function drawRing(lon, lat, km) {
   if (ring) scene.remove(ring);
@@ -256,6 +273,7 @@ function drawRing(lon, lat, km) {
 const flag = (cc) =>
   cc.replace(/./g, (ch) => String.fromCodePoint(0x1f1e6 + ch.charCodeAt(0) - 65));
 let picked = { lon: 28.9784, lat: 41.0082 }; // start on Istanbul
+let lastNear = [];
 
 function runQueries() {
   const { lon, lat } = picked;
@@ -298,10 +316,11 @@ function runQueries() {
   };
   const listEl = document.getElementById("nearList");
   listEl.scrollTop = 0;
+  lastNear = near;
   listEl.innerHTML = near
-    .map((d) => {
+    .map((d, i) => {
       const km = hav([lon, lat], d.loc);
-      return `<li><span class="name">${flag(d.c)} ${d.n}</span><span class="km">${
+      return `<li data-i="${i}"><span class="name">${flag(d.c)} ${d.n}</span><span class="km">${
         km < 10 ? km.toFixed(1) : Math.round(km).toLocaleString()
       } km</span></li>`;
     })
@@ -339,9 +358,17 @@ canvas.addEventListener("pointerup", (e) => {
   ray.setFromCamera(ndc, camera);
   const hit = ray.intersectObject(globe, false)[0];
   if (!hit) return;
-  controls.autoRotate = false;
   picked = toLonLat(hit.point);
   runQueries();
+});
+document.getElementById("nearList").addEventListener("click", (e) => {
+  const li = e.target.closest("li[data-i]");
+  if (!li) return;
+  const d = lastNear[Number(li.dataset.i)];
+  if (d) blinkAt(d.loc[0], d.loc[1]);
+});
+document.getElementById("autorotate").addEventListener("change", (e) => {
+  controls.autoRotate = e.target.checked;
 });
 document.getElementById("radius").addEventListener("input", (e) => {
   document.getElementById("radiusKm").textContent = e.target.value;
@@ -358,6 +385,24 @@ addEventListener("resize", resize);
 resize();
 renderer.setAnimationLoop(() => {
   controls.update();
+  // Keep the pick marker a steady on-screen size: scale with camera
+  // distance (capped so it never balloons when zoomed far out).
+  if (marker.visible) {
+    const d = camera.position.distanceTo(marker.position);
+    marker.scale.setScalar(Math.min(1, d / 1.8));
+  }
+  if (blink.visible) {
+    // Exactly two pulses: |sin| gives one 0→1→0 hump per 450 ms.
+    const t = performance.now() - blinkStart;
+    if (t > 900) {
+      blink.visible = false;
+    } else {
+      const pulse = Math.abs(Math.sin((t * Math.PI) / 450));
+      const d = camera.position.distanceTo(blink.position);
+      blink.scale.setScalar((0.6 + 1.2 * pulse) * Math.min(1, d / 1.8));
+      blinkMat.opacity = 0.15 + 0.8 * pulse;
+    }
+  }
   renderer.render(scene, camera);
 });
 
