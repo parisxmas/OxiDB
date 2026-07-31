@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OxiDB Geo Globe — a database with geospatial queries, running in your browser</title>
+<style>
+  :root {
+    --bg: #060a12;
+    --panel: rgba(13, 20, 34, 0.88);
+    --line: #1e2b44;
+    --text: #d7e2f4;
+    --dim: #7d8fac;
+    --accent: #4dd0e1;
+    --warm: #ffb74d;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #scene { position: fixed; inset: 0; }
+  #panel {
+    position: fixed; top: 16px; right: 16px; width: 320px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; backdrop-filter: blur(8px);
+  }
+  #panel h1 { font-size: 15px; font-weight: 650; letter-spacing: 0.2px; }
+  #panel h1 span { color: var(--accent); }
+  #panel .sub { color: var(--dim); font-size: 12px; margin: 2px 0 12px; }
+  .stat { display: flex; justify-content: space-between; font-size: 12.5px; padding: 2px 0; }
+  .stat b { font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .qline { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+           color: var(--dim); margin: 10px 0 4px; white-space: nowrap; overflow: hidden;
+           text-overflow: ellipsis; }
+  .qline b { color: var(--warm); font-weight: 600; }
+  ol { list-style: none; margin: 6px 0 2px; }
+  ol li { display: flex; justify-content: space-between; gap: 8px; padding: 3.5px 0;
+          border-top: 1px solid var(--line); font-size: 13px; }
+  ol li:first-child { border-top: 0; }
+  ol li .km { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  ol li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #radiusRow { display: flex; align-items: center; gap: 10px; margin-top: 12px;
+               padding-top: 10px; border-top: 1px solid var(--line); font-size: 12.5px; }
+  #radius { flex: 1; accent-color: var(--accent); }
+  #withinCount { color: var(--warm); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #hint { position: fixed; left: 16px; bottom: 14px; color: var(--dim); font-size: 12px; }
+  #hint a { color: var(--accent); text-decoration: none; }
+  #boot {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: var(--bg); z-index: 10; transition: opacity 0.5s; font-size: 14px; color: var(--dim);
+  }
+  #boot .card { text-align: center; }
+  #boot b { color: var(--accent); }
+  @media (max-width: 720px) { #panel { width: calc(100vw - 32px); } }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div id="boot"><div class="card">
+  <div style="font-size:18px; margin-bottom:8px"><b>OxiDB</b> Geo Globe</div>
+  <div id="bootmsg">loading engine…</div>
+</div></div>
+
+<div id="panel">
+  <h1><span>OxiDB</span> Geo Globe</h1>
+  <div class="sub">10,000 cities in a document database compiled to WebAssembly — every query below runs in this tab. No server.</div>
+  <div class="stat"><span>documents</span><b id="docCount">–</b></div>
+  <div class="stat"><span>geohash index build</span><b id="indexMs">–</b></div>
+  <div class="qline" id="nearQ">click the globe to run $near…</div>
+  <div class="stat"><span>query time</span><b id="nearMs">–</b></div>
+  <ol id="nearList"></ol>
+  <div id="radiusRow">
+    <span>$geoWithin</span>
+    <input type="range" id="radius" min="50" max="2500" value="500" step="25">
+    <span><span id="radiusKm">500</span> km → <span id="withinCount">–</span></span>
+  </div>
+  <div class="stat" style="margin-top:2px"><span>query time</span><b id="withinMs">–</b></div>
+</div>
+
+<div id="hint">
+  drag to rotate · scroll to zoom · click to query ·
+  data <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> (CC BY 4.0) ·
+  <a href="https://oxidb.baltavista.com/wasm/" target="_blank">OxiDB WASM docs</a>
+</div>
+
+<script type="importmap">
+  { "imports": { "three": "./three.module.js" } }
+</script>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

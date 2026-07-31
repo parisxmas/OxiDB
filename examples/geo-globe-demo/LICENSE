@@ -1,0 +1,124 @@
+OxiDB Source-Available License 1.0
+
+Copyright (c) 2026 Barış AKIN. All rights reserved.
+
+This license governs use of the accompanying software (the "Software").
+If you use the Software, you accept this license. If you do not accept
+it, do not use the Software.
+
+Modelled on the Elastic License 2.0, with one limitation added:
+distributing the Software as part of a product requires a separate
+agreement with the Licensor. See COMMERCIAL-LICENSE.md.
+
+
+1. GRANT
+
+Subject to the limitations in section 2, you are granted a
+non-exclusive, royalty-free, worldwide, non-sublicensable,
+non-transferable license to use, copy, modify, and prepare derivative
+works of the Software, and to run the Software for your own purposes —
+including in production, to operate your own applications, products, or
+business.
+
+You may run any number of instances, for any workload, without payment
+or registration.
+
+
+2. LIMITATIONS
+
+You may not:
+
+   (a) Provide the Software to third parties as a hosted or managed
+       service, where the service gives those third parties access to
+       any substantial set of the features or functionality of the
+       Software.
+
+       Running the Software to serve your own application's users is
+       not covered by this limitation. Selling access to the Software
+       itself — as a database, a backend service, or a platform built
+       on it — is.
+
+   (b) Distribute the Software, or any derivative work of it, to third
+       parties, whether on its own or as a component of another
+       product, device, or offering.
+
+       Sending modifications to the Licensor, or moving the Software
+       between entities under common control with you, is not
+       distribution for this purpose.
+
+   (c) Move, change, disable, or circumvent any license key, license
+       check, usage limit, or other licensing functionality in the
+       Software, or remove or obscure any functionality it protects.
+
+   (d) Alter, remove, or obscure any licensing, copyright, or other
+       notice in the Software.
+
+Rights under (a) and (b) are available under a commercial license from
+the Licensor. See COMMERCIAL-LICENSE.md.
+
+
+3. PATENTS
+
+The Licensor grants you a license, under any patent claims the Licensor
+can license, to make, have made, use, and prepare derivative works of
+the Software, subject to the limitations in section 2. If you make any
+claim — including a cross-claim in a lawsuit — that the Software
+infringes a patent, this patent license ends immediately.
+
+
+4. NO OTHER RIGHTS
+
+This license grants no right in any trademark or logo of the Licensor,
+and no right that is not expressly stated here.
+
+
+5. TERMINATION
+
+If you use the Software in violation of this license, your rights under
+it terminate automatically. If the Licensor notifies you of the
+violation and you cure it within 30 days of first becoming aware of the
+notice, your rights are reinstated retroactively. This is available to
+you once for any given violation.
+
+
+6. CLIENT LIBRARIES
+
+The thin TCP client libraries — the Python `oxidb` package, the
+JavaScript clients, `OxiDb.Client.Tcp` / `OxiDb.Linq` / `OxiDb.Data` on
+NuGet, and the Go, Julia, Dart, PHP and Swift clients — are licensed
+separately under the MIT license and are not subject to this license.
+Talking to the Software from your own application needs no license of
+its own.
+
+Packages that bundle the engine itself — `oxidb-embedded` on PyPI,
+`OxiDb.Client.Embedded` on NuGet, and the FFI and WASM artifacts —
+contain the Software and are governed by this license.
+
+
+7. PRIOR VERSIONS
+
+Earlier versions were published under other licenses, and those grants
+are irrevocable for those specific published versions:
+
+   - early releases under "MIT OR Apache-2.0";
+   - releases up to and including v0.32.x under "AGPL-3.0-only";
+   - releases from v0.33.0 up to but not including v0.40.0 under the
+     OxiDB Proprietary License.
+
+Each remains available under the terms it was published with. This
+license applies to version 0.40.0 and every later version.
+
+
+8. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+
+9. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
