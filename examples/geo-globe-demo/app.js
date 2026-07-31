@@ -36,7 +36,10 @@ const FILE_BYTES = {
   "./nodes.json": 867519,
   "./borders.json": 153875,
   "./land.json": 76677,
-  "./countries.json": 8352,
+  // ?v=2: the file gained ISO codes; the query string gives it a fresh
+  // cache key so a stored v2 cache refetches just this file (the stale
+  // un-versioned entry is 8 KB of harmless dead weight).
+  "./countries.json?v=2": 9945,
 };
 const FETCH_SHARE = 0.8; // downloads own 80% of the bar; build steps the rest
 const bytesTotal = Object.values(FILE_BYTES).reduce((a, b) => a + b, 0);
@@ -278,18 +281,32 @@ scene.add(grat);
 // first toggle. Sprites sit just above the surface with depthTest on, so
 // the opaque globe hides the far-side names for free. When zoomed out only
 // the major countries (LABELRANK ≤ 4) show; zooming in reveals the rest.
-const countryData = await loadData("./countries.json", "country names");
+const countryData = await loadData("./countries.json?v=2", "country names");
 let countryLabels = null;
-function buildCountryLabels() {
+let labelsHaveFlags = null;
+const flagOf = (cc) =>
+  String.fromCodePoint(...[...cc].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+function ensureCountryLabels() {
+  const wantFlags = document.getElementById("countryflags").checked;
+  if (countryLabels && labelsHaveFlags === wantFlags) return;
+  if (countryLabels) {
+    scene.remove(countryLabels);
+    for (const s of countryLabels.children) {
+      s.material.map.dispose();
+      s.material.dispose();
+    }
+  }
+  labelsHaveFlags = wantFlags;
   countryLabels = new THREE.Group();
   for (const c of countryData) {
     const big = c.r <= 3;
     const fs = big ? 34 : 26;
     const font = `600 ${fs}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const text = wantFlags && c.c ? `${flagOf(c.c)} ${c.n}` : c.n;
     const cv = document.createElement("canvas");
     let ctx = cv.getContext("2d");
     ctx.font = font;
-    const w = Math.ceil(ctx.measureText(c.n).width) + 12;
+    const w = Math.ceil(ctx.measureText(text).width) + 12;
     const h = fs + 14;
     cv.width = w;
     cv.height = h;
@@ -300,7 +317,7 @@ function buildCountryLabels() {
     ctx.shadowColor = "rgba(4, 8, 16, 0.9)";
     ctx.shadowBlur = 6;
     ctx.fillStyle = big ? "#c8d8f0" : "#96abc9";
-    ctx.fillText(c.n, w / 2, h / 2);
+    ctx.fillText(text, w / 2, h / 2);
     const tex = new THREE.CanvasTexture(cv);
     tex.anisotropy = 4;
     // sizeAttenuation off = constant screen size, like a map label — zooming
@@ -322,8 +339,16 @@ function buildCountryLabels() {
   scene.add(countryLabels);
 }
 document.getElementById("countrynames").addEventListener("change", (e) => {
-  if (e.target.checked && !countryLabels) buildCountryLabels();
+  if (e.target.checked) ensureCountryLabels();
   if (countryLabels) countryLabels.visible = e.target.checked;
+});
+document.getElementById("countryflags").addEventListener("change", () => {
+  // Only rebuild when the labels are on screen; an off-screen toggle is
+  // picked up the next time the names checkbox builds them.
+  if (document.getElementById("countrynames").checked) {
+    ensureCountryLabels();
+    countryLabels.visible = true;
+  }
 });
 
 // Starfield.
