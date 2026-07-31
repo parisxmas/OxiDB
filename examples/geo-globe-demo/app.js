@@ -587,21 +587,32 @@ function runQueries() {
 // ── directions panel: Google-Maps-style from/to over the city list ─────────
 {
   const picked = { from: null, to: null };
+  // Case- and diacritic-folded matching: "istanbul", "İSTANBUL" and
+  // "ıstanbul" (Turkish keyboard) all find "Istanbul"; "kadikoy" finds
+  // "Kadıköy". NFD strips combining marks; ı folds to i explicitly
+  // (it has no combining mark to strip).
+  const fold = (t) =>
+    t
+      .toLowerCase()
+      .replaceAll("ı", "i")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+  const foldedNames = cities.map((c) => fold(c.n));
   const wire = (inputId, sugId, slot) => {
     const input = document.getElementById(inputId);
     const sug = document.getElementById(sugId);
     const hide = () => (sug.style.display = "none");
     input.addEventListener("input", () => {
       picked[slot] = null;
-      const q = input.value.trim().toLowerCase();
+      const q = fold(input.value.trim());
       if (q.length < 2) return hide();
       // Prefix matches first, then substring — biggest cities on top.
       const starts = [];
       const contains = [];
-      for (const c of cities) {
-        const n = c.n.toLowerCase();
-        if (n.startsWith(q)) starts.push(c);
-        else if (n.includes(q)) contains.push(c);
+      for (let i = 0; i < cities.length; i++) {
+        const n = foldedNames[i];
+        if (n.startsWith(q)) starts.push(cities[i]);
+        else if (n.includes(q)) contains.push(cities[i]);
         if (starts.length > 400) break;
       }
       const byPop = (a, b) => b.p - a.p;
@@ -613,7 +624,7 @@ function runQueries() {
             `<div data-i="${i}"><span>${flag(c.c)} ${c.n}</span><span class="cc">${fmtPop(Math.max(c.p, 1000))}</span></div>`
         )
         .join("");
-      sug.style.display = "";
+      sug.style.display = "block";
       [...sug.children].forEach((el, i) => {
         el.addEventListener("mousedown", (e) => {
           e.preventDefault();
