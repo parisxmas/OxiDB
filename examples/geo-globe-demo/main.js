@@ -284,7 +284,11 @@ let lastNear = [];
 function minPopValue() {
   const v = Number(document.getElementById("minpop").value);
   if (v === 0) return 0;
-  return Math.round(10 ** (4.18 + (v / 100) * 2.12) / 1000) * 1000;
+  const raw = 10 ** (4.18 + (v / 100) * 2.12);
+  // Friendly steps: 5k granularity once past 25k (the default notch v=25
+  // lands exactly on 50,000).
+  const step = raw >= 25000 ? 5000 : 1000;
+  return Math.round(raw / step) * step;
 }
 const fmtPop = (n) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
