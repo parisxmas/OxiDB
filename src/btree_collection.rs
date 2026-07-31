@@ -25,6 +25,7 @@ use crate::codec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::collection::load_index_metadata;
 use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
+use crate::geo::GeoIndex;
 use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
@@ -120,6 +121,7 @@ pub struct BTreeCollection {
     composite_indexes: RwLock<Vec<CompositeIndex>>,
     text_index: RwLock<Option<CollectionTextIndex>>,
     vector_indexes: RwLock<HashMap<String, VectorIndex>>,
+    geo_indexes: RwLock<HashMap<String, GeoIndex>>,
     doc_cache: DocCache, // Already thread-safe
     /// Sibling of `doc_cache` that holds OxiWire-encoded bytes per doc.
     /// Populated lazily by the wire-output path (and explicitly on insert)
@@ -428,6 +430,25 @@ impl BTreeCollection {
             })
             .transpose()?;
 
+        // Rebuild geo indexes the same way: only the definition persists,
+        // the geohash table is one document scan at open — paid only by
+        // collections that asked for geo.
+        let mut restored_geo: HashMap<String, GeoIndex> = HashMap::new();
+        for info in persisted_indexes.iter().filter(|i| i.index_type == "geo") {
+            if let Some(field) = info.fields.first() {
+                let mut gidx = GeoIndex::new();
+                storage.scan_all_while(|_id, bytes| {
+                    if let Ok(doc) = crate::codec::decode_doc(bytes)
+                        && let Some(id) = doc.get("_id").and_then(|v| v.as_u64())
+                    {
+                        gidx.upsert(id, resolve_field_in_value(&doc, field));
+                    }
+                    Ok(true)
+                })?;
+                restored_geo.insert(field.clone(), gidx);
+            }
+        }
+
         // Restore TTL index configs from persisted metadata
         let ttl_configs: Vec<TtlIndexConfig> = persisted_indexes
             .iter()
@@ -454,6 +475,7 @@ impl BTreeCollection {
             composite_indexes: RwLock::new(composite_indexes),
             text_index: RwLock::new(restored_text),
             vector_indexes: RwLock::new(HashMap::new()),
+            geo_indexes: RwLock::new(restored_geo),
             doc_cache: DocCache::new(crate::doc_cache::default_capacity()),
             bytes_cache: DocBytesCache::new(crate::doc_bytes_cache::default_capacity()),
             next_id: AtomicU64::new(max_id + 1),
@@ -478,6 +500,7 @@ impl BTreeCollection {
             composite_indexes: RwLock::new(Vec::new()),
             text_index: RwLock::new(None),
             vector_indexes: RwLock::new(HashMap::new()),
+            geo_indexes: RwLock::new(HashMap::new()),
             doc_cache: DocCache::new(crate::doc_cache::default_capacity()),
             bytes_cache: DocBytesCache::new(crate::doc_bytes_cache::default_capacity()),
             next_id: AtomicU64::new(1),
@@ -1350,6 +1373,12 @@ impl BTreeCollection {
                 let _ = idx.insert(id, &data_arc);
             }
         }
+        {
+            let mut gi = self.geo_indexes.write();
+            for (field, gidx) in gi.iter_mut() {
+                gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+            }
+        }
 
         // TTL
         self.register_ttl(id, &data_arc);
@@ -1501,6 +1530,12 @@ impl BTreeCollection {
                 for idx in vi.values_mut() {
                     let _ = idx.insert(id, &data_arc);
                 }
+                {
+                    let mut gi = self.geo_indexes.write();
+                    for (field, gidx) in gi.iter_mut() {
+                        gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+                    }
+                }
                 if !skip_cache {
                     self.doc_cache.put(id, data_arc);
                 }
@@ -1586,6 +1621,12 @@ impl BTreeCollection {
                 for idx in vi.values_mut() {
                     let _ = idx.insert(id, &data_arc);
                 }
+                {
+                    let mut gi = self.geo_indexes.write();
+                    for (field, gidx) in gi.iter_mut() {
+                        gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+                    }
+                }
                 if !skip_cache {
                     self.doc_cache.put(id, data_arc);
                 }
@@ -1628,6 +1669,9 @@ impl BTreeCollection {
         opts: &FindOptions,
     ) -> Result<Vec<Arc<Value>>> {
         let query = query::parse_query(query_json)?;
+        // `$near` implies nearest-first ordering (unless the caller sorts
+        // explicitly), so the limit-before-sort fast paths must stand down.
+        let near = query::near_component(&query);
 
         // Fast path: Query::All with no sort — use B-tree cursor scan.
         // Decodes straight into the returned Arc (cache hits are reused);
@@ -1887,7 +1931,7 @@ impl BTreeCollection {
         // Standard path: index-accelerated or full B-tree cursor scan
         let skip_post_filter = query::is_fully_indexed(&query, &fi);
 
-        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() {
+        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() && near.is_none() {
             opts.limit.map(|l| l as usize)
         } else {
             None
@@ -1914,8 +1958,21 @@ impl BTreeCollection {
         }
 
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let mut candidate_ids = query::execute_indexed(&query, &fi, &ci);
         drop(ci);
+
+        // Geo index: the geohash cover nominates candidates; every one is
+        // verified against the exact predicate below (`matches_value`), so
+        // the cover may be generous but never wrong. Field indexes win when
+        // they already narrowed the query; geo carries the rest.
+        if candidate_ids.is_none()
+            && let Some((field, shape)) = query::geo_candidate_shape(&query)
+        {
+            let gi = self.geo_indexes.read();
+            if let Some(gidx) = gi.get(&field) {
+                candidate_ids = gidx.candidates(&shape);
+            }
+        }
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -2013,7 +2070,22 @@ impl BTreeCollection {
             // Actually, sort doesn't use field_indexes, so no need to re-acquire.
         }
 
-        // Apply sort -> skip -> limit
+        // Apply sort -> skip -> limit. `$near` sorts nearest-first when the
+        // caller gave no explicit sort (an explicit sort wins, as in MongoDB).
+        if opts.sort.is_none()
+            && let Some((field, near)) = &near
+        {
+            let center = near.center;
+            results.sort_by(|a, b| {
+                let d = |doc: &Arc<Value>| {
+                    resolve_field_in_value(doc, field)
+                        .and_then(crate::geo::point_of_value)
+                        .map(|p| crate::geo::haversine_m(center, p))
+                        .unwrap_or(f64::INFINITY)
+                };
+                d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         if let Some(sort_fields) = &opts.sort {
             results.sort_by(|a, b| {
                 for (field, order) in sort_fields {
@@ -2655,6 +2727,12 @@ impl BTreeCollection {
                 idx.remove(op.id);
                 let _ = idx.insert(op.id, &op.new_data);
             }
+            {
+                let mut gi = self.geo_indexes.write();
+                for (field, gidx) in gi.iter_mut() {
+                    gidx.upsert(op.id, resolve_field_in_value(&op.new_data, field));
+                }
+            }
 
             self.invalidate_bytes_cache(op.id);
             // Small updates keep the cache warm (read-after-write); bulk
@@ -2818,6 +2896,12 @@ impl BTreeCollection {
             idx.remove(id);
             let _ = idx.insert(id, &new_data);
         }
+        {
+            let mut gi = self.geo_indexes.write();
+            for (field, gidx) in gi.iter_mut() {
+                gidx.upsert(id, resolve_field_in_value(&new_data, field));
+            }
+        }
 
         self.invalidate_bytes_cache(id);
         self.doc_cache.put(id, Arc::new(new_data.clone()));
@@ -2948,6 +3032,12 @@ impl BTreeCollection {
             }
             for idx in vi.values_mut() {
                 idx.remove(op.id);
+            }
+            {
+                let mut gi = self.geo_indexes.write();
+                for gidx in gi.values_mut() {
+                    gidx.remove(op.id);
+                }
             }
 
             deleted_ids.push(op.id);
@@ -3413,6 +3503,22 @@ impl BTreeCollection {
                 expire_after_seconds: None,
             });
         }
+        // Geo AFTER vector — every write path holds the vector lock while
+        // taking the geo lock, so any reader taking both must use the same
+        // order or deadlock (found the hard way: a background metadata save
+        // met an insert halfway).
+        let gi = self.geo_indexes.read();
+        for field in gi.keys() {
+            indexes.push(IndexInfo {
+                name: format!("_geo_{field}"),
+                index_type: "geo".to_string(),
+                fields: vec![field.clone()],
+                unique: false,
+                dimension: None,
+                metric: None,
+                expire_after_seconds: None,
+            });
+        }
         let ttl_cfgs = self.ttl_configs.read();
         for cfg in ttl_cfgs.iter() {
             indexes.push(IndexInfo {
@@ -3447,17 +3553,37 @@ impl BTreeCollection {
                 return Ok(());
             }
         }
+        // Each arm RELEASES its lock before save_index_metadata(): the save
+        // re-enters list_indexes, which read-locks the same structures, and
+        // parking_lot locks are not reentrant — holding on self-deadlocks
+        // (found live by the geo arm; the text and vector arms carried the
+        // same latent bug).
         if name == "_text" {
-            let mut ti = self.text_index.write();
-            if ti.is_some() {
-                *ti = None;
+            let removed = {
+                let mut ti = self.text_index.write();
+                ti.take().is_some()
+            };
+            if removed {
                 let _ = self.save_index_metadata();
                 return Ok(());
             }
         }
         if let Some(field) = name.strip_prefix("_vec_") {
-            let mut vi = self.vector_indexes.write();
-            if vi.remove(field).is_some() {
+            let removed = {
+                let mut vi = self.vector_indexes.write();
+                vi.remove(field).is_some()
+            };
+            if removed {
+                let _ = self.save_index_metadata();
+                return Ok(());
+            }
+        }
+        if let Some(field) = name.strip_prefix("_geo_") {
+            let removed = {
+                let mut gi = self.geo_indexes.write();
+                gi.remove(field).is_some()
+            };
+            if removed {
                 let _ = self.save_index_metadata();
                 return Ok(());
             }
@@ -3506,6 +3632,32 @@ impl BTreeCollection {
         // first time this was reachable from outside the wire. `list_indexes`
         // already reports it, so this is all that was missing here; the in-RAM
         // collection has always done it.
+        let _ = self.save_index_metadata();
+        Ok(())
+    }
+
+    /// Create a geospatial (geohash) index on `field`. Idempotent; the table
+    /// is built by one scan now and rebuilt the same way at every open (only
+    /// the definition is persisted — the text index made the same deal).
+    pub fn create_geo_index(&self, field: &str) -> Result<()> {
+        {
+            let gi = self.geo_indexes.read();
+            if gi.contains_key(field) {
+                return Ok(());
+            }
+        }
+        let mut gidx = GeoIndex::new();
+        self.storage.scan_bytes_while(|bytes| {
+            let doc: Value = codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                gidx.upsert(id, resolve_field_in_value(&doc, field));
+            }
+            Ok(true)
+        })?;
+        {
+            let mut gi = self.geo_indexes.write();
+            gi.insert(field.to_string(), gidx);
+        }
         let _ = self.save_index_metadata();
         Ok(())
     }

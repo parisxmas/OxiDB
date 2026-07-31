@@ -2162,6 +2162,12 @@ impl OxiDb {
         col.create_text_index(fields)
     }
 
+    /// Create a geospatial (geohash) index on a point field. Idempotent.
+    pub fn create_geo_index(&self, collection: &str, field: &str) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.create_geo_index(field)
+    }
+
     pub fn text_search(&self, collection: &str, query: &str, limit: usize) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.text_search(query, limit)

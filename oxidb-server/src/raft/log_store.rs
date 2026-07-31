@@ -560,6 +560,16 @@ fn apply_request_in(
                 },
             }
         }
+        OxiDbRequest::CreateGeoIndex { collection, field } => {
+            match db.create_geo_index(&collection, &field) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!("geo index created"),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
         OxiDbRequest::CreateTextIndex { collection, fields } => {
             match db.create_text_index(&collection, fields) {
                 Ok(()) => OxiDbResponse::Ok {

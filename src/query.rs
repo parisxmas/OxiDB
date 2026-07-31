@@ -43,7 +43,9 @@ pub fn estimate_rows(
                 | QueryOp::ArrayAll(_)
                 | QueryOp::Size(_)
                 | QueryOp::Type(_)
-                | QueryOp::Mod(..) => None,
+                | QueryOp::Mod(..)
+                | QueryOp::GeoWithin(_)
+                | QueryOp::Near(_) => None,
             }
         }
         Query::And(subs) => {
@@ -152,6 +154,8 @@ pub enum QueryOp {
     Size(usize),               // array length: {"tags": {"$size": 3}}
     Type(String),              // JSON type check: {"field": {"$type": "string"}}
     Mod(i64, i64),             // modulo: {"qty": {"$mod": [4, 0]}}
+    GeoWithin(crate::geo::GeoShape), // {"loc": {"$geoWithin": {...}}}
+    Near(crate::geo::GeoNear),       // {"loc": {"$near": ...}} — also sorts, see find paths
 }
 
 #[derive(Debug, Clone)]
@@ -239,8 +243,12 @@ pub fn parse_query(query: &JsonValue) -> Result<Query> {
                     let has_ops = ops.keys().any(|k| k.starts_with('$'));
                     if has_ops {
                         for (op_key, op_val) in ops {
-                            // $options is consumed by $regex, skip it
-                            if op_key == "$options" {
+                            // $options is consumed by $regex; the
+                            // distances by $near. Skip all three here.
+                            if op_key == "$options"
+                                || op_key == "$maxDistance"
+                                || op_key == "$minDistance"
+                            {
                                 continue;
                             }
                             let op = parse_op(op_key, op_val, ops)?;
@@ -393,6 +401,12 @@ fn parse_op(
                 .ok_or_else(|| Error::InvalidQuery("$mod remainder must be an integer".into()))?;
             Ok(QueryOp::Mod(divisor, remainder))
         }
+        "$geoWithin" => crate::geo::shape_from_json(op_val)
+            .map(QueryOp::GeoWithin)
+            .map_err(Error::InvalidQuery),
+        "$near" | "$nearSphere" => crate::geo::near_from_json(op_val, sibling_ops)
+            .map(QueryOp::Near)
+            .map_err(Error::InvalidQuery),
         _ => Err(Error::InvalidQuery(format!("unknown operator: {}", op_key))),
     }
 }
@@ -578,8 +592,43 @@ fn execute_field_op(
         | QueryOp::ArrayAll(_)
         | QueryOp::Size(_)
         | QueryOp::Type(_)
-        | QueryOp::Mod(..) => return None,
+        | QueryOp::Mod(..)
+        | QueryOp::GeoWithin(_)
+        | QueryOp::Near(_) => return None,
     })
+}
+
+/// The single `$near` in `query` (top level, or a top-level AND branch):
+/// `(field, near)`. The find paths use it for MongoDB's implicit
+/// nearest-first ordering when the caller gave no explicit sort.
+pub fn near_component(query: &Query) -> Option<(String, crate::geo::GeoNear)> {
+    match query {
+        Query::Field {
+            field,
+            op: QueryOp::Near(near),
+        } => Some((field.clone(), *near)),
+        Query::And(subs) => subs.iter().find_map(near_component),
+        _ => None,
+    }
+}
+
+/// A geo predicate that can drive candidate selection through a geo index:
+/// the shape of a `$geoWithin`, or the max-distance circle of a `$near`.
+/// Only top-level (or top-level AND) predicates qualify — the candidate set
+/// must be a superset of the whole query's matches, and an OR branch is not.
+pub fn geo_candidate_shape(query: &Query) -> Option<(String, crate::geo::GeoShape)> {
+    match query {
+        Query::Field {
+            field,
+            op: QueryOp::GeoWithin(shape),
+        } => Some((field.clone(), *shape)),
+        Query::Field {
+            field,
+            op: QueryOp::Near(near),
+        } => near.cover_circle().map(|c| (field.clone(), c)),
+        Query::And(subs) => subs.iter().find_map(geo_candidate_shape),
+        _ => None,
+    }
 }
 
 /// Check if any element in a JSON array matches the inner query.
@@ -813,7 +862,9 @@ pub fn execute_indexed_lazy(
                 | QueryOp::ArrayAll(_)
                 | QueryOp::Size(_)
                 | QueryOp::Type(_)
-                | QueryOp::Mod(..) => return None,
+                | QueryOp::Mod(..)
+                | QueryOp::GeoWithin(_)
+                | QueryOp::Near(_) => return None,
             })
         }
         Query::And(subs) => {
@@ -911,6 +962,12 @@ fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
             Some(v) => json_type_matches(v, type_name),
             None => false,
         },
+        QueryOp::GeoWithin(shape) => field_val
+            .and_then(crate::geo::point_of_value)
+            .is_some_and(|p| shape.contains(p)),
+        QueryOp::Near(near) => field_val
+            .and_then(crate::geo::point_of_value)
+            .is_some_and(|p| near.matches(p)),
         QueryOp::Mod(divisor, remainder) => {
             // A zero divisor would panic on `%`; treat it as a non-match
             // rather than aborting the whole query (MongoDB rejects it).
@@ -1049,6 +1106,8 @@ pub fn is_fully_indexed(
                     | QueryOp::Size(_)
                     | QueryOp::Type(_)
                     | QueryOp::Mod(..)
+                    | QueryOp::GeoWithin(_)
+                    | QueryOp::Near(_)
             ) {
                 return false;
             }
@@ -1086,7 +1145,9 @@ pub fn count_indexed(
                 | QueryOp::ArrayAll(_)
                 | QueryOp::Size(_)
                 | QueryOp::Type(_)
-                | QueryOp::Mod(..) => return None,
+                | QueryOp::Mod(..)
+                | QueryOp::GeoWithin(_)
+                | QueryOp::Near(_) => return None,
             })
         }
         Query::And(subs) => {
@@ -1242,6 +1303,8 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                     | QueryOp::Size(_)
                     | QueryOp::Type(_)
                     | QueryOp::Mod(..)
+                    | QueryOp::GeoWithin(_)
+                    | QueryOp::Near(_)
             ) {
                 return None;
             }

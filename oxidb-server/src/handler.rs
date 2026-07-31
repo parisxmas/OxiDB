@@ -770,6 +770,21 @@ fn handle_request_session_inner(
             }
         }
 
+        "create_geo_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            match db.create_geo_index(col, field) {
+                Ok(()) => ok_bytes(json!("geo index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "create_text_index" => {
             let col = match collection.as_deref() {
                 Some(c) => c,

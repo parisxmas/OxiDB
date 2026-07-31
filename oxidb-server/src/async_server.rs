@@ -677,6 +677,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "create_unique_index"
             | "create_composite_index"
             | "create_text_index"
+            | "create_geo_index"
             | "drop_index"
             | "create_bucket"
             | "delete_bucket"
@@ -758,6 +759,10 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
                 fields: fields?,
             })
         }
+        "create_geo_index" => Some(OxiDbRequest::CreateGeoIndex {
+            collection: collection?,
+            field: request.get("field")?.as_str()?.to_string(),
+        }),
         "create_text_index" => {
             let fields: Option<Vec<String>> =
                 request.get("fields").and_then(|v| v.as_array()).map(|arr| {

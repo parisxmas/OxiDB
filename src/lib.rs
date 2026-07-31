@@ -24,6 +24,7 @@ pub mod document;
 pub mod engine;
 pub mod error;
 pub mod fts;
+pub mod geo;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod in_memory;

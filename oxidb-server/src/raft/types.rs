@@ -84,6 +84,10 @@ pub enum OxiDbRequest {
         collection: String,
         fields: Vec<String>,
     },
+    CreateGeoIndex {
+        collection: String,
+        field: String,
+    },
     DropIndex {
         collection: String,
         index: String,

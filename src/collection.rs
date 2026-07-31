@@ -107,6 +107,7 @@ pub struct Collection {
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
     vector_indexes: HashMap<String, VectorIndex>,
+    geo_indexes: HashMap<String, crate::geo::GeoIndex>,
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
     encryption: Option<Arc<EncryptionKey>>,
@@ -272,6 +273,7 @@ impl Collection {
         let mut composite_indexes: Vec<CompositeIndex> = Vec::new();
         let mut text_index: Option<CollectionTextIndex> = None;
         let mut vector_indexes: HashMap<String, VectorIndex> = HashMap::new();
+        let mut geo_indexes: HashMap<String, crate::geo::GeoIndex> = HashMap::new();
 
         for info in &persisted_indexes {
             match info.index_type.as_str() {
@@ -290,6 +292,11 @@ impl Collection {
                 }
                 "text" => {
                     text_index = Some(CollectionTextIndex::new(info.fields.clone()));
+                }
+                "geo" => {
+                    if let Some(field) = info.fields.first() {
+                        geo_indexes.insert(field.clone(), crate::geo::GeoIndex::new());
+                    }
                 }
                 "vector" => {
                     if let (Some(dim), Some(metric_str)) = (info.dimension, info.metric.as_deref())
@@ -337,7 +344,10 @@ impl Collection {
                     next_id = id + 1;
                 }
 
-                // Text index is always rebuilt from docs (not cached)
+                // Text and geo indexes are always rebuilt from docs (not cached)
+                for (field, gidx) in geo_indexes.iter_mut() {
+                    gidx.upsert(id, resolve_field_in_value(&doc, field));
+                }
                 if let Some(ref mut ti) = text_index {
                     let doc_arc = Arc::new(doc);
                     ti.index_doc(id, &doc_arc);
@@ -500,6 +510,7 @@ impl Collection {
             composite_indexes,
             text_index,
             vector_indexes,
+            geo_indexes,
             version_index,
             next_id,
             encryption,
@@ -531,6 +542,7 @@ impl Collection {
             composite_indexes: Vec::new(),
             text_index: None,
             vector_indexes: HashMap::new(),
+            geo_indexes: HashMap::new(),
             version_index: HashMap::new(),
             next_id: 1 + Self::shard_id_offset(),
             encryption: None,
@@ -954,6 +966,26 @@ impl Collection {
         Ok(())
     }
 
+    /// Create a geospatial (geohash) index on `field`. Idempotent; only the
+    /// definition is persisted — the table is rebuilt from documents at open,
+    /// the same deal the text index made.
+    pub fn create_geo_index(&mut self, field: &str) -> Result<()> {
+        if self.geo_indexes.contains_key(field) {
+            return Ok(());
+        }
+        let mut gidx = crate::geo::GeoIndex::new();
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                gidx.upsert(id, resolve_field_in_value(&doc, field));
+            }
+            Ok(true)
+        })?;
+        self.geo_indexes.insert(field.to_string(), gidx);
+        self.save_index_metadata()?;
+        Ok(())
+    }
+
     /// List all indexes on this collection.
     pub fn list_indexes(&self) -> Vec<IndexInfo> {
         let mut indexes = Vec::new();
@@ -988,6 +1020,17 @@ impl Collection {
                 name: "_text".to_string(),
                 index_type: "text".to_string(),
                 fields: text_idx.fields().to_vec(),
+                unique: false,
+                dimension: None,
+                metric: None,
+                expire_after_seconds: None,
+            });
+        }
+        for field in self.geo_indexes.keys() {
+            indexes.push(IndexInfo {
+                name: format!("_geo_{field}"),
+                index_type: "geo".to_string(),
+                fields: vec![field.clone()],
                 unique: false,
                 dimension: None,
                 metric: None,
@@ -1029,6 +1072,12 @@ impl Collection {
         {
             self.save_index_metadata()?;
             self.save_index_data();
+            return Ok(());
+        }
+        if let Some(field) = name.strip_prefix("_geo_")
+            && self.geo_indexes.remove(field).is_some()
+        {
+            self.save_index_metadata()?;
             return Ok(());
         }
         Err(Error::IndexNotFound(name.to_string()))
@@ -1307,6 +1356,9 @@ impl Collection {
         for idx in self.vector_indexes.values_mut() {
             let _ = idx.insert(id, &data_arc);
         }
+        for (field, gidx) in self.geo_indexes.iter_mut() {
+            gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+        }
 
         // TTL: if the document has a _ttl field (seconds), register expiry
         self.register_ttl(id, &data_arc);
@@ -1421,6 +1473,9 @@ impl Collection {
                 for idx in self.vector_indexes.values_mut() {
                     let _ = idx.insert(id, &data_arc);
                 }
+                for (field, gidx) in self.geo_indexes.iter_mut() {
+                    gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+                }
                 if !skip_cache {
                     self.doc_cache.put(id, data_arc);
                 }
@@ -1487,6 +1542,9 @@ impl Collection {
             for idx in self.vector_indexes.values_mut() {
                 let _ = idx.insert(id, &data_arc);
             }
+            for (field, gidx) in self.geo_indexes.iter_mut() {
+                gidx.upsert(id, resolve_field_in_value(&data_arc, field));
+            }
             self.doc_cache.put(id, data_arc);
             ids.push(id);
         }
@@ -1523,6 +1581,9 @@ impl Collection {
         opts: &FindOptions,
     ) -> Result<Vec<Arc<Value>>> {
         let query = query::parse_query(query_json)?;
+        // `$near` implies nearest-first ordering (unless the caller sorts
+        // explicitly), so the limit-before-sort fast paths must stand down.
+        let near = query::near_component(&query);
 
         // Fast path: Query::All with no sort — use streaming sequential scan.
         if matches!(query, Query::All) && opts.sort.is_none() {
@@ -1685,7 +1746,7 @@ impl Collection {
 
         let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
-        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() {
+        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() && near.is_none() {
             opts.limit.map(|l| l as usize)
         } else {
             None
@@ -1712,8 +1773,18 @@ impl Collection {
             }
         }
 
-        let candidate_ids =
+        let mut candidate_ids =
             query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
+
+        // Geo index: the geohash cover nominates candidates; every one is
+        // verified against the exact predicate below, so the cover may be
+        // generous but never wrong.
+        if candidate_ids.is_none()
+            && let Some((field, shape)) = query::geo_candidate_shape(&query)
+            && let Some(gidx) = self.geo_indexes.get(&field)
+        {
+            candidate_ids = gidx.candidates(&shape);
+        }
 
         if let Some(ref indexed_ids) = candidate_ids {
             const BATCH_THRESHOLD: usize = 1024;
@@ -1872,7 +1943,22 @@ impl Collection {
             }
         }
 
-        // Apply sort → skip → limit pipeline
+        // Apply sort → skip → limit pipeline. `$near` sorts nearest-first
+        // when the caller gave no explicit sort (an explicit sort wins).
+        if opts.sort.is_none()
+            && let Some((field, near)) = &near
+        {
+            let center = near.center;
+            results.sort_by(|a, b| {
+                let d = |doc: &Arc<Value>| {
+                    resolve_field_in_value(doc, field)
+                        .and_then(crate::geo::point_of_value)
+                        .map(|p| crate::geo::haversine_m(center, p))
+                        .unwrap_or(f64::INFINITY)
+                };
+                d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         if let Some(sort_fields) = &opts.sort {
             results.sort_by(|a, b| {
                 for (field, order) in sort_fields {
@@ -2462,6 +2548,9 @@ impl Collection {
                 idx.remove(op.id);
                 let _ = idx.insert(op.id, &op.new_data);
             }
+            for (field, gidx) in self.geo_indexes.iter_mut() {
+                gidx.upsert(op.id, resolve_field_in_value(&op.new_data, field));
+            }
             self.doc_cache.put(op.id, Arc::new(op.new_data));
         }
 
@@ -2581,6 +2670,9 @@ impl Collection {
             }
             for idx in self.vector_indexes.values_mut() {
                 idx.remove(op.id);
+            }
+            for gidx in self.geo_indexes.values_mut() {
+                gidx.remove(op.id);
             }
         }
 
@@ -2707,6 +2799,9 @@ impl Collection {
             for idx in self.vector_indexes.values_mut() {
                 idx.clear();
             }
+            for gidx in self.geo_indexes.values_mut() {
+                gidx.clear();
+            }
             for (&id, &loc) in &self.primary_index.clone() {
                 let bytes = self.storage.read(loc)?;
                 let data: Value = crate::codec::decode_doc(&bytes)?;
@@ -2724,6 +2819,9 @@ impl Collection {
                 }
                 for idx in self.vector_indexes.values_mut() {
                     let _ = idx.insert(id, &data_arc);
+                }
+                for (field, gidx) in self.geo_indexes.iter_mut() {
+                    gidx.upsert(id, resolve_field_in_value(&data_arc, field));
                 }
                 self.doc_cache.put(id, data_arc);
             }
@@ -2792,6 +2890,9 @@ impl Collection {
             for idx in self.vector_indexes.values_mut() {
                 idx.clear();
             }
+            for gidx in self.geo_indexes.values_mut() {
+                gidx.clear();
+            }
             for (&id, &loc) in &self.primary_index.clone() {
                 let bytes = self.storage.read(loc)?;
                 let data: Value = crate::codec::decode_doc(&bytes)?;
@@ -2809,6 +2910,9 @@ impl Collection {
                 }
                 for idx in self.vector_indexes.values_mut() {
                     let _ = idx.insert(id, &data_arc);
+                }
+                for (field, gidx) in self.geo_indexes.iter_mut() {
+                    gidx.upsert(id, resolve_field_in_value(&data_arc, field));
                 }
                 self.doc_cache.put(id, data_arc);
             }
@@ -3176,6 +3280,9 @@ impl Collection {
                 for idx in self.vector_indexes.values_mut() {
                     idx.remove(m.doc_id);
                 }
+                for gidx in self.geo_indexes.values_mut() {
+                    gidx.remove(m.doc_id);
+                }
             } else if let Some(loc) = new_locs[i] {
                 self.primary_index.insert(m.doc_id, loc);
                 let ver = m
@@ -3204,6 +3311,9 @@ impl Collection {
                 for idx in self.vector_indexes.values_mut() {
                     idx.remove(m.doc_id);
                     let _ = idx.insert(m.doc_id, &m.new_data);
+                }
+                for (field, gidx) in self.geo_indexes.iter_mut() {
+                    gidx.upsert(m.doc_id, resolve_field_in_value(&m.new_data, field));
                 }
                 self.doc_cache.put(m.doc_id, Arc::new(m.new_data.clone()));
             }
