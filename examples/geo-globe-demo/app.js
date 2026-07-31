@@ -21,8 +21,9 @@ oxidb.init();
 // database itself rebuilds locally in about a second, so caching the FILES
 // (byte-identical, no staleness logic) beats persisting the DB image.
 const DATA_CACHE = "geo-globe-data-v2";
-// Old data versions must not linger (19 MB each); the empty new cache also
-// resets the consent flow below, so a returning "yes" refetches and re-asks.
+// Old data versions must not linger (19 MB each). A returning "yes" visitor
+// misses the new empty cache, refetches, and the consent block silently
+// refills it — no re-ask, the consent covers the data, not one version.
 if ("caches" in window)
   caches.keys().then((ks) =>
     ks.forEach((k) => {
@@ -56,9 +57,10 @@ let servedFromCache = false;
 async function loadData(url, label) {
   bar(`loading ${label}…`);
   let resp = null;
+  let fromCache = false;
   if (persistChoice === "yes" && "caches" in window) {
     resp = await (await caches.open(DATA_CACHE)).match(url);
-    if (resp) servedFromCache = true;
+    if (resp) servedFromCache = fromCache = true;
   }
   if (!resp) resp = await fetch(url);
   const reader = resp.body.getReader();
@@ -81,7 +83,10 @@ async function loadData(url, label) {
     buf.set(c, o);
     o += c.length;
   }
-  if (persistChoice !== "yes") rawBuffers.set(url, buf);
+  // Keep every network-fetched body: either the user hasn't decided yet
+  // (kept until the consent dialog), or they said "yes" but the cache
+  // missed (evicted / version bump) and it must be silently refilled.
+  if (!fromCache) rawBuffers.set(url, buf);
   return JSON.parse(new TextDecoder().decode(buf));
 }
 
@@ -769,20 +774,7 @@ setTimeout(() => document.getElementById("boot").remove(), 600);
     localStorage.removeItem("geoPersist");
     clearRow.style.display = "none";
   });
-  if (persistChoice === "yes") {
-    if (servedFromCache) showClear();
-    else if ("caches" in window) {
-      // Chose to store earlier, but the cache is gone (cleared/evicted):
-      // quietly refill it from this visit's fetches next time around.
-      localStorage.removeItem("geoPersist");
-    }
-    if (persistChoice === "yes" && servedFromCache) return;
-  }
-  if (persistChoice === "no" || !("caches" in window)) return;
-  const ask = document.getElementById("persistAsk");
-  ask.style.display = "";
-  document.getElementById("persistYes").addEventListener("click", async () => {
-    ask.style.display = "none";
+  const store = async () => {
     const cache = await caches.open(DATA_CACHE);
     for (const [url, buf] of rawBuffers) {
       await cache.put(
@@ -793,6 +785,20 @@ setTimeout(() => document.getElementById("boot").remove(), 600);
     rawBuffers.clear();
     localStorage.setItem("geoPersist", "yes");
     showClear();
+  };
+  if (persistChoice === "yes") {
+    // Consent was already given. Anything the cache missed this visit
+    // (evicted, or a data-version bump) was fetched and kept in
+    // rawBuffers — refill silently instead of asking again.
+    if ("caches" in window) await store();
+    return;
+  }
+  if (persistChoice === "no" || !("caches" in window)) return;
+  const ask = document.getElementById("persistAsk");
+  ask.style.display = "";
+  document.getElementById("persistYes").addEventListener("click", async () => {
+    ask.style.display = "none";
+    await store();
   });
   document.getElementById("persistNo").addEventListener("click", () => {
     ask.style.display = "none";
