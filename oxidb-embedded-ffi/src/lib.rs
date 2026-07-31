@@ -762,6 +762,16 @@ pub unsafe extern "C" fn oxidb_execute(
 /// Serve a SQL-engine request. Same request/response shapes as the server:
 /// `{"engine":"sql","cmd":"sql","sql":"...","params":[...]}` →
 /// `{ok:true, data:[...one result per statement...]}`.
+///
+/// Interactive transactions work like ADR-0017's snapshots: the parked
+/// transaction's id is a **token the caller carries**, not handle state. A
+/// request may bring one in as `sql_tx`, and whenever a transaction is open
+/// after the statement runs, the envelope carries `sql_tx` back out — on
+/// errors too, since a failed statement inside a transaction does not end it.
+/// The TCP server threads the same id through its per-connection session;
+/// here the "session" is whoever holds the token, so several logical
+/// connections (say, ADO.NET ones) can share one engine handle without
+/// sharing transactions.
 fn handle_sql(h: &OxiDbHandle, request: &Value) -> Vec<u8> {
     if request.get("cmd").and_then(|v| v.as_str()) != Some("sql") {
         return err_bytes("SQL engine requests must use cmd \"sql\"");
@@ -772,10 +782,16 @@ fn handle_sql(h: &OxiDbHandle, request: &Value) -> Vec<u8> {
     let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'sql' field");
     };
-    match oxidb_sql::json::execute_json(&engine, sql, request.get("params"), false) {
-        Ok(results) => ok_bytes(results),
-        Err(msg) => err_bytes(&msg),
+    let mut tx: Option<u64> = request.get("sql_tx").and_then(|v| v.as_u64());
+    let mut envelope =
+        match oxidb_sql::json::execute_json_in_session(&engine, sql, request.get("params"), false, &mut tx) {
+            Ok(results) => json!({ "ok": true, "data": results }),
+            Err(msg) => json!({ "ok": false, "error": msg }),
+        };
+    if let Some(id) = tx {
+        envelope["sql_tx"] = json!(id);
     }
+    serde_json::to_vec(&envelope).unwrap()
 }
 
 /// Free a string returned by `oxidb_execute`. Safe to call with NULL.

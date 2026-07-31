@@ -36,6 +36,41 @@ public sealed class OxiDbEmbeddedClient : IOxiDbClient
         return new OxiDbEmbeddedClient(handle);
     }
 
+    /// <summary>
+    /// Execute a raw request (JSON text, same shapes as the wire protocol)
+    /// and return the raw <c>{ok, data | error}</c> envelope bytes,
+    /// unparsed and unthrown — the caller decodes, exactly as it would a
+    /// TCP response frame. This is the ADO.NET transport's entry point
+    /// (<c>OxiDb.Data</c> with <c>Path=</c>): its reader already knows how
+    /// to consume the envelope, so handing bytes through keeps one decode
+    /// path for both transports.
+    /// </summary>
+    public byte[] ExecuteRawBytes(string requestJson)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _lock.Wait();
+        try
+        {
+            var resultPtr = NativeInterop.Execute(_handle, requestJson);
+            if (resultPtr == 0)
+                throw new OxiDbEmbeddedException("FFI call returned null");
+            try
+            {
+                var json = Marshal.PtrToStringUTF8(resultPtr)
+                    ?? throw new OxiDbEmbeddedException("Failed to read FFI response");
+                return System.Text.Encoding.UTF8.GetBytes(json);
+            }
+            finally
+            {
+                NativeInterop.FreeString(resultPtr);
+            }
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
     private JsonElement Execute(Dictionary<string, object?> command)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
