@@ -36,6 +36,7 @@ const FILE_BYTES = {
   "./nodes.json": 867519,
   "./borders.json": 153875,
   "./land.json": 76677,
+  "./countries.json": 8352,
 };
 const FETCH_SHARE = 0.8; // downloads own 80% of the bar; build steps the rest
 const bytesTotal = Object.values(FILE_BYTES).reduce((a, b) => a + b, 0);
@@ -272,6 +273,51 @@ scene.add(grat);
     )
   );
 }
+
+// Country name labels (NE admin-0 NAME at LABEL_X/Y) — built lazily on the
+// first toggle. Sprites sit just above the surface with depthTest on, so
+// the opaque globe hides the far-side names for free. When zoomed out only
+// the major countries (LABELRANK ≤ 4) show; zooming in reveals the rest.
+const countryData = await loadData("./countries.json", "country names");
+let countryLabels = null;
+function buildCountryLabels() {
+  countryLabels = new THREE.Group();
+  for (const c of countryData) {
+    const big = c.r <= 3;
+    const fs = big ? 34 : 26;
+    const font = `600 ${fs}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const cv = document.createElement("canvas");
+    let ctx = cv.getContext("2d");
+    ctx.font = font;
+    const w = Math.ceil(ctx.measureText(c.n).width) + 12;
+    const h = fs + 14;
+    cv.width = w;
+    cv.height = h;
+    ctx = cv.getContext("2d");
+    ctx.font = font;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = "rgba(4, 8, 16, 0.9)";
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = big ? "#c8d8f0" : "#96abc9";
+    ctx.fillText(c.n, w / 2, h / 2);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.anisotropy = 4;
+    const s = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+    );
+    const scale = big ? 0.00072 : 0.0006;
+    s.scale.set(w * scale, h * scale, 1);
+    s.position.copy(toXYZ(c.lon, c.lat, R * 1.005));
+    s.userData.r = c.r;
+    countryLabels.add(s);
+  }
+  scene.add(countryLabels);
+}
+document.getElementById("countrynames").addEventListener("change", (e) => {
+  if (e.target.checked && !countryLabels) buildCountryLabels();
+  if (countryLabels) countryLabels.visible = e.target.checked;
+});
 
 // Starfield.
 {
@@ -730,6 +776,10 @@ addEventListener("resize", resize);
 resize();
 renderer.setAnimationLoop(() => {
   controls.update();
+  if (countryLabels?.visible) {
+    const showAll = camera.position.length() < 1.9;
+    for (const s of countryLabels.children) s.visible = showAll || s.userData.r <= 4;
+  }
   // Keep the pick marker a steady on-screen size: scale with camera
   // distance (capped so it never balloons when zoomed far out).
   if (marker.visible) {
