@@ -100,6 +100,13 @@ pub fn create_index(collection: &str, field: &str) -> Result<(), JsValue> {
     with_db(|db| db.create_index(collection, field))
 }
 
+/// Create a geospatial (geohash) index on a point field — accelerates
+/// `$geoWithin` / `$near`, which also work unindexed via a scan.
+#[wasm_bindgen]
+pub fn create_geo_index(collection: &str, field: &str) -> Result<(), JsValue> {
+    with_db(|db| db.create_geo_index(collection, field))
+}
+
 /// List all collection names. Returns JSON array string.
 #[wasm_bindgen]
 pub fn list_collections() -> Result<String, JsValue> {
