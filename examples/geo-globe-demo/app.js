@@ -15,10 +15,72 @@ bootmsg.textContent = "loading engine…";
 await init();
 oxidb.init();
 
-bootmsg.textContent = "loading 10,000 cities…";
-const cities = await (await fetch("./cities.json")).json();
+// Data loading with a real progress bar and optional browser persistence.
+// The five data files total ~19 MB decompressed; with consent they live in
+// the Cache API (versioned) and later visits never touch the network — the
+// database itself rebuilds locally in about a second, so caching the FILES
+// (byte-identical, no staleness logic) beats persisting the DB image.
+const DATA_CACHE = "geo-globe-data-v1";
+const FILE_BYTES = {
+  "./cities.json": 8559352,
+  "./roads.json": 9718386,
+  "./nodes.json": 867422,
+  "./borders.json": 153875,
+  "./land.json": 76677,
+};
+const FETCH_SHARE = 0.8; // downloads own 80% of the bar; build steps the rest
+const bytesTotal = Object.values(FILE_BYTES).reduce((a, b) => a + b, 0);
+let bytesDone = 0;
+let stagePct = 0;
+const bar = (msg) => {
+  if (msg) bootmsg.textContent = msg;
+  const pct = Math.min(100, (bytesDone / bytesTotal) * FETCH_SHARE * 100 + stagePct);
+  document.getElementById("bootfill").style.width = `${pct}%`;
+  document.getElementById("bootpct").textContent = `${Math.round(pct)}%`;
+};
+const stage = (pts, msg) => {
+  stagePct += pts;
+  bar(msg);
+};
+const persistChoice = localStorage.getItem("geoPersist"); // "yes" | "no" | null
+const rawBuffers = new Map(); // kept until the consent decision
+let servedFromCache = false;
+async function loadData(url, label) {
+  bar(`loading ${label}…`);
+  let resp = null;
+  if (persistChoice === "yes" && "caches" in window) {
+    resp = await (await caches.open(DATA_CACHE)).match(url);
+    if (resp) servedFromCache = true;
+  }
+  if (!resp) resp = await fetch(url);
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    bytesDone += value.length;
+    bar();
+  }
+  // Size drift between the baked estimate and reality: settle the account.
+  bytesDone += (FILE_BYTES[url] ?? got) - got;
+  bar();
+  const buf = new Uint8Array(got);
+  let o = 0;
+  for (const c of chunks) {
+    buf.set(c, o);
+    o += c.length;
+  }
+  if (persistChoice !== "yes") rawBuffers.set(url, buf);
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
+const cities = await loadData("./cities.json", "cities");
 
 // Insert as documents: {name, country, pop, loc: [lon, lat]}.
+stage(2, "inserting cities…");
 const t0 = performance.now();
 const docs = cities.map((c) => ({ n: c.n, c: c.c, p: c.p, loc: [c.lon, c.lat] }));
 const BATCH = 2000;
@@ -27,16 +89,14 @@ for (let i = 0; i < docs.length; i += BATCH) {
 }
 const insertMs = performance.now() - t0;
 
-bootmsg.textContent = "building geohash index…";
+stage(5, "building geohash index…");
 const t1 = performance.now();
 oxidb.create_geo_index("cities", "loc");
 const indexMs = performance.now() - t1;
 
-bootmsg.textContent = "loading road network…";
-const [roadEdges, roadNodes] = await Promise.all([
-  (await fetch("./roads.json")).json(),
-  (await fetch("./nodes.json")).json(),
-]);
+const roadEdges = await loadData("./roads.json", "road network");
+const roadNodes = await loadData("./nodes.json", "road nodes");
+stage(3, "building road graph…");
 // The engine gets LEAN edge documents (a, b, km, i); the drawing detail
 // (pts) stays in JS, looked up by the edge's `i` when a route comes back.
 const t2 = performance.now();
@@ -120,7 +180,7 @@ function toLonLat(v) {
 // sphere-surface triangulation. Standard equirect pixel mapping
 // ((lon+180)/360, (90-lat)/180) lines up with SphereGeometry's default UVs
 // and with the city-point projection.
-const landPolys = await (await fetch("./land.json")).json();
+const landPolys = await loadData("./land.json", "land polygons");
 const globeTexture = (() => {
   const W = 2048, H = 1024;
   const cv = document.createElement("canvas");
@@ -172,7 +232,7 @@ scene.add(grat);
 // Long edges are subdivided so a segment hugs the sphere instead of
 // chording through it.
 {
-  const rings = await (await fetch("./borders.json")).json();
+  const rings = await loadData("./borders.json", "country borders");
   const verts = [];
   for (const ring of rings) {
     for (let i = 1; i < ring.length; i++) {
@@ -331,7 +391,10 @@ function drawPolyline(pts, color, dashed = false) {
 }
 
 async function runRoute(b) {
-  const a = routeA;
+  return routeBetween(routeA, b);
+}
+
+async function routeBetween(a, b) {
   document.getElementById("routeQ").textContent =
     `$near ×2 → $shortestPath [${a.lon.toFixed(1)},${a.lat.toFixed(1)}] → [${b.lon.toFixed(1)},${b.lat.toFixed(1)}]`;
   // Snap both ends to the road graph with $near (nearest node document).
@@ -347,7 +410,7 @@ async function runRoute(b) {
   document.getElementById("snapMs").textContent = `${snapMs.toFixed(1)} ms (n${src} → n${dst})`;
   if (src === null || dst === null) {
     document.getElementById("routeStat").textContent = "no road within 1000 km";
-    return;
+    return { ok: false, msg: "no road within 1000 km" };
   }
   // The whole route is ONE aggregation: match the source node document,
   // then $shortestPath over the edge collection.
@@ -367,8 +430,9 @@ async function runRoute(b) {
   try {
     out = JSON.parse(oxidb.aggregate("nodes", JSON.stringify(pipeline)));
   } catch (e) {
-    document.getElementById("routeStat").textContent = `error: ${String(e).slice(0, 80)}`;
-    return;
+    const msg = `error: ${String(e).slice(0, 80)}`;
+    document.getElementById("routeStat").textContent = msg;
+    return { ok: false, msg };
   }
   const routeMs = performance.now() - t;
   document.getElementById("routeMs").textContent = `${routeMs.toFixed(1)} ms`;
@@ -376,9 +440,9 @@ async function runRoute(b) {
   if (!doc.route || !doc.route.length) {
     // Honest failure: the network is real-world disconnected in places.
     drawPolyline([[a.lon, a.lat], [b.lon, b.lat]], 0x7d8fac, true);
-    document.getElementById("routeStat").textContent =
-      doc.totalKm === 0 ? "same node" : "no route (disconnected network)";
-    return;
+    const msg = doc.totalKm === 0 ? "same node" : "no route (disconnected network)";
+    document.getElementById("routeStat").textContent = msg;
+    return { ok: false, msg };
   }
   let ferries = 0;
   for (const e of doc.route) {
@@ -388,9 +452,11 @@ async function runRoute(b) {
     if (isFerry) ferries++;
     drawPolyline(pts, isFerry ? 0x4dd0e1 : 0xffe082, isFerry);
   }
-  document.getElementById("routeStat").textContent =
+  const stat =
     `${Math.round(doc.totalKm).toLocaleString()} km · ${doc.route.length} segments` +
     (ferries ? ` · ${ferries} ferry/bridge` : "");
+  document.getElementById("routeStat").textContent = stat;
+  return { ok: true, msg: stat };
 }
 
 let blinkStart = 0;
@@ -518,6 +584,67 @@ function runQueries() {
   drawRing(lon, lat, radiusKm);
 }
 
+// ── directions panel: Google-Maps-style from/to over the city list ─────────
+{
+  const picked = { from: null, to: null };
+  const wire = (inputId, sugId, slot) => {
+    const input = document.getElementById(inputId);
+    const sug = document.getElementById(sugId);
+    const hide = () => (sug.style.display = "none");
+    input.addEventListener("input", () => {
+      picked[slot] = null;
+      const q = input.value.trim().toLowerCase();
+      if (q.length < 2) return hide();
+      // Prefix matches first, then substring — biggest cities on top.
+      const starts = [];
+      const contains = [];
+      for (const c of cities) {
+        const n = c.n.toLowerCase();
+        if (n.startsWith(q)) starts.push(c);
+        else if (n.includes(q)) contains.push(c);
+        if (starts.length > 400) break;
+      }
+      const byPop = (a, b) => b.p - a.p;
+      const top = [...starts.sort(byPop), ...contains.sort(byPop)].slice(0, 8);
+      if (!top.length) return hide();
+      sug.innerHTML = top
+        .map(
+          (c, i) =>
+            `<div data-i="${i}"><span>${flag(c.c)} ${c.n}</span><span class="cc">${fmtPop(Math.max(c.p, 1000))}</span></div>`
+        )
+        .join("");
+      sug.style.display = "";
+      [...sug.children].forEach((el, i) => {
+        el.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          picked[slot] = top[i];
+          input.value = top[i].n;
+          hide();
+          maybeRoute();
+        });
+      });
+    });
+    input.addEventListener("blur", () => setTimeout(hide, 150));
+  };
+  const maybeRoute = () => {
+    const { from, to } = picked;
+    if (!from || !to) return;
+    clearRoute();
+    const a = { lon: from.lon, lat: from.lat };
+    const b = { lon: to.lon, lat: to.lat };
+    endA.position.copy(toXYZ(a.lon, a.lat, R * 1.004));
+    endB.position.copy(toXYZ(b.lon, b.lat, R * 1.004));
+    endA.visible = endB.visible = true;
+    document.getElementById("dirStat").textContent = "routing…";
+    routeBetween(a, b).then((r) => {
+      document.getElementById("dirStat").textContent = r ? r.msg : "?";
+      document.getElementById("dirStat").style.color = r?.ok ? "" : "var(--warm)";
+    });
+  };
+  wire("fromCity", "fromSug", "from");
+  wire("toCity", "toSug", "to");
+}
+
 // ── interaction ────────────────────────────────────────────────────────────
 const ray = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
@@ -606,6 +733,51 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 
+stage(10, "ready");
 runQueries();
 document.getElementById("boot").style.opacity = "0";
 setTimeout(() => document.getElementById("boot").remove(), 600);
+
+// Persistence consent: asked once, after the first successful load. "Store"
+// writes the exact downloaded bytes into the Cache API — nothing to go
+// stale, next visits read them locally and skip the network.
+(async () => {
+  const clearRow = document.getElementById("clearStore");
+  const showClear = () => (clearRow.style.display = "");
+  document.getElementById("clearStoreLink").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await caches.delete(DATA_CACHE);
+    localStorage.removeItem("geoPersist");
+    clearRow.style.display = "none";
+  });
+  if (persistChoice === "yes") {
+    if (servedFromCache) showClear();
+    else if ("caches" in window) {
+      // Chose to store earlier, but the cache is gone (cleared/evicted):
+      // quietly refill it from this visit's fetches next time around.
+      localStorage.removeItem("geoPersist");
+    }
+    if (persistChoice === "yes" && servedFromCache) return;
+  }
+  if (persistChoice === "no" || !("caches" in window)) return;
+  const ask = document.getElementById("persistAsk");
+  ask.style.display = "";
+  document.getElementById("persistYes").addEventListener("click", async () => {
+    ask.style.display = "none";
+    const cache = await caches.open(DATA_CACHE);
+    for (const [url, buf] of rawBuffers) {
+      await cache.put(
+        url,
+        new Response(buf, { headers: { "Content-Type": "application/json" } })
+      );
+    }
+    rawBuffers.clear();
+    localStorage.setItem("geoPersist", "yes");
+    showClear();
+  });
+  document.getElementById("persistNo").addEventListener("click", () => {
+    ask.style.display = "none";
+    rawBuffers.clear();
+    localStorage.setItem("geoPersist", "no");
+  });
+})();
