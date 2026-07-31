@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- In your own application, use the NuGet packages instead:
+         <PackageReference Include="OxiDb.EntityFrameworkCore" Version="0.42.0" />
+         <PackageReference Include="OxiDb.Client.Embedded"     Version="0.42.0" />
+       OxiDb.Client.Embedded is only needed by apps that use Path= (embedded)
+       connection strings — it carries the native engine. -->
+  <ItemGroup>
+    <ProjectReference Include="../../../dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../../dotnet/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" />
+  </ItemGroup>
+
+  <!-- Dev-tree only: a NuGet reference ships the native library in
+       runtimes/, a ProjectReference does not — copy the locally built one.
+       Not needed when referencing the packages. -->
+  <ItemGroup>
+    <None Include="../../../target-local/release/liboxidb_embedded_ffi.dylib"
+          Condition="Exists('../../../target-local/release/liboxidb_embedded_ffi.dylib')"
+          Link="liboxidb_embedded_ffi.dylib"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
