@@ -168,7 +168,7 @@ const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 50);
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
-controls.minDistance = 1.3;
+controls.minDistance = 1.05; // ~320 km up — small countries fill the screen
 controls.maxDistance = 6;
 controls.enablePan = false;
 controls.autoRotate = false; // the panel checkbox drives this
@@ -816,6 +816,10 @@ function resize() {
 addEventListener("resize", resize);
 resize();
 renderer.setAnimationLoop(() => {
+  // Drag speed proportional to altitude, or the last zoom levels are
+  // untouchably twitchy (a fixed angular speed sweeps a whole small
+  // country per pixel of drag when the camera is 300 km up).
+  controls.rotateSpeed = THREE.MathUtils.clamp((camera.position.length() - 1) * 0.85, 0.05, 1);
   controls.update();
   if (countryLabels?.visible) {
     const showAll = camera.position.length() < 1.9;
