@@ -10,12 +10,12 @@
 .next/
 # The static export that gets rsynced to the web root. Produced by the same
 # build; nothing deploys from git, so there is no reason to carry it.
-/website-react/out/
+/web/site/out/
 
 
 # .NET
-dotnet/**/bin/
-dotnet/**/obj/
+**/bin/
+**/obj/
 tests/**/bin/
 tests/**/obj/
 examples/**/bin/
@@ -87,7 +87,6 @@ dist/
 
 # OxiDMS build artifacts
 OxiDMS/oxidms-server
-OxiDMS/frontend/node_modules/
 OxiDMS/frontend/dist/
 
 tests/go-complex-tests/bench-complex
@@ -97,9 +96,9 @@ repl-test
 udp-bench
 scale-test
 telco-test
-monitoring/.oxidb-data/
-monitoring/.oxidb-server.log
-monitoring/.load.log
+infra/monitoring/.oxidb-data/
+infra/monitoring/.oxidb-server.log
+infra/monitoring/.load.log
 tests/rabbitmq-go-test/rabbitmq-go-test
 tests/rabbitmq-benchmark-go/rabbitmq-benchmark-go
 
@@ -107,7 +106,7 @@ tests/rabbitmq-benchmark-go/rabbitmq-benchmark-go
 deploy/.env
 
 # Dart client build artefacts
-oxibase-dart/.dart_tool/
+**/.dart_tool/
 oxibase-dart/pubspec.lock
 
 # Release artifacts (published to GitHub/the web server; never in the repo)
