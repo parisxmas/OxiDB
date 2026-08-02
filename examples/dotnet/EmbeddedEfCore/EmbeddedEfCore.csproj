@@ -13,8 +13,8 @@
        OxiDb.Client.Embedded is only needed by apps that use Path= (embedded)
        connection strings — it carries the native engine. -->
   <ItemGroup>
-    <ProjectReference Include="../../../dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
-    <ProjectReference Include="../../../dotnet/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" />
+    <ProjectReference Include="../../../clients/dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../../clients/dotnet/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" />
   </ItemGroup>
 
   <!-- Dev-tree only: a NuGet reference ships the native library in

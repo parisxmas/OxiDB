@@ -7,7 +7,7 @@
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../dotnet/OxiDb.Data/OxiDb.Data.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.Data/OxiDb.Data.csproj" />
     <!-- Brings Npgsql (NpgsqlConnection) transitively; same version as efcore-bench. -->
     <PackageReference Include="Npgsql" Version="9.0.4" />
   </ItemGroup>

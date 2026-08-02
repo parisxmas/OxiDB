@@ -10,7 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
-    <ProjectReference Include="../../dotnet/OxiDb.Client.Tcp/OxiDb.Client.Tcp.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.Client.Tcp/OxiDb.Client.Tcp.csproj" />
   </ItemGroup>
 
 </Project>

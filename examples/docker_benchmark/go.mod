@@ -19,4 +19,4 @@ require (
 	golang.org/x/text v0.22.0 // indirect
 )
 
-replace github.com/parisxmas/OxiDB/go/oxidb => ../../go/oxidb
+replace github.com/parisxmas/OxiDB/go/oxidb => ../../clients/go/oxidb

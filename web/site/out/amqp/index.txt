@@ -1,0 +1,126 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+a:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+7:T258a,<section class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 019 9"/><path d="M4 4a16 16 0 0116 16"/><circle cx="5" cy="19" r="1"/></svg> AMQP &mdash; the RabbitMQ protocol</h2>
+    <p class="section-desc">OxiDB speaks <strong>AMQP&nbsp;0-9-1</strong>, the protocol RabbitMQ clients use. Code written for RabbitMQ &mdash; <code>pika</code> (Python), <code>amqplib</code> (Node), <code>RabbitMQ.Client</code> (.NET), <code>amqp091-go</code> (Go), the official tutorials included &mdash; points at OxiDB and works unmodified. It adds the one semantic MQTT cannot express: a <strong>work queue</strong>, where each message goes to exactly <em>one</em> of a pool of competing consumers. Off by default.</p>
+
+    <h3>Enable it</h3>
+    <pre><code class="lang-bash"><span class="co"># start the AMQP listener (5672 is the AMQP default port)</span>
+OXIDB_AMQP_PORT=5672 ./oxidb-server</code></pre>
+
+    <h3>Hello world &mdash; RabbitMQ&apos;s own tutorial code, unmodified</h3>
+    <pre><code class="lang-python">import pika
+
+conn = pika.BlockingConnection(pika.ConnectionParameters('127.0.0.1', 5672))
+ch = conn.channel()
+ch.queue_declare(queue='hello')
+ch.basic_publish(exchange='', routing_key='hello', body=b'Hello OxiDB!')
+
+method, props, body = ch.basic_get('hello', auto_ack=True)
+print(body)          <span class="co"># b'Hello OxiDB!'</span>
+conn.close()</code></pre>
+
+    <h3>Work queues &mdash; competing consumers</h3>
+    <p>An MQTT subscription copies every message to every subscriber. An AMQP queue hands each message to exactly <strong>one</strong> of its consumers, round-robin &mdash; work distribution across a worker pool. Unacked messages requeue (flagged <code>redelivered</code>) if a worker dies.</p>
+    <pre><code class="lang-python"><span class="co"># worker.py — run as many of these as you like; they split the work</span>
+def on_message(ch, method, props, body):
+    do_work(body)
+    ch.basic_ack(method.delivery_tag)   <span class="co"># ack AFTER the work: crash = requeue</span>
+
+ch.basic_qos(prefetch_count=1)          <span class="co"># a busy worker's turn passes to an idle one</span>
+ch.basic_consume('tasks', on_message)
+ch.start_consuming()</code></pre>
+
+    <h3>Exchanges</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Type</th><th>Routing</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>""</code> (default)</td><td>Routing key <em>is</em> the queue name</td><td><code>basic_publish('', 'tasks', ...)</code></td></tr>
+          <tr><td><code>direct</code></td><td>Exact routing-key match</td><td><code>error</code> &rarr; the queue bound with <code>error</code></td></tr>
+          <tr><td><code>fanout</code></td><td>Every bound queue gets a copy</td><td>broadcast</td></tr>
+          <tr><td><code>topic</code></td><td><code>.</code>-separated words; <code>*</code> = one word, <code>#</code> = zero or more</td><td><code>kern.*</code> matches <code>kern.crit</code>; <code>#</code> matches everything</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre><code class="lang-python">ch.exchange_declare(exchange='logs', exchange_type='topic')
+ch.queue_bind('kernel-q', 'logs', 'kern.*')
+ch.queue_bind('audit-q',  'logs', '#')
+ch.basic_publish('logs', 'kern.crit', b'disk on fire')   <span class="co"># reaches both</span></code></pre>
+
+    <h3>Publisher confirms &amp; mandatory</h3>
+    <p>In confirm mode the broker acks each publish &mdash; and for a persistent message the ack is only sent <strong>after the fsync</strong> (write-before-confirm). An unroutable <code>mandatory</code> publish comes back as <code>Basic.Return</code> (312 <code>NO_ROUTE</code>) instead of vanishing; pika surfaces it as <code>UnroutableError</code>.</p>
+    <pre><code class="lang-csharp"><span class="co">// .NET — RabbitMQ.Client 7.x, unmodified</span>
+var factory = new ConnectionFactory { HostName = "127.0.0.1", Port = 5672 };
+await using var conn = await factory.CreateConnectionAsync();
+await using var ch = await conn.CreateChannelAsync(new CreateChannelOptions(
+    publisherConfirmationsEnabled: true,
+    publisherConfirmationTrackingEnabled: true));
+
+await ch.QueueDeclareAsync("orders", durable: true, exclusive: false, autoDelete: false);
+await ch.BasicPublishAsync("", "orders", mandatory: false,
+    basicProperties: new BasicProperties { Persistent = true },
+    body: JsonSerializer.SerializeToUtf8Bytes(order));
+<span class="co">// awaited = the broker has fsync'd it. A crash after this point cannot lose it.</span></code></pre>
+
+    <h3>Durability follows the protocol, not a config flag</h3>
+    <p>AMQP already says what should survive: a queue declared <code>durable</code> holding messages published with <code>delivery_mode=2</code> (persistent) is written through the document engine&apos;s WAL and <strong>survives a <code>SIGKILL</code></strong> &mdash; recovered messages arrive flagged <code>redelivered</code>, acknowledged ones stay consumed. Everything else lives in memory, which is what the client asked for by not saying <code>durable</code>. There is no <code>OXIDB_AMQP_PERSIST</code> because the protocol makes the choice per queue and per message.</p>
+    <p>Under the hood, pipelined persistent publishes are batched into one fsync per burst, and bursts from <em>different connections</em> share fsync rounds through a group committer &mdash; see the numbers below.</p>
+
+    <h3>MQTT &harr; AMQP bridge</h3>
+    <p>The pre-declared <code>amq.topic</code> exchange bridges the two brokers the same way RabbitMQ&apos;s own MQTT plugin does: MQTT topic slashes become AMQP routing-key dots and back, MQTT QoS&nbsp;&ge;&nbsp;1 maps to persistent. A sensor publishes MQTT; a worker pool consumes AMQP &mdash; one binary.</p>
+    <pre><code class="lang-bash"><span class="co"># both listeners on</span>
+OXIDB_MQTT_PORT=1883 OXIDB_AMQP_PORT=5672 ./oxidb-server</code></pre>
+    <pre><code class="lang-python"><span class="co"># AMQP side: bind a queue to amq.topic (pre-declared, no declare needed)</span>
+ch.queue_declare(queue='readings', durable=True)
+ch.queue_bind('readings', 'amq.topic', 'sensors.#')</code></pre>
+    <pre><code class="lang-bash"><span class="co"># MQTT side: publish normally…</span>
+mosquitto_pub -p 1883 -t sensors/floor1/temp -m "21.5"
+<span class="co"># …the AMQP consumer receives it with routing key sensors.floor1.temp</span></code></pre>
+    <p>The reverse works too: an AMQP publish to <code>amq.topic</code> with routing key <code>alerts.fire</code> reaches MQTT subscribers of <code>alerts/+</code> (and OxiMem RESP subscribers on the same bus).</p>
+
+    <h3>Authentication</h3>
+    <pre><code class="lang-bash">OXIDB_AMQP_PORT=5672 OXIDB_AMQP_USER=app OXIDB_AMQP_PASSWORD=secret ./oxidb-server
+<span class="co"># clients use PLAIN auth exactly as against RabbitMQ: amqp://app:secret@host:5672/</span></code></pre>
+
+    <h3>Performance vs RabbitMQ</h3>
+    <p>Measured with the same Go client (<code>amqp091-go</code>), the same code path, against RabbitMQ&nbsp;4.x on the same machine (100-byte bodies; harness in <code>tests/rabbitmq-benchmark-go</code>):</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Scenario</th><th>OxiDB</th><th>RabbitMQ</th><th>Ratio</th></tr></thead>
+        <tbody>
+          <tr><td>Publish confirms, pipelined</td><td>246k msg/s</td><td>164k msg/s</td><td><strong>1.50&times;</strong></td></tr>
+          <tr><td>Publish confirm latency (p50)</td><td>0.02 ms</td><td>0.03 ms</td><td><strong>1.74&times;</strong></td></tr>
+          <tr><td>Durable publish, 1 connection</td><td>54k msg/s</td><td>160k msg/s</td><td>0.34&times;</td></tr>
+          <tr><td>Durable publish, 8 connections</td><td>103k msg/s</td><td>93k msg/s</td><td><strong>1.11&times;</strong></td></tr>
+          <tr><td>End-to-end throughput</td><td>318k msg/s</td><td>246k msg/s</td><td><strong>1.29&times;</strong></td></tr>
+          <tr><td>End-to-end latency (p50)</td><td>0.02 ms</td><td>0.04 ms</td><td><strong>1.52&times;</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The one loss is deliberate: every OxiDB durable confirm sits behind a real <code>F_FULLFSYNC</code> of its batch, while RabbitMQ classic queues flush lazily on an interval &mdash; its persistent confirm does not, by itself, prove the message is on stable storage. Add concurrency and the honest fsync wins anyway.</p>
+
+    <h3>The subset, stated honestly</h3>
+    <p>Implemented: connections/channels/heartbeats, PLAIN auth, default + <code>direct</code>/<code>fanout</code>/<code>topic</code> exchanges, queue declare/bind (durable, exclusive, auto-delete, server-named, passive), publish with multi-frame bodies, consume/get/ack/nack/reject, <code>Basic.Qos</code> prefetch, publisher confirms, mandatory <code>Basic.Return</code>, and the MQTT bridge.</p>
+    <p>Not implemented &mdash; and <em>refused with a clear channel error</em>, never silently accepted: the <code>tx</code> class, <code>headers</code> exchanges, exchange-to-exchange bindings, per-message TTL/priority, dead-letter arguments, alternate exchanges, streams, and AMQP&nbsp;1.0 (a different protocol entirely).</p>
+
+    <p>AMQP queues are node-local, like the <a href="/mqtt/">MQTT broker</a>: consumers are connections and connections live on one node; the durable data behind a queue is what replicates in <a href="/clustering/">cluster mode</a>.</p>
+  </div>
+</section>0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","amqp",""],"q":"","i":false,"f":[[["",{"children":["amqp",{"children":["__PAGE__",{}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":[["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$7"}}],null,"$L8"]}],{},null,false,false]},null,false,false]},null,false,false],"$L9",false]],"m":"$undefined","G":["$a",[]],"S":true}
+b:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+c:"$Sreact.suspense"
+e:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+10:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+8:["$","$Lb",null,{"children":["$","$c",null,{"name":"Next.MetadataOutlet","children":"$@d"}]}]
+9:["$","$1","h",{"children":[null,["$","$Le",null,{"children":"$Lf"}],["$","div",null,{"hidden":true,"children":["$","$L10",null,{"children":["$","$c",null,{"name":"Next.Metadata","children":"$L11"}]}]}],null]}]
+f:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+12:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+d:null
+11:[["$","title","0",{"children":"AMQP (RabbitMQ protocol) | OxiDB"}],["$","meta","1",{"name":"description","content":"OxiDB speaks AMQP 0-9-1 — the RabbitMQ protocol. pika, amqplib, RabbitMQ.Client and amqp091-go work unmodified: work queues with competing consumers, direct/fanout/topic exchanges, publisher confirms, prefetch, durable queues that survive SIGKILL, and an MQTT bridge."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/amqp/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/amqp/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L12","22",{}]]

@@ -1,0 +1,87 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+7:I[73067,["/_next/static/chunks/0c089677cb770e4f.js","/_next/static/chunks/54f597c4d487e846.js"],"default"]
+b:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","s3","quickstart",""],"q":"","i":false,"f":[[["",{"children":["s3",{"children":["quickstart",{"children":["__PAGE__",{}]}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[[["$","script","script-0",{"src":"/_next/static/chunks/54f597c4d487e846.js","async":true,"nonce":"$undefined"}]],["$","div",null,{"className":"docs-shell","children":[["$","$L7",null,{}],["$","main",null,{"className":"docs-content","children":["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]}]]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":"$L8","templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":["$L9",{},null,false,false]},null,false,false]},null,false,false]},null,false,false],"$La",false]],"m":"$undefined","G":["$b",[]],"S":true}
+e:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+10:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+11:"$Sreact.suspense"
+8:["$","$L4",null,{}]
+c:Te93,<p class="docs-eyebrow">S3 · Get Going</p>
+<h2>S3 Quick Start</h2>
+<p>From zero to a working S3 endpoint in three steps.</p>
+
+<h3>1. Build / get a server with S3 support</h3>
+<p>The S3 module is feature-gated. Pre-built v0.34.0 binaries already include it. If you build from source:</p>
+<pre><code class="lang-bash">cargo build --release -p oxidb-server --features s3</code></pre>
+
+<h3>2. Start the server</h3>
+<pre><code class="lang-bash">OXIDB_S3_PORT=9000 \
+OXIDB_S3_ACCESS_KEY=minioadmin \
+OXIDB_S3_SECRET_KEY=minioadmin \
+OXIDB_DATA=./data \
+oxidb-server</code></pre>
+<p>You should see:</p>
+<pre><code class="lang-bash">[oxidb-server] listening on 127.0.0.1:4444
+[s3] S3-compatible API listening on 0.0.0.0:9000</code></pre>
+
+<h3>3. Configure aws-cli</h3>
+<pre><code class="lang-bash">aws configure set aws_access_key_id minioadmin
+aws configure set aws_secret_access_key minioadmin
+aws configure set default.region us-east-1</code></pre>
+<p>Then either pass <code>--endpoint-url</code> on every call, or alias the command:</p>
+<pre><code class="lang-bash">alias os3=<span class="str">"aws --endpoint-url http://localhost:9000"</span></code></pre>
+
+<h3>4. Hello, S3</h3>
+<pre><code class="lang-bash">os3 s3 mb s3://test-bucket
+os3 s3 cp /etc/hosts s3://test-bucket/hosts.txt
+os3 s3 ls s3://test-bucket/
+os3 s3 cp s3://test-bucket/hosts.txt /tmp/recovered
+os3 s3 rm s3://test-bucket/hosts.txt
+os3 s3 rb s3://test-bucket</code></pre>
+
+<h3>5. Or with curl + a presigned URL</h3>
+<p>Generate a presigned URL on the server, then use plain curl:</p>
+<pre><code class="lang-bash">URL=$(os3 s3 presign s3://test-bucket/hosts.txt --expires-in 600)
+curl -O <span class="str">"$URL"</span></code></pre>
+
+<h3>Common env vars</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>OXIDB_S3_PORT</code></td><td><em>(off)</em></td><td>Port to bind. Setting this enables the S3 server.</td></tr>
+<tr><td><code>OXIDB_S3_ACCESS_KEY</code></td><td><em>(off)</em></td><td>Single-tenant access key.</td></tr>
+<tr><td><code>OXIDB_S3_SECRET_KEY</code></td><td><em>(off)</em></td><td>Single-tenant secret key.</td></tr>
+<tr><td><code>OXIDB_S3_CREDENTIALS</code></td><td><em>(off)</em></td><td>Multi-tenant: <code>"ak1:sk1,ak2:sk2,..."</code></td></tr>
+<tr><td><code>OXIDB_S3_ENCRYPTION_KEY</code></td><td><em>(off)</em></td><td>32-byte hex key for SSE-S3.</td></tr>
+<tr><td><code>OXIDB_S3_DEFAULT_ENCRYPTION</code></td><td><code>false</code></td><td>If <code>true</code>, every PUT is auto-encrypted with SSE-S3.</td></tr>
+<tr><td><code>OXIDB_S3_CORS_ORIGIN</code></td><td><code>*</code></td><td><code>Access-Control-Allow-Origin</code> header value.</td></tr>
+<tr><td><code>OXIDB_DATA</code></td><td><code>./oxidb_data</code></td><td>Where bucket/object files live (shared with native API).</td></tr>
+</tbody></table></div>
+
+<h3>Where data lives on disk</h3>
+<pre><code class="lang-bash">$OXIDB_DATA/
+├── _blobs/                  # S3 buckets &amp; objects (same store as embedded blob API)
+│   └── photos/
+│       ├── &lt;object-id&gt;.data
+│       └── &lt;object-id&gt;.meta
+└── ... (the rest of the database)</code></pre>
+
+<div class="docs-callout"><strong>Heads-up:</strong> the S3 API and OxiDB's <a href="/blobs/">embedded blob API</a> read/write the same store. You can <code>put_object</code> from a Rust embedded program and download it via <code>aws s3 cp</code>.</div>
+
+<div class="docs-prevnext">
+  <a href="/s3/" class="prev"><div class="label">Back to</div><div class="title">← S3 overview</div></a>
+  <a href="/s3/auth/" class="next"><div class="label">Next</div><div class="title">Authentication →</div></a>
+</div>9:["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$c"}}],null,"$Ld"]}]
+a:["$","$1","h",{"children":[null,["$","$Le",null,{"children":"$Lf"}],["$","div",null,{"hidden":true,"children":["$","$L10",null,{"children":["$","$11",null,{"name":"Next.Metadata","children":"$L12"}]}]}],null]}]
+13:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+d:["$","$L13",null,{"children":["$","$11",null,{"name":"Next.MetadataOutlet","children":"$@14"}]}]
+f:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+15:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+12:[["$","title","0",{"children":"S3 Quick Start | OxiDB"}],["$","meta","1",{"name":"description","content":"A fast, multi-model database — document, SQL, time-series, Redis, MQTT, AMQP (RabbitMQ) and S3 in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/s3/quickstart/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/s3/quickstart/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L15","22",{}]]
+14:null

@@ -6,13 +6,26 @@
 
 <p align="center">ACID transactions, snapshot-consistent reads, Raft replication, point-in-time recovery, SCRAM/TLS/RBAC and AES-GCM encryption at rest are built in — one ~20 MB zero-dependency binary that starts with no configuration, runs embedded in your process, and compiles to WASM for the browser.</p>
 
-<p align="center"><strong>Clients:</strong> <a href="python/">Python</a> · <a href="go/">Go</a> · <a href="dotnet/">.NET</a> · <a href="oxidb-js/">JS/TS</a> · <a href="julia/">Julia</a> · <a href="swift/">Swift</a> · <a href="oxidb-client-ffi/">C FFI</a> · <a href="oxidb-wasm/">WASM</a> · <a href="oxidb-vscode/">VS Code</a></p>
+<p align="center"><strong>Clients:</strong> <a href="clients/python/">Python</a> · <a href="clients/go/">Go</a> · <a href="clients/dotnet/">.NET</a> · <a href="clients/js/">JS/TS</a> · <a href="clients/java/">Java</a> · <a href="clients/julia/">Julia</a> · <a href="clients/swift/">Swift</a> · <a href="oxidb-client-ffi/">C FFI</a> · <a href="oxidb-wasm/">WASM</a> · <a href="apps/vscode/">VS Code</a></p>
 
 ---
 
 > ⚠️ **WARNING — pre-1.0 stability.** OxiDB is under active pre-1.0 development. The on-disk data format, the wire/server protocol, the client SDK surface, and the JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability. The test suite protects against regressions *within* a version, not breaking changes *across* versions.
 
 **Adoption status:** pre-1.0. Path to 1.0 in [ADR-0003](docs/decisions/0003-1.0-stability-scope.md); release policy in [ADR-0004](docs/decisions/0004-phase-0-answers.md). All architectural decisions: [`docs/decisions/`](docs/decisions/).
+
+## Repository layout
+
+| Directory | What lives there |
+|---|---|
+| `src/` + `oxidb-*/`, `oxipool/`, `oxibase/` | The Rust workspace: core engine, server, SQL/TSDB engines, CLI, pooler, FFI, WASM, control plane |
+| [`clients/`](clients/) | Language SDKs — Python (+embedded), Go, .NET, JS/TS, Java, Julia, Swift, Android, and the OxiBase JS/Dart SDKs |
+| [`apps/`](apps/) | Tools — OxiDB Studio (Tauri), the VS Code extension, the OxiBase dashboard |
+| [`examples/`](examples/) | Runnable demos and showcase apps — per-language samples, the FTS demo, the geo globe, ColdChain, the bug tracker, cluster drills |
+| [`docs/`](docs/) | Documentation, ADRs, benchmarks, format specs |
+| `tests/`, `fuzz/`, `bench/` | Workspace integration tests, fuzz targets, benchmark harnesses |
+| [`infra/`](infra/) | Dockerfiles, monitoring stack, OSS-Fuzz config |
+| `web/` | The website (`web/site` — Next.js static export) |
 
 ## Install
 
@@ -156,7 +169,7 @@ Nine fuzz targets live in [`fuzz/`](fuzz/), four mutation-based and two differen
 
 ## Tools
 
-A CLI with an interactive shell (embedded or client mode), a VS Code extension with a collection browser and query editor, [OxiDB Studio](oxidb-app/) — a Tauri desktop app with a SQL editor and data grid — and a WASM build of the document engine that runs in a browser with OPFS persistence. The [geo globe demo](https://oxidb.baltavista.com/demo/geo/) is that WASM build live: 10,000 cities, `$near`/`$geoWithin` and `$shortestPath` routing, entirely in the browser.
+A CLI with an interactive shell (embedded or client mode), a VS Code extension with a collection browser and query editor, [OxiDB Studio](apps/studio/) — a Tauri desktop app with a SQL editor and data grid — and a WASM build of the document engine that runs in a browser with OPFS persistence. The [geo globe demo](https://oxidb.baltavista.com/demo/geo/) is that WASM build live: 10,000 cities, `$near`/`$geoWithin` and `$shortestPath` routing, entirely in the browser.
 
 ## Configuration
 

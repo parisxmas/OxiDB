@@ -19,13 +19,13 @@ let package = Package(
         .target(
             name: "COxiDBEmbedded",
             dependencies: ["OxiDBEmbeddedBinary"],
-            path: "swift/COxiDBEmbedded",
+            path: "clients/swift/COxiDBEmbedded",
             publicHeadersPath: "include"
         ),
         .target(
             name: "OxiDB",
             dependencies: ["COxiDBEmbedded"],
-            path: "swift/OxiDB/Sources/OxiDB",
+            path: "clients/swift/OxiDB/Sources/OxiDB",
             exclude: ["include"]
         ),
     ]

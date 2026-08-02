@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.8">
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>

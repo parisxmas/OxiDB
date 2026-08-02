@@ -1,0 +1,13 @@
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/bin/Debug/net10.0/OxiDb.Client.S3.deps.json
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/bin/Debug/net10.0/OxiDb.Client.S3.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/bin/Debug/net10.0/OxiDb.Client.S3.pdb
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.csproj.AssemblyReference.cache
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.GeneratedMSBuildEditorConfig.editorconfig
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.AssemblyInfoInputs.cache
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.AssemblyInfo.cs
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.csproj.CoreCompileInputs.cache
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.sourcelink.json
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/refint/OxiDb.Client.S3.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/OxiDb.Client.S3.pdb
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3/obj/Debug/net10.0/ref/OxiDb.Client.S3.dll

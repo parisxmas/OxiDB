@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>OxiDb.Client.Embedded</id>
+    <version>0.18.1</version>
+    <authors>OxiDB Contributors</authors>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <projectUrl>https://github.com/oxidb/oxidb</projectUrl>
+    <description>Embedded (in-process) OxiDB client via native FFI. No server required — runs the database engine directly in your process.</description>
+    <copyright>Copyright (c) OxiDB Contributors</copyright>
+    <tags>database document-database nosql embedded oxidb</tags>
+    <repository type="git" url="https://github.com/oxidb/oxidb" commit="50c39afa5ac2afa8b37069aa7a7542e6e54e2534" />
+    <dependencies>
+      <group targetFramework="net10.0">
+        <dependency id="OxiDb.Client.Tcp" version="0.18.1" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="/Users/barisakin/source/docdb/dotnet/OxiDb.Client.Embedded/bin/Release/net10.0/OxiDb.Client.Embedded.pdb" target="lib/net10.0/OxiDb.Client.Embedded.pdb" />
+  </files>
+</package>

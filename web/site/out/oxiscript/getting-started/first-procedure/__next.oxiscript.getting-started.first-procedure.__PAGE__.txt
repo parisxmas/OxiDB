@@ -1,0 +1,92 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T16c1,<p class="docs-eyebrow">Getting Started · 3 of 3</p>
+<h2>Your first real procedure</h2>
+<p>Time to touch the database. We'll build <code>get_user</code>, then <code>create_user</code>, then <code>award_points</code> — each one adds one new concept.</p>
+
+<h3>Setup</h3>
+<pre><code class="lang-bash">{<span class="str">"cmd"</span>: <span class="str">"create_index"</span>, <span class="str">"collection"</span>: <span class="str">"users"</span>, <span class="str">"field"</span>: <span class="str">"email"</span>}</code></pre>
+
+<h3>1. Read with validation</h3>
+<pre><code class="lang-rust">proc get_user(email) {
+    let user = find_one(<span class="str">"users"</span>, {email: email})
+    <span class="kw">if</span> user == <span class="kw">null</span> {
+        <span class="kw">abort</span> <span class="str">"user not found"</span>
+    }
+    <span class="kw">return</span> user
+}</code></pre>
+<p>Concepts learned: <code>let</code> binding, <code>find_one</code>, <code>null</code> check, <code>abort</code>.</p>
+
+<h3>2. Create with idempotency</h3>
+<pre><code class="lang-rust">proc create_user(email, name) {
+    let existing = find_one(<span class="str">"users"</span>, {email: email})
+    <span class="kw">if</span> existing != <span class="kw">null</span> {
+        <span class="kw">abort</span> <span class="str">"email already registered"</span>
+    }
+    insert(<span class="str">"users"</span>, {
+        email: email,
+        name: name,
+        points: <span class="num">0</span>,
+        created_at: <span class="str">"2026-04-26"</span>
+    })
+    <span class="kw">return</span> {created: <span class="kw">true</span>, email: email}
+}</code></pre>
+<p>Concepts learned: <code>insert</code>, the <code>!=</code> operator, multi-field object literals.</p>
+
+<h3>3. Update with arithmetic</h3>
+<pre><code class="lang-rust">proc award_points(email, amount) {
+    <span class="kw">if</span> amount &lt;= <span class="num">0</span> {
+        <span class="kw">abort</span> <span class="str">"amount must be positive"</span>
+    }
+    let user = find_one(<span class="str">"users"</span>, {email: email})
+    <span class="kw">if</span> user == <span class="kw">null</span> {
+        <span class="kw">abort</span> <span class="str">"user not found"</span>
+    }
+    update(<span class="str">"users"</span>, {email: email}, {$inc: {points: amount}})
+    <span class="kw">return</span> {
+        email: email,
+        previous: user.points,
+        awarded: amount,
+        new_total: user.points + amount
+    }
+}</code></pre>
+<p>Concepts learned: <code>update</code> with <code>$inc</code>, computing in <code>return</code>.</p>
+
+<h3>4. Combining the three</h3>
+<pre><code class="lang-rust">proc signup_and_award(email, name, signup_bonus) {
+    create_user({email: email, name: name})
+    award_points({email: email, amount: signup_bonus})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, signed_up: email, bonus: signup_bonus}
+}</code></pre>
+<p>Concepts learned: procedures call procedures. Pass parameters as a single object literal.</p>
+
+<h3>5. Calling each from the wire</h3>
+<pre><code class="lang-bash">{<span class="str">"cmd"</span>: <span class="str">"call_procedure"</span>, <span class="str">"name"</span>: <span class="str">"create_user"</span>,
+ <span class="str">"params"</span>: {<span class="str">"email"</span>: <span class="str">"alice@example.com"</span>, <span class="str">"name"</span>: <span class="str">"Alice"</span>}}
+
+{<span class="str">"cmd"</span>: <span class="str">"call_procedure"</span>, <span class="str">"name"</span>: <span class="str">"award_points"</span>,
+ <span class="str">"params"</span>: {<span class="str">"email"</span>: <span class="str">"alice@example.com"</span>, <span class="str">"amount"</span>: <span class="num">100</span>}}
+
+{<span class="str">"cmd"</span>: <span class="str">"call_procedure"</span>, <span class="str">"name"</span>: <span class="str">"signup_and_award"</span>,
+ <span class="str">"params"</span>: {<span class="str">"email"</span>: <span class="str">"bob@example.com"</span>, <span class="str">"name"</span>: <span class="str">"Bob"</span>, <span class="str">"signup_bonus"</span>: <span class="num">50</span>}}</code></pre>
+
+<h3>6. Watching it fail</h3>
+<pre><code class="lang-bash"><span class="co"># Duplicate email</span>
+{<span class="str">"cmd"</span>: <span class="str">"call_procedure"</span>, <span class="str">"name"</span>: <span class="str">"create_user"</span>,
+ <span class="str">"params"</span>: {<span class="str">"email"</span>: <span class="str">"alice@example.com"</span>, <span class="str">"name"</span>: <span class="str">"Alice 2"</span>}}
+<span class="co">// → {"ok": false, "error": "email already registered"}</span>
+
+<span class="co"># Negative amount</span>
+{<span class="str">"cmd"</span>: <span class="str">"call_procedure"</span>, <span class="str">"name"</span>: <span class="str">"award_points"</span>,
+ <span class="str">"params"</span>: {<span class="str">"email"</span>: <span class="str">"alice@example.com"</span>, <span class="str">"amount"</span>: -<span class="num">5</span>}}
+<span class="co">// → {"ok": false, "error": "amount must be positive"}</span></code></pre>
+
+<div class="docs-callout"><strong>Why this is powerful:</strong> all three operations of <code>signup_and_award</code> happen in one transaction. If <code>award_points</code> fails, the <code>create_user</code> insert is rolled back. No client logic, no compensation queue, no retries.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/getting-started/hello-world/" class="prev"><div class="label">Previous</div><div class="title">← 2. Hello, OxiScript</div></a>
+  <a href="/oxiscript/syntax/types/" class="next"><div class="label">Next</div><div class="title">Types &amp; literals →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

@@ -31,7 +31,7 @@ version = "1.11.0"
 
 [[deps.OxiDb]]
 deps = ["Base64", "JSON3", "Sockets"]
-path = "../../julia/OxiDb"
+path = "../../clients/julia/OxiDb"
 uuid = "a1b2c3d4-0000-0000-0000-000000000000"
 version = "0.1.0"
 

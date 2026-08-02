@@ -1,0 +1,121 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+7:I[73067,["/_next/static/chunks/0c089677cb770e4f.js","/_next/static/chunks/54f597c4d487e846.js"],"default"]
+b:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","s3","multipart",""],"q":"","i":false,"f":[[["",{"children":["s3",{"children":["multipart",{"children":["__PAGE__",{}]}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[[["$","script","script-0",{"src":"/_next/static/chunks/54f597c4d487e846.js","async":true,"nonce":"$undefined"}]],["$","div",null,{"className":"docs-shell","children":[["$","$L7",null,{}],["$","main",null,{"className":"docs-content","children":["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]}]]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":"$L8","templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":["$L9",{},null,false,false]},null,false,false]},null,false,false]},null,false,false],"$La",false]],"m":"$undefined","G":["$b",[]],"S":true}
+e:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+10:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+11:"$Sreact.suspense"
+8:["$","$L4",null,{}]
+c:T179e,<p class="docs-eyebrow">S3 · API</p>
+<h2>Multipart upload</h2>
+<p>For objects bigger than ~100 MiB or unreliable network paths. Split the data into 5 MiB+ parts, upload each (in parallel if you want), then complete.</p>
+
+<h3>Limits</h3>
+<ul>
+  <li>Up to <strong>10,000 parts</strong> per upload.</li>
+  <li>Total size up to <strong>5 GiB</strong> per multipart upload.</li>
+  <li>Minimum part size: <strong>5 MiB</strong> (except the last).</li>
+  <li>Abandoned uploads are auto-cleaned after <strong>24 hours</strong>.</li>
+</ul>
+
+<h3>aws-cli (handles parts automatically)</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 \
+  s3 cp ./big-video.mp4 s3://media/big-video.mp4 \
+  --expected-size 4294967296</code></pre>
+<p>Above 8 MiB, aws-cli automatically switches to multipart. For really big files, tune the chunk size:</p>
+<pre><code class="lang-bash">aws configure set default.s3.multipart_chunksize 64MB
+aws configure set default.s3.multipart_threshold 64MB
+aws configure set default.s3.max_concurrent_requests 16</code></pre>
+
+<h3>boto3 high-level</h3>
+<pre><code class="lang-python"><span class="kw">from</span> boto3.s3.transfer <span class="kw">import</span> TransferConfig
+
+cfg = TransferConfig(
+    multipart_threshold=<span class="num">64</span>*<span class="num">1024</span>*<span class="num">1024</span>,
+    multipart_chunksize=<span class="num">16</span>*<span class="num">1024</span>*<span class="num">1024</span>,
+    max_concurrency=<span class="num">8</span>
+)
+
+s3.upload_file(<span class="str">"big-video.mp4"</span>, <span class="str">"media"</span>, <span class="str">"big-video.mp4"</span>, Config=cfg)</code></pre>
+
+<h3>Raw multipart lifecycle</h3>
+
+<h4>1. Initiate</h4>
+<pre><code class="lang-bash">curl -X POST <span class="str">"http://localhost:9000/media/big-video.mp4?uploads"</span> \
+  --aws-sigv4 <span class="str">"aws:amz:us-east-1:s3"</span> \
+  --user <span class="str">"minioadmin:minioadmin"</span></code></pre>
+<p>Server returns the upload id:</p>
+<pre><code class="lang-xml"><span class="kw">&lt;InitiateMultipartUploadResult&gt;</span>
+  <span class="kw">&lt;Bucket&gt;</span>media<span class="kw">&lt;/Bucket&gt;</span>
+  <span class="kw">&lt;Key&gt;</span>big-video.mp4<span class="kw">&lt;/Key&gt;</span>
+  <span class="kw">&lt;UploadId&gt;</span>up_a3f8c01...<span class="kw">&lt;/UploadId&gt;</span>
+<span class="kw">&lt;/InitiateMultipartUploadResult&gt;</span></code></pre>
+
+<h4>2. Upload each part</h4>
+<pre><code class="lang-bash">curl -X PUT --data-binary @part1 \
+  <span class="str">"http://localhost:9000/media/big-video.mp4?partNumber=1&amp;uploadId=up_a3f8c01..."</span> \
+  --aws-sigv4 <span class="str">"aws:amz:us-east-1:s3"</span> \
+  --user <span class="str">"minioadmin:minioadmin"</span>
+<span class="co"># Server returns ETag in response header — capture it for the complete step</span></code></pre>
+
+<h4>3. Complete</h4>
+<pre><code class="lang-bash">curl -X POST <span class="str">"http://localhost:9000/media/big-video.mp4?uploadId=up_a3f8c01..."</span> \
+  --aws-sigv4 <span class="str">"aws:amz:us-east-1:s3"</span> \
+  --user <span class="str">"minioadmin:minioadmin"</span> \
+  -d <span class="str">'&lt;CompleteMultipartUpload&gt;
+    &lt;Part&gt;&lt;PartNumber&gt;1&lt;/PartNumber&gt;&lt;ETag&gt;"abc1"&lt;/ETag&gt;&lt;/Part&gt;
+    &lt;Part&gt;&lt;PartNumber&gt;2&lt;/PartNumber&gt;&lt;ETag&gt;"abc2"&lt;/ETag&gt;&lt;/Part&gt;
+    &lt;Part&gt;&lt;PartNumber&gt;3&lt;/PartNumber&gt;&lt;ETag&gt;"abc3"&lt;/ETag&gt;&lt;/Part&gt;
+&lt;/CompleteMultipartUpload&gt;'</span></code></pre>
+
+<h4>4. Or abort</h4>
+<pre><code class="lang-bash">curl -X DELETE <span class="str">"http://localhost:9000/media/big-video.mp4?uploadId=up_a3f8c01..."</span> \
+  --aws-sigv4 <span class="str">"aws:amz:us-east-1:s3"</span> \
+  --user <span class="str">"minioadmin:minioadmin"</span></code></pre>
+
+<h3>Parallel parts in Python</h3>
+<pre><code class="lang-python"><span class="kw">from</span> concurrent.futures <span class="kw">import</span> ThreadPoolExecutor
+
+resp = s3.create_multipart_upload(Bucket=<span class="str">"media"</span>, Key=<span class="str">"video.mp4"</span>)
+upload_id = resp[<span class="str">"UploadId"</span>]
+
+<span class="kw">def</span> <span class="fn">upload_part</span>(part_number, body):
+    r = s3.upload_part(
+        Bucket=<span class="str">"media"</span>, Key=<span class="str">"video.mp4"</span>,
+        UploadId=upload_id, PartNumber=part_number, Body=body
+    )
+    <span class="kw">return</span> {<span class="str">"PartNumber"</span>: part_number, <span class="str">"ETag"</span>: r[<span class="str">"ETag"</span>]}
+
+<span class="kw">with</span> open(<span class="str">"video.mp4"</span>, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+    parts_data = [(i+<span class="num">1</span>, f.read(<span class="num">16</span>*<span class="num">1024</span>*<span class="num">1024</span>)) <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">10</span>)]
+
+<span class="kw">with</span> ThreadPoolExecutor(max_workers=<span class="num">8</span>) <span class="kw">as</span> ex:
+    parts = list(ex.map(<span class="kw">lambda</span> p: upload_part(*p), parts_data))
+
+s3.complete_multipart_upload(
+    Bucket=<span class="str">"media"</span>, Key=<span class="str">"video.mp4"</span>,
+    UploadId=upload_id, MultipartUpload={<span class="str">"Parts"</span>: parts}
+)</code></pre>
+
+<h3>List in-progress uploads</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api list-multipart-uploads --bucket media</code></pre>
+
+<div class="docs-callout"><strong>Auto-cleanup:</strong> abandoned multipart uploads (started but never completed or aborted) are removed 24 hours later. No manual janitor needed.</div>
+
+<div class="docs-prevnext">
+  <a href="/s3/objects/" class="prev"><div class="label">Previous</div><div class="title">← Objects</div></a>
+  <a href="/s3/encryption/" class="next"><div class="label">Next</div><div class="title">Encryption →</div></a>
+</div>9:["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$c"}}],null,"$Ld"]}]
+a:["$","$1","h",{"children":[null,["$","$Le",null,{"children":"$Lf"}],["$","div",null,{"hidden":true,"children":["$","$L10",null,{"children":["$","$11",null,{"name":"Next.Metadata","children":"$L12"}]}]}],null]}]
+13:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+d:["$","$L13",null,{"children":["$","$11",null,{"name":"Next.MetadataOutlet","children":"$@14"}]}]
+f:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+15:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+12:[["$","title","0",{"children":"S3 Multipart Upload | OxiDB"}],["$","meta","1",{"name":"description","content":"A fast, multi-model database — document, SQL, time-series, Redis, MQTT, AMQP (RabbitMQ) and S3 in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/s3/multipart/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/s3/multipart/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L15","22",{}]]
+14:null

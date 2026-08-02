@@ -156,14 +156,14 @@ the newer server. The new features ship as additive surface (see
 Per [STABILITY.md §Tier A](../STABILITY.md), the following clients ship
 `api/v1.json` snapshots and are diffed in CI to keep this matrix honest:
 
-- `python/` (TCP), `python-embedded/` (FFI)
-- `go/` (OxiWire)
-- `julia/OxiDb` (TCP), `julia/OxiDbEmbedded` (FFI)
-- `dotnet/OxiDb.Client.Tcp`, `dotnet/OxiDb.Client.Embedded`, `dotnet/OxiDb.Linq`
-- `oxidb-js/` (REST + WebSocket)
+- `clients/python/` (TCP), `python-embedded/` (FFI)
+- `clients/go/` (OxiWire)
+- `clients/julia/OxiDb` (TCP), `julia/OxiDbEmbedded` (FFI)
+- `clients/dotnet/OxiDb.Client.Tcp`, `clients/dotnet/OxiDb.Client.Embedded`, `clients/dotnet/OxiDb.Linq`
+- `clients/js/` (REST + WebSocket)
 - `oxidb-java/` (pure-Java OxiWire)
 
-Tier-B clients (`php/`, `swift/`) ship with `1.0-experimental` markers and
+Tier-B clients (`php/`, `clients/swift/`) ship with `1.0-experimental` markers and
 are **not** covered by this matrix.
 
 ## How this matrix is enforced

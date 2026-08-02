@@ -8,10 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
     <!-- The embedded engine: OxiDb.Data reaches it by reflection when the
          connection string says Path=, so the APP references it, not Data. -->
-    <ProjectReference Include="../../dotnet/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" />
   </ItemGroup>
 
   <!-- Via a NuGet reference the runtimes/ layout ships the native library;

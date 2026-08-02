@@ -71,16 +71,16 @@ one follows the rule in [SEMVER.md §"Optional config defaults"](SEMVER.md).
 Each Tier-A client tags a `1.0` package, audits its public surface, marks
 experimental APIs as such, and ships an `api/v1.json` snapshot diffed in CI.
 
-- `python/` — TCP client (`oxidb`)
+- `clients/python/` — TCP client (`oxidb`)
 - `python-embedded/` — embedded FFI (`oxidb-embedded`)
-- `go/` — `oxidb-go` (OxiWire)
-- `julia/OxiDb` — TCP (already document-only and Tables.jl-aligned per
+- `clients/go/` — `oxidb-go` (OxiWire)
+- `clients/julia/OxiDb` — TCP (already document-only and Tables.jl-aligned per
   [ADR-0001](decisions/0001-julia-no-dbinterface.md))
 - `julia/OxiDbEmbedded` — embedded FFI
-- `dotnet/OxiDb.Client.Tcp`
-- `dotnet/OxiDb.Client.Embedded`
-- `dotnet/OxiDb.Linq` — typed query syntax over either .NET client
-- `oxidb-js/` — JS/TS (REST + WebSocket)
+- `clients/dotnet/OxiDb.Client.Tcp`
+- `clients/dotnet/OxiDb.Client.Embedded`
+- `clients/dotnet/OxiDb.Linq` — typed query syntax over either .NET client
+- `clients/js/` — JS/TS (REST + WebSocket)
 - `oxidb-java/` — pure-Java OxiWire client (`com.oxidb:oxidb-client`)
 
 ### Tier B — shipped but explicitly Experimental
@@ -91,7 +91,7 @@ any 1.x minor of the engine. They graduate to Tier A via the promotion
 mechanism below.
 
 - `php/` (PHP TCP + FFI bindings)
-- `swift/` (iOS C-FFI bindings)
+- `clients/swift/` (iOS C-FFI bindings)
 
 ## Experimental subsystems (NOT covered by 1.0)
 

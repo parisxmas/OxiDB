@@ -1,0 +1,125 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+7:I[41543,["/_next/static/chunks/0c089677cb770e4f.js","/_next/static/chunks/d4fa8f6b10da73b4.js"],"default"]
+c:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","oxiscript","api","sdks",""],"q":"","i":false,"f":[[["",{"children":["oxiscript",{"children":["api",{"children":["sdks",{"children":["__PAGE__",{}]}]}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[[["$","script","script-0",{"src":"/_next/static/chunks/d4fa8f6b10da73b4.js","async":true,"nonce":"$undefined"}]],["$","div",null,{"className":"docs-shell","children":[["$","$L7",null,{}],["$","main",null,{"className":"docs-content","children":["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]}]]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":"$L8","templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":["$L9",{"children":["$La",{},null,false,false]},null,false,false]},null,false,false]},null,false,false]},null,false,false],"$Lb",false]],"m":"$undefined","G":["$c",[]],"S":true}
+f:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+11:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+12:"$Sreact.suspense"
+8:["$","$L4",null,{}]
+9:["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}]
+d:T151e,<p class="docs-eyebrow">API · 3 of 3</p>
+<h2>SDKs — Go, Python, .NET</h2>
+<p>Each official client wraps the wire commands.</p>
+
+<h3>Go</h3>
+<pre><code class="lang-go">script := <span class="str">`proc transfer(from, to, amount) {
+    let s = find_one("accounts", {_id: from})
+    if s == null { abort "sender not found" }
+    if s.balance &lt; amount { abort "insufficient funds" }
+    update("accounts", {_id: from}, {$inc: {balance: -amount}})
+    update("accounts", {_id: to},   {$inc: {balance:  amount}})
+    return {ok: true}
+}`</span>
+
+client.CreateProcedure(<span class="str">"transfer"</span>, script)
+
+resp, err := client.CallProcedure(<span class="str">"transfer"</span>, <span class="kw">map</span>[<span class="ty">string</span>]<span class="kw">any</span>{
+    <span class="str">"from"</span>: <span class="str">"alice"</span>, <span class="str">"to"</span>: <span class="str">"bob"</span>, <span class="str">"amount"</span>: <span class="num">1500</span>,
+})
+<span class="kw">if</span> err != <span class="kw">nil</span> {
+    log.Fatal(err) <span class="co">// abort comes back as an error</span>
+}
+
+names, _ := client.ListProcedures()
+def, _ := client.GetProcedure(<span class="str">"transfer"</span>)
+client.DeleteProcedure(<span class="str">"transfer"</span>)</code></pre>
+
+<h3>Python</h3>
+<pre><code class="lang-python"><span class="kw">from</span> oxidb <span class="kw">import</span> OxiDbClient
+
+<span class="kw">with</span> OxiDbClient(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>) <span class="kw">as</span> db:
+    db.create_procedure(<span class="str">"award_points"</span>, <span class="str">"""
+        proc award_points(email, amount) {
+            let user = find_one("users", {email: email})
+            if user == null { abort "user not found" }
+            update("users", {email: email}, {$inc: {points: amount}})
+            return {ok: true, new_total: user.points + amount}
+        }
+    """</span>)
+
+    r = db.call_procedure(<span class="str">"award_points"</span>, {
+        <span class="str">"email"</span>: <span class="str">"alice@example.com"</span>,
+        <span class="str">"amount"</span>: <span class="num">100</span>
+    })
+    <span class="kw">print</span>(r)
+
+    db.list_procedures()
+    db.get_procedure(<span class="str">"award_points"</span>)
+    db.delete_procedure(<span class="str">"award_points"</span>)</code></pre>
+
+<h3>.NET (TCP client)</h3>
+<pre><code class="lang-csharp"><span class="kw">using</span> OxiDb.Client.Tcp;
+
+<span class="kw">var</span> client = <span class="kw">new</span> OxiDbClient(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>);
+
+<span class="kw">var</span> script = @<span class="str">"
+    proc transfer(from, to, amount) {
+        let s = find_one(""accounts"", {_id: from})
+        if s.balance &lt; amount { abort ""insufficient funds"" }
+        update(""accounts"", {_id: from}, {$inc: {balance: -amount}})
+        update(""accounts"", {_id: to},   {$inc: {balance:  amount}})
+        return {ok: true}
+    }"</span>;
+
+<span class="kw">await</span> client.CreateProcedureAsync(<span class="str">"transfer"</span>, script);
+
+<span class="kw">var</span> result = <span class="kw">await</span> client.CallProcedureAsync(<span class="str">"transfer"</span>, <span class="kw">new</span> {
+    from = <span class="str">"alice"</span>, to = <span class="str">"bob"</span>, amount = <span class="num">1500</span>
+});</code></pre>
+
+<h3>JS / TypeScript (oxidb-js)</h3>
+<pre><code class="lang-javascript"><span class="kw">import</span> { OxiDb } <span class="kw">from</span> <span class="str">"oxidb"</span>
+
+<span class="kw">const</span> db = <span class="kw">new</span> OxiDb({rest: <span class="str">"http://localhost:8080"</span>})
+
+<span class="kw">await</span> db.createProcedure(<span class="str">"transfer"</span>, <span class="str">`
+  proc transfer(from, to, amount) {
+    let s = find_one("accounts", {_id: from})
+    if s.balance &lt; amount { abort "insufficient funds" }
+    update("accounts", {_id: from}, {$inc: {balance: -amount}})
+    update("accounts", {_id: to},   {$inc: {balance:  amount}})
+    return {ok: true}
+  }
+`</span>)
+
+<span class="kw">const</span> r = <span class="kw">await</span> db.callProcedure(<span class="str">"transfer"</span>, {
+  from: <span class="str">"alice"</span>, to: <span class="str">"bob"</span>, amount: <span class="num">1500</span>
+})</code></pre>
+
+<h3>Common pattern: load procs from disk on boot</h3>
+<pre><code class="lang-python"><span class="kw">import</span> os, glob
+
+<span class="kw">for</span> path <span class="kw">in</span> glob.glob(<span class="str">"procs/*.oxs"</span>):
+    name = os.path.splitext(os.path.basename(path))[<span class="num">0</span>]
+    <span class="kw">with</span> open(path) <span class="kw">as</span> f:
+        db.create_procedure(name, f.read())</code></pre>
+
+<div class="docs-callout"><strong>Versioning tip:</strong> keep your procedures in source control as <code>.oxs</code> files and re-create them on deploy. There is no migration concept — <code>create_procedure</code> overwrites by name.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/api/rest/" class="prev"><div class="label">Previous</div><div class="title">← REST endpoints</div></a>
+  <a href="/oxiscript/" class="next"><div class="label">Back to</div><div class="title">OxiScript overview →</div></a>
+</div>a:["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$d"}}],null,"$Le"]}]
+b:["$","$1","h",{"children":[null,["$","$Lf",null,{"children":"$L10"}],["$","div",null,{"hidden":true,"children":["$","$L11",null,{"children":["$","$12",null,{"name":"Next.Metadata","children":"$L13"}]}]}],null]}]
+14:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+e:["$","$L14",null,{"children":["$","$12",null,{"name":"Next.MetadataOutlet","children":"$@15"}]}]
+10:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+16:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+13:[["$","title","0",{"children":"SDKs | OxiDB"}],["$","meta","1",{"name":"description","content":"A fast, multi-model database — document, SQL, time-series, Redis, MQTT, AMQP (RabbitMQ) and S3 in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/oxiscript/api/sdks/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/oxiscript/api/sdks/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L16","22",{}]]
+15:null

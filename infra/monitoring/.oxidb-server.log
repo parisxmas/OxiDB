@@ -1,0 +1,123 @@
+OxiDB:      TCP 127.0.0.1:4444   metrics http://127.0.0.1:14580/metrics
+data dir:   /Users/barisakin/source/docdb/monitoring/.oxidb-data
+slow-query profiler: ON (>50ms -> _profile)
+
+lazy sync: DISABLED — every commit fsync'd (strict ACID-D); snapshot every 1000ms
+TTL eviction: enabled (interval=1000ms)
+alert evaluator: enabled (interval=15s)
+FTS: lang=english k1=1.2 b=0.75 (BM25)
+oxidb-server listening on 127.0.0.1:4444 (pool_size=4, data_dir=/Users/barisakin/source/docdb/monitoring/.oxidb-data, idle_timeout=30s)
+[rest] WARNING: no OXIDB_JWT_SECRET — REST API is open (no auth)
+[rest] thread pool: 64 workers, queue depth 512
+REST HTTP API listening on 0.0.0.0:14580
+client connected: 127.0.0.1:50015
+client disconnected: 127.0.0.1:50015
+client connected: 127.0.0.1:50016
+client connected: 127.0.0.1:50017
+client connected: 127.0.0.1:50018
+client connected: 127.0.0.1:50019
+client connected: 127.0.0.1:50020
+client connected: 127.0.0.1:50021
+client connected: 127.0.0.1:50022
+client connected: 127.0.0.1:50023
+client connected: 127.0.0.1:50024
+client connected: 127.0.0.1:50025
+client connected: 127.0.0.1:50026
+client disconnected: 127.0.0.1:50026
+client disconnected: 127.0.0.1:50024
+client disconnected: 127.0.0.1:50025
+client disconnected: 127.0.0.1:50022
+client disconnected: 127.0.0.1:50020
+client disconnected: 127.0.0.1:50019
+client disconnected: 127.0.0.1:50018
+client disconnected: 127.0.0.1:50017
+client disconnected: 127.0.0.1:50016
+client disconnected: 127.0.0.1:50023
+client disconnected: 127.0.0.1:50021
+client connected: 127.0.0.1:50031
+client disconnected: 127.0.0.1:50031
+client connected: 127.0.0.1:53856
+client connected: 127.0.0.1:53857
+client disconnected: 127.0.0.1:53857
+client disconnected: 127.0.0.1:53856
+client connected: 127.0.0.1:53858
+client disconnected: 127.0.0.1:53858
+client connected: 127.0.0.1:53862
+client disconnected: 127.0.0.1:53862
+client connected: 127.0.0.1:53874
+client connected: 127.0.0.1:53875
+client disconnected: 127.0.0.1:53875
+client disconnected: 127.0.0.1:53874
+client connected: 127.0.0.1:53876
+client disconnected: 127.0.0.1:53876
+client connected: 127.0.0.1:53877
+client connected: 127.0.0.1:53878
+client connected: 127.0.0.1:53879
+client connected: 127.0.0.1:53880
+client connected: 127.0.0.1:53881
+client connected: 127.0.0.1:53882
+client connected: 127.0.0.1:53883
+client connected: 127.0.0.1:53884
+client connected: 127.0.0.1:53885
+client connected: 127.0.0.1:53886
+client connected: 127.0.0.1:53887
+client connected: 127.0.0.1:53888
+client connected: 127.0.0.1:53889
+client connected: 127.0.0.1:53890
+client connected: 127.0.0.1:53891
+client connected: 127.0.0.1:53894
+client connected: 127.0.0.1:53895
+client connected: 127.0.0.1:53896
+client connected: 127.0.0.1:53897
+client connected: 127.0.0.1:53898
+client connected: 127.0.0.1:53899
+idle timeout for 127.0.0.1:53878, disconnecting
+idle timeout for 127.0.0.1:53880, disconnecting
+client disconnected: 127.0.0.1:53880
+idle timeout for 127.0.0.1:53882, disconnecting
+idle timeout for 127.0.0.1:53886, disconnecting
+client disconnected: 127.0.0.1:53878
+idle timeout for 127.0.0.1:53888, disconnecting
+client disconnected: 127.0.0.1:53888
+idle timeout for 127.0.0.1:53890, disconnecting
+client disconnected: 127.0.0.1:53890
+idle timeout for 127.0.0.1:53896, disconnecting
+client disconnected: 127.0.0.1:53896
+client disconnected: 127.0.0.1:53882
+client disconnected: 127.0.0.1:53886
+idle timeout for 127.0.0.1:53884, disconnecting
+client disconnected: 127.0.0.1:53884
+idle timeout for 127.0.0.1:53898, disconnecting
+client disconnected: 127.0.0.1:53898
+idle timeout for 127.0.0.1:53894, disconnecting
+client disconnected: 127.0.0.1:53894
+client disconnected: 127.0.0.1:53881
+client disconnected: 127.0.0.1:53895
+client disconnected: 127.0.0.1:53885
+client disconnected: 127.0.0.1:53883
+client disconnected: 127.0.0.1:53897
+client disconnected: 127.0.0.1:53899
+client disconnected: 127.0.0.1:53889
+client disconnected: 127.0.0.1:53887
+client disconnected: 127.0.0.1:53879
+client disconnected: 127.0.0.1:53891
+client connected: 127.0.0.1:53901
+client disconnected: 127.0.0.1:53901
+client disconnected: 127.0.0.1:53877
+client connected: 127.0.0.1:53907
+client connected: 127.0.0.1:53908
+client disconnected: 127.0.0.1:53908
+client disconnected: 127.0.0.1:53907
+client connected: 127.0.0.1:53909
+client connected: 127.0.0.1:53913
+client connected: 127.0.0.1:53914
+client disconnected: 127.0.0.1:53913
+client disconnected: 127.0.0.1:53914
+client connected: 127.0.0.1:53915
+client disconnected: 127.0.0.1:53915
+read error from 127.0.0.1:53909: Connection reset by peer (os error 54)
+client disconnected: 127.0.0.1:53909
+client connected: 127.0.0.1:53918
+client disconnected: 127.0.0.1:53918
+oxidb-server: shutdown signal received, flushing...
+oxidb-server: flush complete in 249.422792ms, exiting cleanly

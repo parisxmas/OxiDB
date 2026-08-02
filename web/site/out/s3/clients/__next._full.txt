@@ -1,0 +1,162 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+7:I[73067,["/_next/static/chunks/0c089677cb770e4f.js","/_next/static/chunks/54f597c4d487e846.js"],"default"]
+b:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","s3","clients",""],"q":"","i":false,"f":[[["",{"children":["s3",{"children":["clients",{"children":["__PAGE__",{}]}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[[["$","script","script-0",{"src":"/_next/static/chunks/54f597c4d487e846.js","async":true,"nonce":"$undefined"}]],["$","div",null,{"className":"docs-shell","children":[["$","$L7",null,{}],["$","main",null,{"className":"docs-content","children":["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]}]]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":"$L8","templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":["$L9",{},null,false,false]},null,false,false]},null,false,false]},null,false,false],"$La",false]],"m":"$undefined","G":["$b",[]],"S":true}
+e:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+10:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+11:"$Sreact.suspense"
+8:["$","$L4",null,{}]
+c:T1a47,<p class="docs-eyebrow">S3 · Use it From</p>
+<h2>Clients</h2>
+<p>Anything that talks AWS S3 talks to OxiDB. Pass <code>--endpoint-url</code> (or set <code>endpoint_url</code> in the SDK config), and you're done.</p>
+
+<h3>aws-cli</h3>
+<pre><code class="lang-bash">aws configure set aws_access_key_id minioadmin
+aws configure set aws_secret_access_key minioadmin
+aws configure set default.region us-east-1
+
+ENDPOINT=http://localhost:9000
+aws --endpoint-url $ENDPOINT s3 ls
+aws --endpoint-url $ENDPOINT s3 mb s3://photos
+aws --endpoint-url $ENDPOINT s3 cp ./local s3://photos/ --recursive
+aws --endpoint-url $ENDPOINT s3 sync ./local s3://photos/
+
+<span class="co"># Persist endpoint to skip the flag (~/.aws/config)</span>
+[profile oxidb]
+endpoint_url = http://localhost:9000
+region = us-east-1
+
+aws --profile oxidb s3 ls</code></pre>
+
+<h3>Python — boto3</h3>
+<pre><code class="lang-python"><span class="kw">import</span> boto3
+
+s3 = boto3.client(
+    <span class="str">"s3"</span>,
+    endpoint_url=<span class="str">"http://localhost:9000"</span>,
+    aws_access_key_id=<span class="str">"minioadmin"</span>,
+    aws_secret_access_key=<span class="str">"minioadmin"</span>,
+    region_name=<span class="str">"us-east-1"</span>
+)
+
+s3.create_bucket(Bucket=<span class="str">"photos"</span>)
+s3.upload_file(<span class="str">"avatar.png"</span>, <span class="str">"photos"</span>, <span class="str">"me.png"</span>)
+s3.download_file(<span class="str">"photos"</span>, <span class="str">"me.png"</span>, <span class="str">"local.png"</span>)
+<span class="kw">for</span> page <span class="kw">in</span> s3.get_paginator(<span class="str">"list_objects_v2"</span>).paginate(Bucket=<span class="str">"photos"</span>):
+    <span class="kw">for</span> o <span class="kw">in</span> page.get(<span class="str">"Contents"</span>, []):
+        <span class="kw">print</span>(o[<span class="str">"Key"</span>], o[<span class="str">"Size"</span>])</code></pre>
+
+<h3>Python — s3fs</h3>
+<pre><code class="lang-python"><span class="kw">import</span> s3fs
+
+fs = s3fs.S3FileSystem(
+    key=<span class="str">"minioadmin"</span>, secret=<span class="str">"minioadmin"</span>,
+    client_kwargs={<span class="str">"endpoint_url"</span>: <span class="str">"http://localhost:9000"</span>}
+)
+
+<span class="kw">with</span> fs.open(<span class="str">"photos/me.png"</span>, <span class="str">"wb"</span>) <span class="kw">as</span> f:
+    f.write(image_bytes)
+
+<span class="kw">for</span> path <span class="kw">in</span> fs.ls(<span class="str">"photos"</span>):
+    <span class="kw">print</span>(path)</code></pre>
+
+<h3>mc — MinIO client</h3>
+<pre><code class="lang-bash">mc alias set oxidb http://localhost:9000 minioadmin minioadmin
+
+mc mb oxidb/photos
+mc cp avatar.png oxidb/photos/me.png
+mc ls oxidb/photos/
+mc cat oxidb/photos/me.png &gt; recovered.png
+mc rm oxidb/photos/me.png
+mc rb oxidb/photos
+mc mirror ./local oxidb/photos/</code></pre>
+
+<h3>JavaScript — AWS SDK v3</h3>
+<pre><code class="lang-javascript"><span class="kw">import</span> { S3Client, PutObjectCommand, GetObjectCommand } <span class="kw">from</span> <span class="str">"@aws-sdk/client-s3"</span>
+
+<span class="kw">const</span> s3 = <span class="kw">new</span> S3Client({
+  endpoint: <span class="str">"http://localhost:9000"</span>,
+  region: <span class="str">"us-east-1"</span>,
+  credentials: { accessKeyId: <span class="str">"minioadmin"</span>, secretAccessKey: <span class="str">"minioadmin"</span> },
+  forcePathStyle: <span class="kw">true</span>     <span class="co">// IMPORTANT — OxiDB uses path-style URLs</span>
+})
+
+<span class="kw">await</span> s3.send(<span class="kw">new</span> PutObjectCommand({
+  Bucket: <span class="str">"photos"</span>, Key: <span class="str">"me.png"</span>, Body: imageBuffer,
+  ContentType: <span class="str">"image/png"</span>
+}))
+
+<span class="kw">const</span> obj = <span class="kw">await</span> s3.send(<span class="kw">new</span> GetObjectCommand({
+  Bucket: <span class="str">"photos"</span>, Key: <span class="str">"me.png"</span>
+}))</code></pre>
+
+<h3>Go — aws-sdk-go-v2</h3>
+<pre><code class="lang-go"><span class="kw">import</span> (
+    <span class="str">"context"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/aws"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/credentials"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/service/s3"</span>
+)
+
+cfg := aws.Config{
+    Region: <span class="str">"us-east-1"</span>,
+    Credentials: credentials.NewStaticCredentialsProvider(<span class="str">"minioadmin"</span>, <span class="str">"minioadmin"</span>, <span class="str">""</span>),
+    BaseEndpoint: aws.String(<span class="str">"http://localhost:9000"</span>),
+}
+
+client := s3.NewFromConfig(cfg, <span class="kw">func</span>(o *s3.Options) {
+    o.UsePathStyle = <span class="kw">true</span>
+})
+
+client.PutObject(context.TODO(), &amp;s3.PutObjectInput{
+    Bucket: aws.String(<span class="str">"photos"</span>),
+    Key:    aws.String(<span class="str">"me.png"</span>),
+    Body:   bytes.NewReader(data),
+})</code></pre>
+
+<h3>rclone</h3>
+<pre><code class="lang-bash"># ~/.config/rclone/rclone.conf
+[oxidb]
+type = s3
+provider = Other
+access_key_id = minioadmin
+secret_access_key = minioadmin
+endpoint = http://localhost:9000
+force_path_style = true
+
+rclone copy ./local oxidb:photos/
+rclone sync oxidb:photos/ ./backup/
+rclone ls oxidb:photos</code></pre>
+
+<h3>Browser uploads — presigned URL + fetch</h3>
+<pre><code class="lang-javascript"><span class="co">// Backend (boto3)</span>
+url = s3.generate_presigned_url(<span class="str">"put_object"</span>,
+  Params={<span class="str">"Bucket"</span>: <span class="str">"uploads"</span>, <span class="str">"Key"</span>: <span class="str">"u-1.png"</span>, <span class="str">"ContentType"</span>: <span class="str">"image/png"</span>},
+  ExpiresIn=<span class="num">600</span>)
+
+<span class="co">// Frontend (any modern browser)</span>
+<span class="kw">await</span> fetch(url, {
+  method: <span class="str">"PUT"</span>,
+  body: file,
+  headers: { <span class="str">"Content-Type"</span>: <span class="str">"image/png"</span> }
+})</code></pre>
+
+<div class="docs-callout"><strong>Path style vs virtual host:</strong> OxiDB only speaks <strong>path-style</strong> URLs (<code>http://endpoint/bucket/key</code>). Force this in any SDK that defaults to virtual-host style — the option is usually called <code>force_path_style</code> or <code>UsePathStyle</code>.</div>
+
+<div class="docs-prevnext">
+  <a href="/s3/encryption/" class="prev"><div class="label">Previous</div><div class="title">← Encryption</div></a>
+  <a href="/s3/" class="next"><div class="label">Back to</div><div class="title">S3 overview →</div></a>
+</div>9:["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$c"}}],null,"$Ld"]}]
+a:["$","$1","h",{"children":[null,["$","$Le",null,{"children":"$Lf"}],["$","div",null,{"hidden":true,"children":["$","$L10",null,{"children":["$","$11",null,{"name":"Next.Metadata","children":"$L12"}]}]}],null]}]
+13:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+d:["$","$L13",null,{"children":["$","$11",null,{"name":"Next.MetadataOutlet","children":"$@14"}]}]
+f:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+15:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+12:[["$","title","0",{"children":"S3 Clients | OxiDB"}],["$","meta","1",{"name":"description","content":"A fast, multi-model database — document, SQL, time-series, Redis, MQTT, AMQP (RabbitMQ) and S3 in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/s3/clients/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/s3/clients/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L15","22",{}]]
+14:null

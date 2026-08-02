@@ -1,0 +1,69 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:Te2a,<p class="docs-eyebrow">Database Ops · 4 of 6</p>
+<h2><code>delete</code> / <code>delete_one</code></h2>
+<p>Remove documents. <code>delete</code> hits every match; <code>delete_one</code> stops after one.</p>
+
+<h3>Signatures</h3>
+<pre><code class="lang-rust">delete(collection, query)
+delete_one(collection, query)</code></pre>
+
+<h3>Delete by id</h3>
+<pre><code class="lang-rust">proc remove_user(id) {
+    delete_one(<span class="str">"users"</span>, {_id: id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Delete with confirmation</h3>
+<pre><code class="lang-rust">proc safe_delete(id, confirmation) {
+    let user = find_one(<span class="str">"users"</span>, {_id: id})
+    <span class="kw">if</span> user == <span class="kw">null</span>                 { <span class="kw">abort</span> <span class="str">"not found"</span> }
+    <span class="kw">if</span> confirmation != user.email   { <span class="kw">abort</span> <span class="str">"confirmation must match email"</span> }
+    delete_one(<span class="str">"users"</span>, {_id: id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, deleted: id}
+}</code></pre>
+
+<h3>Bulk delete</h3>
+<pre><code class="lang-rust">proc purge_old_logs(days) {
+    delete(<span class="str">"logs"</span>, {age_days: {$gte: days}})
+    <span class="kw">return</span> {remaining: count(<span class="str">"logs"</span>)}
+}</code></pre>
+
+<h3>Soft delete (preferred for user data)</h3>
+<p>Hard <code>delete</code> can't be undone. For most user-facing data, mark a flag instead:</p>
+<pre><code class="lang-rust">proc soft_delete_user(id, reason) {
+    let u = find_one(<span class="str">"users"</span>, {_id: id})
+    <span class="kw">if</span> u == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"not found"</span> }
+    update(<span class="str">"users"</span>, {_id: id}, {
+        $set: {deleted: <span class="kw">true</span>, deleted_at: <span class="str">"now"</span>, deleted_reason: reason}
+    })
+    insert(<span class="str">"audit_log"</span>, {action: <span class="str">"delete"</span>, target: id, original: u})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Cascade delete</h3>
+<pre><code class="lang-rust">proc remove_account(account_id) {
+    delete(<span class="str">"transactions"</span>, {account_id: account_id})
+    delete(<span class="str">"sessions"</span>, {account_id: account_id})
+    delete(<span class="str">"notifications"</span>, {user_id: account_id})
+    delete_one(<span class="str">"accounts"</span>, {_id: account_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Conditional cascade</h3>
+<pre><code class="lang-rust">proc remove_team(team_id) {
+    let members = count(<span class="str">"members"</span>, {team_id: team_id})
+    <span class="kw">if</span> members &gt; <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"team has members"</span> }
+    delete_one(<span class="str">"teams"</span>, {_id: team_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<div class="docs-callout"><strong>Atomic cascade:</strong> all the deletes in <code>remove_account</code> above run in one transaction. If any step fails, nothing is removed.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/db/update/" class="prev"><div class="label">Previous</div><div class="title">← update</div></a>
+  <a href="/oxiscript/db/count/" class="next"><div class="label">Next</div><div class="title">count →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

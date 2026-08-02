@@ -1,0 +1,81 @@
+1:"$Sreact.fragment"
+2:I[42724,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+3:I[39756,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+4:I[37457,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"default"]
+5:I[22016,["/_next/static/chunks/0c089677cb770e4f.js"],""]
+6:I[70669,["/_next/static/chunks/0c089677cb770e4f.js"],"default"]
+a:I[68027,[],"default"]
+:HL["/_next/static/chunks/c46b1bfd479c8b86.css","style"]
+7:T1207,<section class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Time-Series Engine</h2>
+    <p class="section-desc">A standalone InfluxDB-style time-series engine, mounted like the SQL engine in the same process. Each series (measurement &times; tag-set &times; field) is a Gorilla-compressed columnar stream &mdash; about 0.3 bytes per point on regular data. Off by default; zero cost when unused.</p>
+
+    <h3>Enable it</h3>
+    <pre><code class="lang-bash">OXIDB_TSDB=1 ./oxidb-server
+<span class="co"># data under &lt;OXIDB_DATA&gt;/tsdb (override with OXIDB_TSDB_DATA)</span></code></pre>
+
+    <h3>Write points</h3>
+    <p>TSDB requests carry <code>"engine": "tsdb"</code>, <code>"cmd": "tsdb"</code>, and an <code>"op"</code>. Fields are typed (float / integer / boolean / string).</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "tsdb", "op": "write",
+  "measurement": "cpu", "tags": {"host": "a", "region": "eu"},
+  "fields": {"usage": 0.63}, "ts": 1700000000000 }</code></pre>
+
+    <h3>InfluxDB line protocol</h3>
+    <p>Ingest the InfluxDB line protocol verbatim &mdash; ms timestamps, <code>now()</code> when absent.</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "tsdb", "op": "write_lp",
+  "lp": "cpu,host=a,region=eu usage=0.63 1700000000000\ncpu,host=b usage=0.41" }</code></pre>
+
+    <h3>Query &amp; downsample</h3>
+    <p>Filter by measurement, field, tags, and a <code>[start, end)</code> window; optionally downsample with <code>GROUP BY time(interval)</code> and group by tags.</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "tsdb", "op": "query",
+  "measurement": "cpu", "field": "usage",
+  "tag_filters": [{"key": "host", "value": "a"}],
+  "start": 1700000000000, "end": 1700003600000,
+  "interval": 600000, "group_by": ["region"],
+  "agg": "mean" }</code></pre>
+    <h3>Aggregations</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Agg</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>mean sum min max count first last distinct</code></td><td>Standard numeric aggregations</td></tr>
+          <tr><td><code>rate</code></td><td>Per-second change (for counters)</td></tr>
+          <tr><td><code>percentile</code> (+ <code>p</code>), or <code>p95</code> shorthand</td><td>Linear-interpolated percentile</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Text (string) fields support <code>first</code> / <code>last</code> / <code>count</code> / <code>distinct</code>.</p>
+
+    <h3>Continuous-aggregate rollups</h3>
+    <p>Materialize completed time buckets of every numeric series into a derived measurement (<code>&lt;m&gt;@&lt;label&gt;</code>). Incremental via a crash-safe per-series watermark &mdash; no double-count on restart.</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "tsdb", "op": "rollup_add",
+  "measurement": "cpu", "interval": 60000, "aggs": ["mean", "max"] }
+{ "engine": "tsdb", "cmd": "tsdb", "op": "rollup_refresh", "now": 1700003600000 }
+<span class="co">// query the rollup as measurement "cpu@1m", field "usage_mean"</span></code></pre>
+
+    <h3>Retention &amp; checkpoints</h3>
+    <p>Retention drops whole expired blocks &mdash; durable for free. A checkpoint seals buffers, writes a fresh snapshot, and rotates the WAL (auto past 8&nbsp;MiB).</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "tsdb", "op": "retention", "cutoff": 1699000000000 }
+{ "engine": "tsdb", "cmd": "tsdb", "op": "checkpoint" }
+{ "engine": "tsdb", "cmd": "tsdb", "op": "stats" }</code></pre>
+
+    <h3>Backup &amp; restore</h3>
+    <p>Like the SQL engine, the TSDB has a consistent <strong>low-lock online backup</strong> &mdash; it pins a committed generation and compresses with the write lock released, so ingestion keeps flowing. Admin-only.</p>
+    <pre><code class="lang-json">{ "engine": "tsdb", "cmd": "backup",  "path": "/backups/tsdb.tar.gz" }
+{ "engine": "tsdb", "cmd": "restore", "archive": "/backups/tsdb.tar.gz", "target": "/data/restored" }</code></pre>
+
+    <h3>Persistence</h3>
+    <p>A versioned block snapshot + per-generation WAL, with a MANIFEST as the atomic commit point. Every point is WAL-appended; a checkpoint writes a fresh snapshot, atomically replaces the MANIFEST, then rotates the WAL &mdash; a crash on either side never double-counts. Node-local. A Go client ships in the repo.</p>
+  </div>
+</section>0:{"P":null,"b":"KSQyzOi4CrTPaMnAtTmaN","c":["","tsdb",""],"q":"","i":false,"f":[[["",{"children":["tsdb",{"children":["__PAGE__",{}]}]},"$undefined","$undefined",true],[["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/c46b1bfd479c8b86.css","precedence":"next","crossOrigin":"$undefined","nonce":"$undefined"}],["$","script","script-0",{"src":"/_next/static/chunks/0c089677cb770e4f.js","async":true,"nonce":"$undefined"}]],["$","html",null,{"lang":"en","children":["$","body",null,{"children":[["$","script",null,{"dangerouslySetInnerHTML":{"__html":"(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();"}}],["$","$L2",null,{}],["$","div",null,{"className":"dev-banner","role":"alert","children":[["$","span",null,{"className":"dev-banner-dot"}],["$","span",null,{"children":[["$","strong",null,{"children":"Under active development."}]," OxiDB is not yet recommended for production use."]}]]}],["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":[[["$","title",null,{"children":"404: This page could not be found."}],["$","div",null,{"style":{"fontFamily":"system-ui,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"","height":"100vh","textAlign":"center","display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center"},"children":["$","div",null,{"children":[["$","style",null,{"dangerouslySetInnerHTML":{"__html":"body{color:#000;background:#fff;margin:0}.next-error-h1{border-right:1px solid rgba(0,0,0,.3)}@media (prefers-color-scheme:dark){body{color:#fff;background:#000}.next-error-h1{border-right:1px solid rgba(255,255,255,.3)}}"}}],["$","h1",null,{"className":"next-error-h1","style":{"display":"inline-block","margin":"0 20px 0 0","padding":"0 23px 0 0","fontSize":24,"fontWeight":500,"verticalAlign":"top","lineHeight":"49px"},"children":404}],["$","div",null,{"style":{"display":"inline-block"},"children":["$","h2",null,{"style":{"fontSize":14,"fontWeight":400,"lineHeight":"49px","margin":0},"children":"This page could not be found."}]}]]}]}]],[]],"forbidden":"$undefined","unauthorized":"$undefined"}],["$","a",null,{"href":"/bugs/","className":"report-tab","aria-label":"Report an issue","children":[["$","svg",null,{"width":"16","height":"16","viewBox":"0 0 24 24","fill":"none","stroke":"currentColor","strokeWidth":"2","strokeLinecap":"round","strokeLinejoin":"round","children":[["$","rect",null,{"x":"8","y":"6","width":"8","height":"14","rx":"4"}],["$","path",null,{"d":"M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2"}]]}],["$","span",null,{"children":"Report Issue"}]]}],["$","footer",null,{"className":"footer","children":["$","div",null,{"className":"container","children":[["$","div",null,{"className":"footer-inner","children":[["$","div",null,{"className":"footer-brand","children":[["$","span",null,{"className":"logo","children":["Oxi",["$","span",null,{"children":"DB"}]]}],["$","p",null,{"children":"A fast, versatile document database."}]]}],["$","div",null,{"className":"footer-links","children":[["$","div",null,{"children":[["$","h4",null,{"children":"Resources"}],["$","a",null,{"href":"https://crates.io/crates/oxidb","children":"crates.io"}]]}],["$","div",null,{"children":[["$","h4",null,{"children":"Docs"}],["$","$L5",null,{"href":"/quickstart","children":"Quick Start"}],["$","$L5",null,{"href":"/queries","children":"Query API"}],["$","$L5",null,{"href":"/server","children":"Server"}],["$","$L5",null,{"href":"/clients","children":"Client Libraries"}],["$","$L5",null,{"href":"/license","children":"License"}]]}]]}]]}],["$","div",null,{"className":"footer-bottom","children":["$","p",null,{"children":["© 2026 Barış AKIN — OxiDB is source-available: free for your own production use (",["$","$L5",null,{"href":"/license","children":"licensing"}],") — Built with Rust"]}]}]]}]}],["$","$L6",null,{}]]}]}]]}],{"children":[["$","$1","c",{"children":[null,["$","$L3",null,{"parallelRouterKey":"children","error":"$undefined","errorStyles":"$undefined","errorScripts":"$undefined","template":["$","$L4",null,{}],"templateStyles":"$undefined","templateScripts":"$undefined","notFound":"$undefined","forbidden":"$undefined","unauthorized":"$undefined"}]]}],{"children":[["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$7"}}],null,"$L8"]}],{},null,false,false]},null,false,false]},null,false,false],"$L9",false]],"m":"$undefined","G":["$a",[]],"S":true}
+b:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+c:"$Sreact.suspense"
+e:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"ViewportBoundary"]
+10:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"MetadataBoundary"]
+8:["$","$Lb",null,{"children":["$","$c",null,{"name":"Next.MetadataOutlet","children":"$@d"}]}]
+9:["$","$1","h",{"children":[null,["$","$Le",null,{"children":"$Lf"}],["$","div",null,{"hidden":true,"children":["$","$L10",null,{"children":["$","$c",null,{"name":"Next.Metadata","children":"$L11"}]}]}],null]}]
+f:[["$","meta","0",{"charSet":"utf-8"}],["$","meta","1",{"name":"viewport","content":"width=device-width, initial-scale=1"}]]
+12:I[27201,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"IconMark"]
+d:null
+11:[["$","title","0",{"children":"Time-Series Engine | OxiDB"}],["$","meta","1",{"name":"description","content":"OxiDB's InfluxDB-style time-series engine — Gorilla-compressed streams, line-protocol ingest, downsampling, rate()/percentile, continuous-aggregate rollups, and backup/restore."}],["$","meta","2",{"name":"keywords","content":"database,multi-model database,document database,sql database,time series database,nosql,embedded database,rust,json,mongodb,ef core,full-text search,vector search,transactions,amqp,rabbitmq,mqtt,message queue,work queue"}],["$","meta","3",{"property":"og:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","4",{"property":"og:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.39.15."}],["$","meta","5",{"property":"og:url","content":"https://oxidb.baltavista.com/"}],["$","meta","6",{"property":"og:site_name","content":"OxiDB"}],["$","meta","7",{"property":"og:image:alt","content":"OxiDB"}],["$","meta","8",{"property":"og:image:type","content":"image/png"}],["$","meta","9",{"property":"og:image","content":"https://oxidb.baltavista.com/tsdb/opengraph-image?5055a917c75913e"}],["$","meta","10",{"property":"og:image:width","content":"1200"}],["$","meta","11",{"property":"og:image:height","content":"630"}],["$","meta","12",{"property":"og:type","content":"website"}],["$","meta","13",{"name":"twitter:card","content":"summary_large_image"}],["$","meta","14",{"name":"twitter:title","content":"OxiDB - Fast Multi-Model Database"}],["$","meta","15",{"name":"twitter:description","content":"MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.39.15."}],["$","meta","16",{"name":"twitter:image:alt","content":"OxiDB"}],["$","meta","17",{"name":"twitter:image:type","content":"image/png"}],["$","meta","18",{"name":"twitter:image","content":"https://oxidb.baltavista.com/tsdb/opengraph-image?5055a917c75913e"}],["$","meta","19",{"name":"twitter:image:width","content":"1200"}],["$","meta","20",{"name":"twitter:image:height","content":"630"}],["$","link","21",{"rel":"icon","href":"/logo.png"}],["$","$L12","22",{}]]

@@ -7,7 +7,7 @@
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
   </ItemGroup>
 </Project>

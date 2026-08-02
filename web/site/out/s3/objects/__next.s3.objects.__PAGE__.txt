@@ -1,0 +1,103 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T135a,<p class="docs-eyebrow">S3 · API</p>
+<h2>Objects</h2>
+<p>The everyday operations: PUT, GET, HEAD, DELETE, COPY, plus tagging and conditional / range reads.</p>
+
+<h3>PUT — upload an object</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3 cp ./avatar.png s3://photos/me.png</code></pre>
+
+<h4>With content-type and custom metadata</h4>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api put-object \
+  --bucket photos --key me.png \
+  --body avatar.png \
+  --content-type image/png \
+  --metadata <span class="str">"user_id=123,uploaded_by=alice"</span></code></pre>
+
+<h4>boto3</h4>
+<pre><code class="lang-python">s3.upload_file(<span class="str">"avatar.png"</span>, <span class="str">"photos"</span>, <span class="str">"me.png"</span>, ExtraArgs={
+    <span class="str">"ContentType"</span>: <span class="str">"image/png"</span>,
+    <span class="str">"Metadata"</span>: {<span class="str">"user_id"</span>: <span class="str">"123"</span>}
+})</code></pre>
+
+<h4>Raw curl</h4>
+<pre><code class="lang-bash">curl -X PUT --data-binary @avatar.png \
+  -H <span class="str">"Content-Type: image/png"</span> \
+  -H <span class="str">"x-amz-meta-user-id: 123"</span> \
+  --aws-sigv4 <span class="str">"aws:amz:us-east-1:s3"</span> \
+  --user <span class="str">"minioadmin:minioadmin"</span> \
+  http://localhost:9000/photos/me.png</code></pre>
+
+<h3>GET — download an object</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3 cp s3://photos/me.png ./download.png</code></pre>
+
+<h4>Range requests</h4>
+<p>Standard HTTP <code>Range</code> header — useful for video streaming, resumable downloads, partial reads.</p>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api get-object \
+  --bucket videos --key movie.mp4 \
+  --range bytes=0-1048575 \
+  /tmp/first-megabyte</code></pre>
+
+<h4>Conditional GET</h4>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api get-object \
+  --bucket photos --key me.png \
+  --if-none-match <span class="str">'"abc123def"'</span> \
+  /tmp/me.png
+<span class="co"># Returns 304 Not Modified if ETag matches</span></code></pre>
+
+<h3>HEAD — metadata only</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api head-object \
+  --bucket photos --key me.png</code></pre>
+<p>Returns size, content-type, ETag, last-modified, and any custom <code>x-amz-meta-*</code> headers.</p>
+
+<h3>DELETE — remove an object</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3 rm s3://photos/me.png</code></pre>
+
+<h4>Batch delete (up to 1000 keys)</h4>
+<pre><code class="lang-python">s3.delete_objects(Bucket=<span class="str">"photos"</span>, Delete={
+    <span class="str">"Objects"</span>: [{<span class="str">"Key"</span>: <span class="str">"old1.jpg"</span>}, {<span class="str">"Key"</span>: <span class="str">"old2.jpg"</span>}, {<span class="str">"Key"</span>: <span class="str">"old3.jpg"</span>}]
+})</code></pre>
+
+<h3>COPY — server-side duplicate</h3>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3 cp \
+  s3://photos/me.png s3://backups/photos/me.png</code></pre>
+<p>The server copies the bytes locally — no download/upload round-trip via the client.</p>
+
+<h4>boto3</h4>
+<pre><code class="lang-python">s3.copy_object(
+    Bucket=<span class="str">"backups"</span>, Key=<span class="str">"photos/me.png"</span>,
+    CopySource={<span class="str">"Bucket"</span>: <span class="str">"photos"</span>, <span class="str">"Key"</span>: <span class="str">"me.png"</span>}
+)</code></pre>
+
+<h3>Tagging</h3>
+<pre><code class="lang-bash"><span class="co"># Set tags</span>
+aws --endpoint-url http://localhost:9000 s3api put-object-tagging \
+  --bucket photos --key me.png \
+  --tagging <span class="str">'{"TagSet":[{"Key":"env","Value":"prod"},{"Key":"owner","Value":"alice"}]}'</span>
+
+<span class="co"># Read tags</span>
+aws --endpoint-url http://localhost:9000 s3api get-object-tagging \
+  --bucket photos --key me.png
+
+<span class="co"># Clear tags</span>
+aws --endpoint-url http://localhost:9000 s3api delete-object-tagging \
+  --bucket photos --key me.png</code></pre>
+
+<h3>What's stored</h3>
+<p>Each object carries: content-type, custom metadata (<code>x-amz-meta-*</code>), tags, ETag (CRC32 hex), creation timestamp, byte size. ETag changes on every PUT.</p>
+
+<h3>Limits</h3>
+<ul>
+  <li>Single-PUT object size: 5 GiB. Use <a href="/s3/multipart/">multipart upload</a> for larger.</li>
+  <li>Object key length: 1024 bytes UTF-8.</li>
+  <li>Custom metadata: 2 KB total per object.</li>
+  <li>Tags: 10 per object, 128 chars per key, 256 chars per value.</li>
+</ul>
+
+<div class="docs-prevnext">
+  <a href="/s3/buckets/" class="prev"><div class="label">Previous</div><div class="title">← Buckets</div></a>
+  <a href="/s3/multipart/" class="next"><div class="label">Next</div><div class="title">Multipart upload →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

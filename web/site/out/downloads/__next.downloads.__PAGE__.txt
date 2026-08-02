@@ -1,0 +1,484 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T509e,<section class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Downloads</h2>
+    <p class="section-desc">Pre-built binaries for <code>oxidb-server</code> and <code>oxidb</code> CLI. Statically linked on Linux (musl). No dependencies required.</p>
+
+    <!-- v0.42.6 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">v0.42.6</h3>
+        <span class="version-date">2026-07-28</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes"><strong>OxiDB is source-available from this release</strong> &mdash; free to run in production for your own applications and business, at any scale. Plus the fix that matters most: a transaction spanning two collections could recover half-applied after a crash. <a href="/changelog/">Full changelog</a></p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Linux</td>
+              <td>x86_64</td>
+              <td><code>oxidb-server-v0.42.6-linux-amd64.tar.gz</code></td>
+              <td>10.1 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.42.6/oxidb-server-v0.42.6-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Linux</td>
+              <td>ARM64</td>
+              <td><code>oxidb-server-v0.42.6-linux-arm64.tar.gz</code></td>
+              <td>9.1 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.42.6/oxidb-server-v0.42.6-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>ARM64 (Apple Silicon)</td>
+              <td><code>oxidb-server-v0.42.6-darwin-arm64.tar.gz</code></td>
+              <td>8.8 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.42.6/oxidb-server-v0.42.6-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>x86_64 (Intel)</td>
+              <td><code>oxidb-server-v0.42.6-darwin-amd64.tar.gz</code></td>
+              <td>9.7 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.42.6/oxidb-server-v0.42.6-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Windows</td>
+              <td>x86_64</td>
+              <td><code>oxidb-server-v0.42.6-windows-amd64.zip</code></td>
+              <td>9.7 MB</td>
+              <td>zip</td>
+              <td><a href="/releases/v0.42.6/oxidb-server-v0.42.6-windows-amd64.zip" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>SHA256 Checksums</strong></td>
+              <td></td>
+              <td>txt</td>
+              <td><a href="/releases/v0.42.6/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Quick Install (Server)</h4>
+        <pre><code><span class="co"># Linux / macOS</span>
+curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.42.6-linux-amd64.tar.gz
+./oxidb-server
+
+<span class="co"># Or use as a Rust library</span>
+cargo add oxidb</code></pre>
+      </div>
+    </div>
+
+    <!-- CLI v0.42.6 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">oxidb CLI v0.42.6</h3>
+        <span class="version-date">2026-07-28</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes">Interactive shell and REPL with MongoDB-style syntax, SQL support, vector search, and embedded mode.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Linux</td>
+              <td>x86_64</td>
+              <td><code>oxidb-v0.42.6-linux-amd64.tar.gz</code></td>
+              <td>3.7 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.42.6/oxidb-v0.42.6-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Linux</td>
+              <td>ARM64</td>
+              <td><code>oxidb-v0.42.6-linux-arm64.tar.gz</code></td>
+              <td>3.3 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.42.6/oxidb-v0.42.6-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>ARM64 (Apple Silicon)</td>
+              <td><code>oxidb-v0.42.6-darwin-arm64.tar.gz</code></td>
+              <td>3.1 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.42.6/oxidb-v0.42.6-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>x86_64 (Intel)</td>
+              <td><code>oxidb-v0.42.6-darwin-amd64.tar.gz</code></td>
+              <td>3.4 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.42.6/oxidb-v0.42.6-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Windows</td>
+              <td>x86_64</td>
+              <td><code>oxidb-v0.42.6-windows-amd64.zip</code></td>
+              <td>3.6 MB</td>
+              <td>zip</td>
+              <td><a href="/releases/v0.42.6/oxidb-v0.42.6-windows-amd64.zip" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>SHA256 Checksums</strong></td>
+              <td></td>
+              <td>txt</td>
+              <td><a href="/releases/v0.42.6/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Quick Install (CLI)</h4>
+        <pre><code><span class="co"># Linux / macOS</span>
+curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-v0.42.6-linux-amd64.tar.gz
+tar xzf oxidb-v0.42.6-linux-amd64.tar.gz
+./oxidb --data ./mydb              <span class="co"># embedded mode</span>
+./oxidb --host 127.0.0.1           <span class="co"># client mode</span>
+
+<span class="co"># Or build from source</span>
+cargo build --release -p oxidb-cli</code></pre>
+      </div>
+    </div>
+
+    <!-- OxiDB Studio v0.3.0 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">OxiDB Studio v0.3.0</h3>
+        <span class="version-date">2026-07-19</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes">Desktop GUI (Tauri) — SQL editor with schema tree, a visual Query Designer (drag-to-connect joins), editable result grids, table CRUD, SCRAM auth with saved connections, and an OxiMem browser.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>macOS</td>
+              <td>ARM64 (Apple Silicon)</td>
+              <td><code>OxiDB-Studio-0.3.0-macos-arm64.dmg</code></td>
+              <td>6.1 MB</td>
+              <td>dmg</td>
+              <td><a href="/releases/studio/OxiDB-Studio-0.3.0-macos-arm64.dmg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>Windows &amp; Linux builds</strong> — coming soon (built per-platform)</td>
+              <td></td>
+              <td></td>
+              <td><a href="https://github.com/parisxmas/OxiDB" class="dl-btn dl-btn-secondary">Source</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Install (macOS)</h4>
+        <pre><code><span class="co"># Download, open the .dmg, drag OxiDB to Applications.</span>
+<span class="co"># First launch: right-click → Open (unsigned build).</span>
+curl -LO https://oxidb.baltavista.com/releases/studio/OxiDB-Studio-0.3.0-macos-arm64.dmg</code></pre>
+      </div>
+    </div>
+
+    <!-- .NET / EF Core NuGet v0.42.6 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">.NET / EF Core v0.42.6</h3>
+        <span class="version-date">2026-07-28</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes">Entity Framework Core provider for the OxiDB SQL engine (with ADO.NET / Dapper) — passes all 3832 official EF Core spec tests and beats PostgreSQL. See <a href="/dotnet-examples/">.NET / EF Core examples</a>.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Package</th><th>Purpose</th><th>File</th><th>Size</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>OxiDb.EntityFrameworkCore</code></td>
+              <td>EF Core provider (SQL engine)</td>
+              <td><code>.nupkg</code></td>
+              <td>22 KB</td>
+              <td><a href="/nuget/OxiDb.EntityFrameworkCore.0.42.6.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td><code>OxiDb.Data</code></td>
+              <td>ADO.NET (Dapper-ready)</td>
+              <td><code>.nupkg</code></td>
+              <td>19 KB</td>
+              <td><a href="/nuget/OxiDb.Data.0.42.6.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td><code>OxiDb.Client.Tcp</code></td>
+              <td>TCP client (dependency)</td>
+              <td><code>.nupkg</code></td>
+              <td>43 KB</td>
+              <td><a href="/nuget/OxiDb.Client.Tcp.0.42.6.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Install</h4>
+        <pre><code><span class="co"># download all three, then add the folder as a NuGet source</span>
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.EntityFrameworkCore.0.42.6.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Data.0.42.6.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Client.Tcp.0.42.6.nupkg
+
+dotnet nuget add source $(pwd) --name oxidb
+dotnet add package OxiDb.EntityFrameworkCore</code></pre>
+      </div>
+    </div>
+
+    <!-- WebAssembly v0.42.6 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">WebAssembly v0.42.6</h3>
+        <span class="version-date">2026-07-28</span>
+      </div>
+      <p class="release-notes">Run OxiDB directly in the browser via WebAssembly. Built with wasm-pack.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Browser</td>
+              <td>wasm32</td>
+              <td><code>oxidb-wasm-v0.42.6.tar.gz</code></td>
+              <td>865 KB</td>
+              <td>wasm-pack</td>
+              <td><a href="/releases/v0.42.6/oxidb-wasm-v0.42.6.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>SHA256 Checksums</strong></td>
+              <td></td>
+              <td>txt</td>
+              <td><a href="/releases/v0.42.6/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Quick Install (WebAssembly)</h4>
+        <pre><code>curl -L -o oxidb-wasm.tar.gz \
+  /releases/v0.42.6/oxidb-wasm-v0.42.6.tar.gz
+mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
+      </div>
+    </div>
+
+    <!-- v0.18.0 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">v0.18.0</h3>
+        <span class="version-date">2026-03-05</span>
+      </div>
+      <p class="release-notes">OxiWire binary protocol, .NET EF Core provider, parallel serialization, MsgPack removed. <a href="/changelog/">Full changelog</a></p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Linux</td>
+              <td>x86_64</td>
+              <td><code>oxidb-server-v0.18.0-linux-amd64.tar.gz</code></td>
+              <td>5.4 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Linux</td>
+              <td>ARM64</td>
+              <td><code>oxidb-server-v0.18.0-linux-arm64.tar.gz</code></td>
+              <td>4.8 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>ARM64 (Apple Silicon)</td>
+              <td><code>oxidb-server-v0.18.0-darwin-arm64.tar.gz</code></td>
+              <td>4.6 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>x86_64 (Intel)</td>
+              <td><code>oxidb-server-v0.18.0-darwin-amd64.tar.gz</code></td>
+              <td>5.1 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Windows</td>
+              <td>x86_64</td>
+              <td><code>oxidb-server-v0.18.0-windows-amd64.zip</code></td>
+              <td>5.0 MB</td>
+              <td>zip</td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>SHA256 Checksums</strong></td>
+              <td></td>
+              <td>txt</td>
+              <td><a href="/releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- CLI v0.18.0 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">oxidb CLI v0.18.0</h3>
+        <span class="version-date">2026-03-05</span>
+      </div>
+      <p class="release-notes">Interactive shell and REPL with MongoDB-style syntax, SQL support, vector search, and embedded mode.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Linux</td>
+              <td>x86_64</td>
+              <td><code>oxidb-cli-v0.18.0-linux-amd64.tar.gz</code></td>
+              <td>3.9 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Linux</td>
+              <td>ARM64</td>
+              <td><code>oxidb-cli-v0.18.0-linux-arm64.tar.gz</code></td>
+              <td>3.6 MB</td>
+              <td>musl static</td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>ARM64 (Apple Silicon)</td>
+              <td><code>oxidb-cli-v0.18.0-darwin-arm64.tar.gz</code></td>
+              <td>3.3 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>macOS</td>
+              <td>x86_64 (Intel)</td>
+              <td><code>oxidb-cli-v0.18.0-darwin-amd64.tar.gz</code></td>
+              <td>3.7 MB</td>
+              <td>tar.gz</td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>Windows</td>
+              <td>x86_64</td>
+              <td><code>oxidb-cli-v0.18.0-windows-amd64.zip</code></td>
+              <td>3.8 MB</td>
+              <td>zip</td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
+            </tr>
+            <tr class="checksum-row">
+              <td colspan="3"><strong>SHA256 Checksums</strong></td>
+              <td></td>
+              <td>txt</td>
+              <td><a href="/releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="other-install">
+      <h3>Other Installation Methods</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Command</th></tr></thead>
+          <tbody>
+            <tr><td>Rust (embedded library)</td><td><code>cargo add oxidb</code></td></tr>
+            <tr><td>Python client</td><td><code>pip install oxidb</code> or copy <code>oxidb.py</code></td></tr>
+            <tr><td>Python Embedded (FFI)</td><td><code>pip install oxidb-embedded</code></td></tr>
+            <tr><td>Go client</td><td><code>go get oxidb</code></td></tr>
+            <tr><td>.NET TCP client</td><td><code>dotnet add package OxiDb.Client.Tcp</code></td></tr>
+            <tr><td>.NET Embedded</td><td><code>dotnet add package OxiDb.Client.Embedded</code></td></tr>
+            <tr><td>.NET LINQ provider</td><td><code>dotnet add package OxiDb.Linq</code></td></tr>
+            <tr><td>WebAssembly (browser)</td><td><code>See /wasm for setup</code></td></tr>
+            <tr><td>Build server from source</td><td><code>cargo build --release -p oxidb-server</code></td></tr>
+            <tr><td>Build CLI from source</td><td><code>cargo build --release -p oxidb-cli</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">The Book</h3>
+        <span class="version-date">2026</span>
+        <span class="version-badge latest">free</span>
+      </div>
+      <p class="release-notes"><strong>Her Şeyin Veritabanı</strong> — a free 240-page book (in Turkish) on how a database works inside, from first principles to OxiDB's document, SQL and time-series engines. <a href="/book/">Details</a></p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Format</th><th>File</th><th>Size</th><th>Language</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>PDF</td>
+              <td><code>her-seyin-veritabani.pdf</code></td>
+              <td>5.3 MB</td>
+              <td>Türkçe</td>
+              <td><a href="/kitap/her-seyin-veritabani.pdf?v=20260721" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>EPUB</td>
+              <td><code>her-seyin-veritabani.epub</code></td>
+              <td>875 KB</td>
+              <td>Türkçe</td>
+              <td><a href="/kitap/her-seyin-veritabani.epub?v=20260721" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</section>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

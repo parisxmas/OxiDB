@@ -84,15 +84,15 @@ The pattern translates to each language's idioms:
 
 | Client                                    | Introspection mechanism                              | Snapshot path                                    |
 |-------------------------------------------|------------------------------------------------------|--------------------------------------------------|
-| `python/` (TCP)                           | `inspect` module (done — see above)                 | `python/api/v1.json`                             |
+| `clients/python/` (TCP)                           | `inspect` module (done — see above)                 | `python/api/v1.json`                             |
 | `python-embedded/` (FFI)                  | `inspect` over the published `oxidb_embedded` module| `python-embedded/api/v1.json`                    |
-| `go/` (OxiWire)                           | `go/ast` walk of the public `oxidb` package         | `go/api/v1.json`                                 |
-| `julia/OxiDb` (TCP)                       | `methods(OxiDb)` + `propertynames` over the module  | `julia/OxiDb/api/v1.json`                        |
+| `clients/go/` (OxiWire)                           | `go/ast` walk of the public `oxidb` package         | `go/api/v1.json`                                 |
+| `clients/julia/OxiDb` (TCP)                       | `methods(OxiDb)` + `propertynames` over the module  | `julia/OxiDb/api/v1.json`                        |
 | `julia/OxiDbEmbedded` (FFI)               | same                                                | `julia/OxiDbEmbedded/api/v1.json`                |
-| `dotnet/OxiDb.Client.Tcp`                 | `Microsoft.CodeAnalysis` over the assembly         | `dotnet/OxiDb.Client.Tcp/api/v1.json`            |
-| `dotnet/OxiDb.Client.Embedded`            | same                                                | `dotnet/OxiDb.Client.Embedded/api/v1.json`       |
-| `dotnet/OxiDb.Linq`                       | same                                                | `dotnet/OxiDb.Linq/api/v1.json`                  |
-| `oxidb-js/` (REST + WebSocket)            | `typescript` compiler API + `.d.ts` parsing        | `oxidb-js/api/v1.json`                           |
+| `clients/dotnet/OxiDb.Client.Tcp`                 | `Microsoft.CodeAnalysis` over the assembly         | `clients/dotnet/OxiDb.Client.Tcp/api/v1.json`            |
+| `clients/dotnet/OxiDb.Client.Embedded`            | same                                                | `clients/dotnet/OxiDb.Client.Embedded/api/v1.json`       |
+| `clients/dotnet/OxiDb.Linq`                       | same                                                | `clients/dotnet/OxiDb.Linq/api/v1.json`                  |
+| `clients/js/` (REST + WebSocket)            | `typescript` compiler API + `.d.ts` parsing        | `clients/js/api/v1.json`                           |
 | `oxidb-java/`                             | Reflection over the JAR                             | `oxidb-java/api/v1.json`                         |
 
 Every snapshot has the same top-level shape (`module`, `schema_version`,
@@ -115,7 +115,7 @@ it experimental.
 
 ## Tier-B clients
 
-`php/` and `swift/` ship with explicit `1.0-experimental` markers per
+`php/` and `clients/swift/` ship with explicit `1.0-experimental` markers per
 [STABILITY.md §Tier-B](STABILITY.md). They do **not** maintain `api/v1.json`
 snapshots — their surface is allowed to change in any 1.x minor of the
 engine. They graduate to Tier A (and adopt this pattern) via a promotion

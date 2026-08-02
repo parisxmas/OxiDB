@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "dgSpecHash": "LYTSDn9+ilQ=",
+  "success": true,
+  "projectFilePath": "/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3.Sample/OxiDb.Client.S3.Sample.csproj",
+  "expectedPackageFiles": [
+    "/Users/barisakin/.nuget/packages/awssdk.core/4.0.0.5/awssdk.core.4.0.0.5.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/awssdk.s3/4.0.1/awssdk.s3.4.0.1.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.configuration.abstractions/9.0.0/microsoft.extensions.configuration.abstractions.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.configuration.binder/9.0.0/microsoft.extensions.configuration.binder.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.dependencyinjection.abstractions/9.0.0/microsoft.extensions.dependencyinjection.abstractions.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.options/9.0.0/microsoft.extensions.options.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.options.configurationextensions/9.0.0/microsoft.extensions.options.configurationextensions.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.extensions.primitives/9.0.0/microsoft.extensions.primitives.9.0.0.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.netcore.app.ref/9.0.12/microsoft.netcore.app.ref.9.0.12.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.aspnetcore.app.ref/9.0.12/microsoft.aspnetcore.app.ref.9.0.12.nupkg.sha512",
+    "/Users/barisakin/.nuget/packages/microsoft.netcore.app.host.osx-arm64/9.0.12/microsoft.netcore.app.host.osx-arm64.9.0.12.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1603",
+      "level": "Warning",
+      "message": "OxiDb.Client.S3 depends on AWSSDK.S3 (>= 4.0.0.20) but AWSSDK.S3 4.0.0.20 was not found. AWSSDK.S3 4.0.1 was resolved instead.",
+      "projectPath": "/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3.Sample/OxiDb.Client.S3.Sample.csproj",
+      "warningLevel": 1,
+      "filePath": "/Users/barisakin/source/docdb/dotnet/OxiDb.Client.S3.Sample/OxiDb.Client.S3.Sample.csproj",
+      "libraryId": "AWSSDK.S3",
+      "targetGraphs": [
+        "net9.0"
+      ]
+    }
+  ]
+}

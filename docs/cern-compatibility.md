@@ -192,7 +192,7 @@ CERN adoption is not a top-down sale. The mechanics that actually work:
    actually cover.
 3. This document — where the fit is and isn't.
 4. The Julia clients + benchmark
-   ([`julia/benchmarks/sqlite_vs_oxidb.jl`](../julia/benchmarks/sqlite_vs_oxidb.jl))
+   ([`clients/julia/benchmarks/sqlite_vs_oxidb.jl`](../clients/julia/benchmarks/sqlite_vs_oxidb.jl))
    — an honest, reproducible engine comparison.
 
 ## Revisiting this document

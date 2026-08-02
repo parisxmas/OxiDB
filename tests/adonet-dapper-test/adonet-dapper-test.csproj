@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../dotnet/OxiDb.Data/OxiDb.Data.csproj" />
+    <ProjectReference Include="../../clients/dotnet/OxiDb.Data/OxiDb.Data.csproj" />
     <PackageReference Include="Dapper" Version="2.1.66" />
   </ItemGroup>
 </Project>

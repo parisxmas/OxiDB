@@ -22,14 +22,14 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: oxidb-app/src-tauri
+          workspaces: apps/studio/src-tauri
 
       - name: Install frontend dependencies
-        working-directory: oxidb-app
+        working-directory: apps/studio
         run: npm install
 
       - name: Build Tauri app
-        working-directory: oxidb-app
+        working-directory: apps/studio
         run: npx tauri build
 
       - name: Upload MSI artifact

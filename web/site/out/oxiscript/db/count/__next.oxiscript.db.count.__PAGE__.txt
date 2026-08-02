@@ -1,0 +1,66 @@
+1:"$Sreact.fragment"
+3:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+4:"$Sreact.suspense"
+2:Tc1f,<p class="docs-eyebrow">Database Ops · 5 of 6</p>
+<h2><code>count</code></h2>
+<p>Returns the number of documents matching a query — without loading them. With an indexed field, it's O(1).</p>
+
+<h3>Signatures</h3>
+<pre><code class="lang-rust">count(collection)
+count(collection, query)</code></pre>
+
+<h3>Total count</h3>
+<pre><code class="lang-rust">proc total_users() {
+    <span class="kw">return</span> count(<span class="str">"users"</span>)
+}</code></pre>
+
+<h3>Filtered count</h3>
+<pre><code class="lang-rust">proc active_users() {
+    <span class="kw">return</span> count(<span class="str">"users"</span>, {active: <span class="kw">true</span>})
+}</code></pre>
+
+<h3>Multiple filters</h3>
+<pre><code class="lang-rust">proc users_in_range(min, max) {
+    <span class="kw">return</span> count(<span class="str">"users"</span>, {age: {$gte: min, $lte: max}, active: <span class="kw">true</span>})
+}</code></pre>
+
+<h3>Count as a guard</h3>
+<pre><code class="lang-rust">proc enforce_quota(user_id, max_files) {
+    let n = count(<span class="str">"files"</span>, {owner: user_id})
+    <span class="kw">if</span> n &gt;= max_files { <span class="kw">abort</span> <span class="str">"file limit reached"</span> }
+    <span class="kw">return</span> {used: n, allowed: max_files}
+}</code></pre>
+
+<h3>Dashboard summary</h3>
+<pre><code class="lang-rust">proc dashboard() {
+    <span class="kw">return</span> {
+        users:    count(<span class="str">"users"</span>),
+        active:   count(<span class="str">"users"</span>, {active: <span class="kw">true</span>}),
+        admins:   count(<span class="str">"users"</span>, {role: <span class="str">"admin"</span>}),
+        sessions: count(<span class="str">"sessions"</span>, {expired: <span class="kw">false</span>}),
+        orders:   count(<span class="str">"orders"</span>, {status: <span class="str">"open"</span>})
+    }
+}</code></pre>
+
+<h3>Count after a write</h3>
+<pre><code class="lang-rust">proc add_member(team_id, user_id) {
+    insert(<span class="str">"members"</span>, {team_id: team_id, user_id: user_id})
+    let total = count(<span class="str">"members"</span>, {team_id: team_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, total_members: total}
+}</code></pre>
+
+<h3>Comparison: count vs find length</h3>
+<p><code>count</code> is index-friendly and never loads documents. Don't do <code>find(...).length</code>-style patterns — use <code>count</code>.</p>
+<div class="docs-grid-2">
+  <pre><code class="lang-rust"><span class="co">// SLOW — loads all docs</span>
+let xs = find(<span class="str">"users"</span>, {})
+<span class="co">// can't get length anyway</span></code></pre>
+  <pre><code class="lang-rust"><span class="co">// FAST — index-only</span>
+let n = count(<span class="str">"users"</span>, {})</code></pre>
+</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/db/delete/" class="prev"><div class="label">Previous</div><div class="title">← delete</div></a>
+  <a href="/oxiscript/db/aggregate/" class="next"><div class="label">Next</div><div class="title">aggregate →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,["$","$L3",null,{"children":["$","$4",null,{"name":"Next.MetadataOutlet","children":"$@5"}]}]]}],"loading":null,"isPartial":false}
+5:null

@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>OxiDb.Client.Tcp</id>
+    <version>0.40.0</version>
+    <authors>OxiDB Contributors</authors>
+    <license type="expression">MIT</license>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <projectUrl>https://github.com/oxidb/oxidb</projectUrl>
+    <description>Pure managed TCP client for OxiDB document database server. Zero native dependencies.</description>
+    <copyright>Copyright (c) OxiDB Contributors</copyright>
+    <tags>database document-database nosql embedded oxidb</tags>
+    <repository type="git" url="https://github.com/oxidb/oxidb" commit="0b3eb4d421e8dd36a8c2158035768cf0bb8be5fe" />
+    <dependencies>
+      <group targetFramework="net10.0">
+        <dependency id="Microsoft.Extensions.DependencyInjection.Abstractions" version="10.0.0" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="/Users/barisakin/source/docdb/dotnet/OxiDb.Client.Tcp/bin/Release/net10.0/OxiDb.Client.Tcp.dll" target="lib/net10.0/OxiDb.Client.Tcp.dll" />
+  </files>
+</package>

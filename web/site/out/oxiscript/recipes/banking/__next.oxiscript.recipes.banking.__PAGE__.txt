@@ -1,0 +1,101 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T1ab7,<p class="docs-eyebrow">Recipes · 1 of 6</p>
+<h2>Banking — transfers, withdrawals, statements</h2>
+<p>Six procedures that together model a small bank: open account, deposit, withdraw, transfer, freeze, monthly statement.</p>
+
+<h3>Schema</h3>
+<pre><code class="lang-bash">accounts:     {_id, account_id, name, balance, frozen, created_at}
+ledger:       {account_id, type, amount, ts}
+transfers:    {from, to, amount, ts}</code></pre>
+
+<h3>open_account</h3>
+<pre><code class="lang-rust">proc open_account(account_id, name, initial) {
+    <span class="kw">if</span> count(<span class="str">"accounts"</span>, {account_id: account_id}) &gt; <span class="num">0</span> {
+        <span class="kw">abort</span> <span class="str">"account_id taken"</span>
+    }
+    <span class="kw">if</span> initial &lt; <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"initial deposit cannot be negative"</span> }
+    let id = insert(<span class="str">"accounts"</span>, {
+        account_id: account_id, name: name, balance: initial, frozen: <span class="kw">false</span>
+    })
+    insert(<span class="str">"ledger"</span>, {account_id: account_id, type: <span class="str">"open"</span>, amount: initial})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, id: id}
+}</code></pre>
+
+<h3>deposit</h3>
+<pre><code class="lang-rust">proc deposit(account_id, amount) {
+    <span class="kw">if</span> amount &lt;= <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"amount must be positive"</span> }
+    let acc = find_one(<span class="str">"accounts"</span>, {account_id: account_id})
+    <span class="kw">if</span> acc == <span class="kw">null</span>   { <span class="kw">abort</span> <span class="str">"account not found"</span> }
+    <span class="kw">if</span> acc.frozen     { <span class="kw">abort</span> <span class="str">"account frozen"</span> }
+    update(<span class="str">"accounts"</span>, {account_id: account_id}, {$inc: {balance: amount}})
+    insert(<span class="str">"ledger"</span>, {account_id: account_id, type: <span class="str">"deposit"</span>, amount: amount})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, balance: acc.balance + amount}
+}</code></pre>
+
+<h3>withdraw</h3>
+<pre><code class="lang-rust">proc withdraw(account_id, amount) {
+    <span class="kw">if</span> amount &lt;= <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"amount must be positive"</span> }
+    let acc = find_one(<span class="str">"accounts"</span>, {account_id: account_id})
+    <span class="kw">if</span> acc == <span class="kw">null</span>             { <span class="kw">abort</span> <span class="str">"account not found"</span> }
+    <span class="kw">if</span> acc.frozen               { <span class="kw">abort</span> <span class="str">"account frozen"</span> }
+    <span class="kw">if</span> acc.balance &lt; amount     { <span class="kw">abort</span> <span class="str">"insufficient funds"</span> }
+    update(<span class="str">"accounts"</span>, {account_id: account_id}, {$inc: {balance: -amount}})
+    insert(<span class="str">"ledger"</span>, {account_id: account_id, type: <span class="str">"withdraw"</span>, amount: -amount})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, balance: acc.balance - amount}
+}</code></pre>
+
+<h3>transfer</h3>
+<pre><code class="lang-rust">proc transfer(from, to, amount) {
+    <span class="kw">if</span> from == to    { <span class="kw">abort</span> <span class="str">"self-transfer"</span> }
+    <span class="kw">if</span> amount &lt;= <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"invalid amount"</span> }
+
+    let s = find_one(<span class="str">"accounts"</span>, {account_id: from})
+    let r = find_one(<span class="str">"accounts"</span>, {account_id: to})
+    <span class="kw">if</span> s == <span class="kw">null</span> || r == <span class="kw">null</span>          { <span class="kw">abort</span> <span class="str">"account not found"</span> }
+    <span class="kw">if</span> s.frozen || r.frozen           { <span class="kw">abort</span> <span class="str">"account frozen"</span> }
+    <span class="kw">if</span> s.balance &lt; amount             { <span class="kw">abort</span> <span class="str">"insufficient funds"</span> }
+
+    update(<span class="str">"accounts"</span>, {account_id: from}, {$inc: {balance: -amount, sent_count: <span class="num">1</span>}})
+    update(<span class="str">"accounts"</span>, {account_id: to},   {$inc: {balance:  amount, recv_count: <span class="num">1</span>}})
+    insert(<span class="str">"transfers"</span>, {from: from, to: to, amount: amount})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>freeze / unfreeze</h3>
+<pre><code class="lang-rust">proc freeze(account_id, reason, actor) {
+    update(<span class="str">"accounts"</span>, {account_id: account_id}, {$set: {frozen: <span class="kw">true</span>}})
+    insert(<span class="str">"audit_log"</span>, {action: <span class="str">"freeze"</span>, target: account_id, reason: reason, actor: actor})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}
+
+proc unfreeze(account_id, actor) {
+    update(<span class="str">"accounts"</span>, {account_id: account_id}, {$set: {frozen: <span class="kw">false</span>}})
+    insert(<span class="str">"audit_log"</span>, {action: <span class="str">"unfreeze"</span>, target: account_id, actor: actor})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>monthly_statement</h3>
+<pre><code class="lang-rust">proc monthly_statement(account_id, year, month) {
+    let acc = find_one(<span class="str">"accounts"</span>, {account_id: account_id})
+    <span class="kw">if</span> acc == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"account not found"</span> }
+
+    let entries = find(<span class="str">"ledger"</span>, {account_id: account_id, year: year, month: month})
+    let totals = aggregate(<span class="str">"ledger"</span>, [
+        {$match: {account_id: account_id, year: year, month: month}},
+        {$group: {_id: <span class="str">"$type"</span>, total: {$sum: <span class="str">"$amount"</span>}, n: {$sum: <span class="num">1</span>}}}
+    ])
+    <span class="kw">return</span> {
+        account: acc.name, balance: acc.balance,
+        period: {year: year, month: month},
+        entries: entries, totals: totals
+    }
+}</code></pre>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/patterns/upsert-soft-delete/" class="prev"><div class="label">Previous</div><div class="title">← Upsert &amp; soft-delete</div></a>
+  <a href="/oxiscript/recipes/ecommerce/" class="next"><div class="label">Next</div><div class="title">E-commerce →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

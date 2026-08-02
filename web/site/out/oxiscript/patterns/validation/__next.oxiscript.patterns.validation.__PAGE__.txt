@@ -1,0 +1,90 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T15df,<p class="docs-eyebrow">Patterns · 1 of 4</p>
+<h2>Input validation</h2>
+<p>Procedures run server-side, so they're the last gate before data hits storage. Validate everything at the top — fail fast, fail clearly.</p>
+
+<h3>Guard-clause style</h3>
+<pre><code class="lang-rust">proc create_user(email, name, age) {
+    <span class="kw">if</span> email == <span class="kw">null</span> || email == <span class="str">""</span> { <span class="kw">abort</span> <span class="str">"email required"</span> }
+    <span class="kw">if</span> name == <span class="kw">null</span>  || name == <span class="str">""</span>  { <span class="kw">abort</span> <span class="str">"name required"</span> }
+    <span class="kw">if</span> age &lt; <span class="num">13</span>                    { <span class="kw">abort</span> <span class="str">"must be 13 or older"</span> }
+    insert(<span class="str">"users"</span>, {email: email, name: name, age: age})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Range checks</h3>
+<pre><code class="lang-rust">proc set_price(sku, price) {
+    <span class="kw">if</span> price &lt; <span class="num">0</span>      { <span class="kw">abort</span> <span class="str">"price cannot be negative"</span> }
+    <span class="kw">if</span> price &gt; <span class="num">10000</span>  { <span class="kw">abort</span> <span class="str">"price too high — needs approval"</span> }
+    update(<span class="str">"products"</span>, {sku: sku}, {$set: {price: price}})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Existence checks</h3>
+<pre><code class="lang-rust">proc add_to_team(user_id, team_id) {
+    let user = find_one(<span class="str">"users"</span>, {_id: user_id})
+    let team = find_one(<span class="str">"teams"</span>, {_id: team_id})
+    <span class="kw">if</span> user == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"user not found"</span> }
+    <span class="kw">if</span> team == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"team not found"</span> }
+    insert(<span class="str">"members"</span>, {user_id: user_id, team_id: team_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Permission checks</h3>
+<pre><code class="lang-rust">proc delete_post(post_id, actor_id) {
+    let post = find_one(<span class="str">"posts"</span>, {_id: post_id})
+    <span class="kw">if</span> post == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"post not found"</span> }
+
+    let actor = find_one(<span class="str">"users"</span>, {_id: actor_id})
+    <span class="kw">if</span> actor == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"actor not found"</span> }
+
+    <span class="kw">if</span> post.author_id != actor_id &amp;&amp; actor.role != <span class="str">"admin"</span> {
+        <span class="kw">abort</span> <span class="str">"forbidden"</span>
+    }
+    delete_one(<span class="str">"posts"</span>, {_id: post_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Uniqueness checks</h3>
+<pre><code class="lang-rust">proc claim_username(user_id, username) {
+    <span class="kw">if</span> count(<span class="str">"users"</span>, {username: username}) &gt; <span class="num">0</span> {
+        <span class="kw">abort</span> <span class="str">"username taken"</span>
+    }
+    update(<span class="str">"users"</span>, {_id: user_id}, {$set: {username: username}})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Quota checks</h3>
+<pre><code class="lang-rust">proc upload(user_id, file_size) {
+    let user = find_one(<span class="str">"users"</span>, {_id: user_id})
+    <span class="kw">if</span> user.storage_used + file_size &gt; user.storage_quota {
+        <span class="kw">abort</span> <span class="str">"storage quota exceeded"</span>
+    }
+    update(<span class="str">"users"</span>, {_id: user_id}, {$inc: {storage_used: file_size}})
+    insert(<span class="str">"files"</span>, {owner: user_id, size: file_size})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, used: user.storage_used + file_size}
+}</code></pre>
+
+<h3>Compose validation into its own proc</h3>
+<pre><code class="lang-rust">proc validate_email(email) {
+    <span class="kw">if</span> email == <span class="kw">null</span> || email == <span class="str">""</span> { <span class="kw">abort</span> <span class="str">"email required"</span> }
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}
+
+proc signup(email, name) {
+    validate_email({email: email})
+    <span class="kw">if</span> count(<span class="str">"users"</span>, {email: email}) &gt; <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"email taken"</span> }
+    insert(<span class="str">"users"</span>, {email: email, name: name})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<div class="docs-callout"><strong>Error message style:</strong> short, lowercase, machine-grep-friendly. Wire response is <code>{"ok": false, "error": "msg"}</code>; clients can switch on the message text.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/db/aggregate/" class="prev"><div class="label">Previous</div><div class="title">← aggregate</div></a>
+  <a href="/oxiscript/patterns/transactions/" class="next"><div class="label">Next</div><div class="title">Atomic transactions →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null

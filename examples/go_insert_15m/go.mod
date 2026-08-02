@@ -4,4 +4,4 @@ go 1.21
 
 require github.com/parisxmas/OxiDB/go/oxidb v0.0.0
 
-replace github.com/parisxmas/OxiDB/go/oxidb => ../../go/oxidb
+replace github.com/parisxmas/OxiDB/go/oxidb => ../../clients/go/oxidb

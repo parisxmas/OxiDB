@@ -1,0 +1,87 @@
+1:"$Sreact.fragment"
+4:I[97367,["/_next/static/chunks/ff1a16fafef87110.js","/_next/static/chunks/d2be314c3ece3fbe.js"],"OutletBoundary"]
+5:"$Sreact.suspense"
+2:T1227,<p class="docs-eyebrow">Syntax · 1 of 6</p>
+<h2>Types &amp; literals</h2>
+<p>OxiScript values map directly to JSON. There are six types: <strong>number</strong>, <strong>string</strong>, <strong>bool</strong>, <strong>null</strong>, <strong>array</strong>, and <strong>object</strong>.</p>
+
+<h3>Numbers</h3>
+<pre><code class="lang-rust">let a = <span class="num">42</span>
+let b = <span class="num">3.14</span>
+let c = -<span class="num">7</span>
+let d = <span class="num">0</span>
+let e = <span class="num">1000000</span></code></pre>
+<p>All numbers are 64-bit floats internally. There is no separate integer type — but they round-trip JSON cleanly when whole.</p>
+
+<h3>Strings</h3>
+<p>Both single and double quotes work. Use whichever doesn't conflict with the contents.</p>
+<pre><code class="lang-rust">let a = <span class="str">"hello"</span>
+let b = <span class="str">'world'</span>
+let c = <span class="str">"with \"escaped\" quotes"</span>
+let d = <span class="str">'newline\nhere'</span>
+let e = <span class="str">""</span>             <span class="co">// empty string</span></code></pre>
+
+<h3>Booleans</h3>
+<pre><code class="lang-rust">let yes = <span class="kw">true</span>
+let no  = <span class="kw">false</span></code></pre>
+
+<h3>Null</h3>
+<pre><code class="lang-rust">let nothing = <span class="kw">null</span>
+<span class="kw">if</span> user == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"missing"</span> }</code></pre>
+<p><code>find_one</code> returns <code>null</code> when the query has no match. Always check for it.</p>
+
+<h3>Arrays</h3>
+<pre><code class="lang-rust">let empty = []
+let nums  = [<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>]
+let mixed = [<span class="num">1</span>, <span class="str">"two"</span>, <span class="kw">true</span>, <span class="kw">null</span>]
+let nested = [[<span class="num">1</span>, <span class="num">2</span>], [<span class="num">3</span>, <span class="num">4</span>]]
+let docs  = [{name: <span class="str">"a"</span>}, {name: <span class="str">"b"</span>}]</code></pre>
+
+<h4>Indexing</h4>
+<pre><code class="lang-rust">let xs = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">30</span>]
+let first = xs[<span class="num">0</span>]
+let second = xs[<span class="num">1</span>]</code></pre>
+
+<h3>Objects</h3>
+<pre><code class="lang-rust">let empty = {}
+let user = {name: <span class="str">"Alice"</span>, age: <span class="num">30</span>}
+let with_quotes = {<span class="str">"first name"</span>: <span class="str">"Alice"</span>}
+let nested = {
+    user: {name: <span class="str">"Alice"</span>, address: {city: <span class="str">"Tokyo"</span>}},
+    tags: [<span class="str">"vip"</span>, <span class="str">"early"</span>]
+}</code></pre>
+
+<h4>Field access</h4>
+<pre><code class="lang-rust">let n = user.name
+let c = nested.user.address.city
+let by_index = nested[<span class="str">"user"</span>]</code></pre>
+
+<h3>Mongo-style <code>$</code> operators</h3>
+<p>OxiScript treats <code>$set</code>, <code>$inc</code>, <code>$push</code>, <code>$gte</code>, etc. as first-class identifiers — no quoting needed when used as keys.</p>
+<pre><code class="lang-rust">update(<span class="str">"users"</span>, {age: {$gte: <span class="num">18</span>}}, {
+    $set: {is_adult: <span class="kw">true</span>},
+    $inc: {seen: <span class="num">1</span>},
+    $push: {tags: <span class="str">"verified"</span>}
+})</code></pre>
+
+<h3>Type quick-reference</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>OxiScript</th><th>JSON</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>42</code>, <code>3.14</code></td><td>number</td><td>f64 internally</td></tr>
+      <tr><td><code>"x"</code>, <code>'x'</code></td><td>string</td><td><code>\"</code>, <code>\'</code>, <code>\n</code>, <code>\t</code>, <code>\\</code> escapes</td></tr>
+      <tr><td><code>true</code>, <code>false</code></td><td>bool</td><td>—</td></tr>
+      <tr><td><code>null</code></td><td>null</td><td>compare with <code>==</code></td></tr>
+      <tr><td><code>[1,2,3]</code></td><td>array</td><td>indexed with <code>arr[i]</code></td></tr>
+      <tr><td><code>{a: 1}</code></td><td>object</td><td>access with <code>obj.a</code> or <code>obj["a"]</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/getting-started/first-procedure/" class="prev"><div class="label">Previous</div><div class="title">← First procedure</div></a>
+  <a href="/oxiscript/syntax/variables/" class="next"><div class="label">Next</div><div class="title">Variables (let) →</div></a>
+</div>0:{"buildId":"KSQyzOi4CrTPaMnAtTmaN","rsc":["$","$1","c",{"children":[["$","div",null,{"dangerouslySetInnerHTML":{"__html":"$2"}}],null,"$L3"]}],"loading":null,"isPartial":false}
+3:["$","$L4",null,{"children":["$","$5",null,{"name":"Next.MetadataOutlet","children":"$@6"}]}]
+6:null
