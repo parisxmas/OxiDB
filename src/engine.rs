@@ -438,6 +438,21 @@ pub struct OxiDb {
     archive_sequencer: Option<Arc<crate::pitr::ArchiveSequencer>>,
     next_tx_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
+    /// Idle timeout for interactive transactions, in milliseconds
+    /// (`OXIDB_TX_MAX_IDLE_SECS`, default 300 s; `0` disables). A
+    /// transaction whose owner goes quiet past this is rolled back — its
+    /// buffered state dropped, its `find_for_update` locks released —
+    /// because a lost client must not park state on the server forever.
+    /// The server's disconnect rollback covers a *closed* connection;
+    /// this covers the one that stays open (keep-alives, `OXIDB_IDLE_TIMEOUT=0`)
+    /// or an embedded caller that leaked a tx id.
+    #[cfg(not(target_arch = "wasm32"))]
+    tx_max_idle_ms: AtomicU64,
+    /// Recently expired transaction ids (bounded to
+    /// [`EXPIRED_TX_REMEMBERED`]) so a returning client is told
+    /// "expired", not the misleading "not found".
+    #[cfg(not(target_arch = "wasm32"))]
+    expired_txs: Mutex<std::collections::BTreeSet<TransactionId>>,
     encryption: Option<Arc<EncryptionKey>>,
     verbose: bool,
     #[allow(dead_code)]
@@ -531,6 +546,21 @@ pub struct OxiDb {
     gpu: Mutex<Option<Arc<crate::gpu::GpuCompute>>>,
 }
 
+/// How many expired transaction ids are remembered for accurate error
+/// reporting. Ids are monotonic, so eviction drops the oldest.
+#[cfg(not(target_arch = "wasm32"))]
+const EXPIRED_TX_REMEMBERED: usize = 1024;
+
+/// `OXIDB_TX_MAX_IDLE_SECS` (default 300, `0` = never expire), in ms.
+#[cfg(not(target_arch = "wasm32"))]
+fn tx_max_idle_ms_from_env() -> u64 {
+    std::env::var("OXIDB_TX_MAX_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        .saturating_mul(1000)
+}
+
 impl OxiDb {
     /// Open or create a database at the given directory.
     #[cfg(not(target_arch = "wasm32"))]
@@ -599,6 +629,8 @@ impl OxiDb {
             archive_sequencer: None,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
+            tx_max_idle_ms: AtomicU64::new(tx_max_idle_ms_from_env()),
+            expired_txs: Mutex::new(std::collections::BTreeSet::new()),
             encryption: None,
             verbose: false,
             log_callback: None,
@@ -689,6 +721,10 @@ impl OxiDb {
                     drop(_occ_guard);
                     #[cfg(not(target_arch = "wasm32"))]
                     db.snap_gate.expire_tick();
+                    // Abandoned interactive transactions expire on the
+                    // same heartbeat — their client may never send
+                    // another request to trigger the lazy check.
+                    db.expire_stale_transactions();
                 }
             })
             .expect("failed to spawn TTL thread");
@@ -791,6 +827,8 @@ impl OxiDb {
             archive_sequencer,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
+            tx_max_idle_ms: AtomicU64::new(tx_max_idle_ms_from_env()),
+            expired_txs: Mutex::new(std::collections::BTreeSet::new()),
             encryption,
             verbose,
             log_callback,
@@ -2540,6 +2578,10 @@ impl OxiDb {
 
     /// Begin a new transaction. Returns the transaction ID.
     pub fn begin_transaction(&self) -> TransactionId {
+        // Every begin doubles as a sweep, so abandoned transactions die
+        // even in embedded use where no TTL thread runs.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.expire_stale_transactions();
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::SeqCst);
         let tx = Transaction::new(tx_id);
         self.active_transactions
@@ -2548,14 +2590,131 @@ impl OxiDb {
         tx_id
     }
 
+    /// Set the interactive-transaction idle timeout in milliseconds
+    /// (`0` = never expire). Programmatic override of
+    /// `OXIDB_TX_MAX_IDLE_SECS` for embedded callers and tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_tx_max_idle_ms(&self, ms: u64) {
+        self.tx_max_idle_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Look up an active transaction and run `f` on it, enforcing the
+    /// idle timeout: an expired transaction is rolled back right here
+    /// (state removed, `find_for_update` locks released) and the caller
+    /// gets [`Error::TransactionExpired`] — never a silent continuation
+    /// on state the sweeper is about to drop. A live transaction gets its
+    /// idle clock reset.
+    fn with_tx<T>(&self, tx_id: TransactionId, f: impl FnOnce(&mut Transaction) -> T) -> Result<T> {
+        let txs = self.active_transactions.read();
+        let Some(tx_mutex) = txs.get(&tx_id) else {
+            drop(txs);
+            return Err(self.tx_gone(tx_id));
+        };
+        let mut tx = tx_mutex.lock();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.tx_idle_expired(&tx) {
+                drop(tx);
+                drop(txs);
+                self.expire_transaction(tx_id);
+                return Err(Error::TransactionExpired(tx_id));
+            }
+            tx.last_active = std::time::Instant::now();
+        }
+        Ok(f(&mut tx))
+    }
+
+    /// The error for a transaction id that is not in the active set:
+    /// `TransactionExpired` if the engine timed it out, else the generic
+    /// `TransactionNotFound`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tx_gone(&self, tx_id: TransactionId) -> Error {
+        if self.expired_txs.lock().contains(&tx_id) {
+            Error::TransactionExpired(tx_id)
+        } else {
+            Error::TransactionNotFound(tx_id)
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn tx_gone(&self, tx_id: TransactionId) -> Error {
+        Error::TransactionNotFound(tx_id)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tx_idle_expired(&self, tx: &Transaction) -> bool {
+        let ms = self.tx_max_idle_ms.load(Ordering::Relaxed);
+        ms > 0 && tx.last_active.elapsed() >= std::time::Duration::from_millis(ms)
+    }
+
+    /// Remember an expired id (bounded) for accurate late-caller errors.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_expired(&self, tx_id: TransactionId) {
+        let mut expired = self.expired_txs.lock();
+        expired.insert(tx_id);
+        while expired.len() > EXPIRED_TX_REMEMBERED {
+            let oldest = *expired.iter().next().unwrap();
+            expired.remove(&oldest);
+        }
+    }
+
+    /// Roll back an expired transaction: drop its buffered state and
+    /// release its pessimistic doc locks.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn expire_transaction(&self, tx_id: TransactionId) {
+        if self.active_transactions.write().remove(&tx_id).is_none() {
+            return; // raced a commit, rollback, or another expirer
+        }
+        self.doc_locks.release_all(tx_id);
+        self.remember_expired(tx_id);
+        if self.verbose {
+            eprintln!(
+                "transaction {tx_id} expired (idle past OXIDB_TX_MAX_IDLE_SECS); rolled back"
+            );
+        }
+    }
+
+    /// Expire every transaction past the idle timeout. Called on each
+    /// `begin_transaction` and periodically by the TTL thread, so an
+    /// abandoned transaction dies — and frees its `find_for_update`
+    /// locks — even if its client never sends another request.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn expire_stale_transactions(&self) {
+        if self.tx_max_idle_ms.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let stale: Vec<TransactionId> = {
+            let txs = self.active_transactions.read();
+            if txs.is_empty() {
+                return;
+            }
+            txs.iter()
+                .filter_map(|(id, m)| {
+                    // try_lock: a held mutex means an operation is running
+                    // on the transaction right now — the opposite of idle.
+                    let tx = m.try_lock()?;
+                    self.tx_idle_expired(&tx).then_some(*id)
+                })
+                .collect()
+        };
+        for id in stale {
+            self.expire_transaction(id);
+        }
+    }
+
     /// Extract buffered write ops from a transaction (for Raft replication).
     /// Removes the transaction from the active set.
     pub fn extract_transaction_writes(&self, tx_id: TransactionId) -> Result<Vec<WriteOp>> {
         let mut txs = self.active_transactions.write();
-        let tx_mutex = txs
-            .remove(&tx_id)
-            .ok_or(Error::TransactionNotFound(tx_id))?;
+        let tx_mutex = txs.remove(&tx_id).ok_or_else(|| self.tx_gone(tx_id))?;
+        drop(txs);
         let tx = tx_mutex.into_inner();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.tx_idle_expired(&tx) {
+            self.doc_locks.release_all(tx_id);
+            self.remember_expired(tx_id);
+            return Err(Error::TransactionExpired(tx_id));
+        }
         Ok(tx.write_ops)
     }
 
@@ -2579,15 +2738,14 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let id = col.reserve_ids(1);
 
-        let txs = self.active_transactions.read();
-        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
-        let mut tx = tx_mutex.lock();
-        tx.collections_involved.insert(collection.to_string());
-        tx.write_ops.push(WriteOp::Insert {
-            collection: collection.to_string(),
-            data: doc,
-            id: Some(id),
-        });
+        self.with_tx(tx_id, |tx| {
+            tx.collections_involved.insert(collection.to_string());
+            tx.write_ops.push(WriteOp::Insert {
+                collection: collection.to_string(),
+                data: doc,
+                id: Some(id),
+            });
+        })?;
         Ok(id)
     }
 
@@ -2602,21 +2760,19 @@ impl OxiDb {
         let results = col.find(query)?;
 
         // Record read versions
-        let txs = self.active_transactions.read();
-        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
-        let mut tx = tx_mutex.lock();
-        tx.collections_involved.insert(collection.to_string());
-
-        for doc in &results {
-            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col.get_version(doc_id);
-                tx.read_set.push(ReadRecord {
-                    collection: collection.to_string(),
-                    doc_id,
-                    version,
-                });
+        self.with_tx(tx_id, |tx| {
+            tx.collections_involved.insert(collection.to_string());
+            for doc in &results {
+                if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let version = col.get_version(doc_id);
+                    tx.read_set.push(ReadRecord {
+                        collection: collection.to_string(),
+                        doc_id,
+                        version,
+                    });
+                }
             }
-        }
+        })?;
 
         Ok(results)
     }
@@ -2666,20 +2822,23 @@ impl OxiDb {
             }
         }
 
-        let txs = self.active_transactions.read();
-        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
-        let mut tx = tx_mutex.lock();
-        tx.collections_involved.insert(collection.to_string());
-
-        for doc in &results {
-            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col.get_version(doc_id);
-                tx.read_set.push(ReadRecord {
-                    collection: collection.to_string(),
-                    doc_id,
-                    version,
-                });
+        // On any failure (expired or unknown tx) the per-document locks
+        // taken above must not stay parked under a dead transaction id.
+        if let Err(e) = self.with_tx(tx_id, |tx| {
+            tx.collections_involved.insert(collection.to_string());
+            for doc in &results {
+                if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let version = col.get_version(doc_id);
+                    tx.read_set.push(ReadRecord {
+                        collection: collection.to_string(),
+                        doc_id,
+                        version,
+                    });
+                }
             }
+        }) {
+            self.doc_locks.release_all(tx_id);
+            return Err(e);
         }
 
         Ok(results)
@@ -2697,28 +2856,24 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let matching = col.find(query)?;
 
-        let txs = self.active_transactions.read();
-        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
-        let mut tx = tx_mutex.lock();
-        tx.collections_involved.insert(collection.to_string());
-
-        for doc in &matching {
-            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col.get_version(doc_id);
-                tx.read_set.push(ReadRecord {
-                    collection: collection.to_string(),
-                    doc_id,
-                    version,
-                });
+        self.with_tx(tx_id, |tx| {
+            tx.collections_involved.insert(collection.to_string());
+            for doc in &matching {
+                if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let version = col.get_version(doc_id);
+                    tx.read_set.push(ReadRecord {
+                        collection: collection.to_string(),
+                        doc_id,
+                        version,
+                    });
+                }
             }
-        }
-
-        tx.write_ops.push(WriteOp::Update {
-            collection: collection.to_string(),
-            query: query.clone(),
-            update: update.clone(),
-        });
-        Ok(())
+            tx.write_ops.push(WriteOp::Update {
+                collection: collection.to_string(),
+                query: query.clone(),
+                update: update.clone(),
+            });
+        })
     }
 
     /// Buffer a delete within a transaction, recording read versions.
@@ -2726,27 +2881,23 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let matching = col.find(query)?;
 
-        let txs = self.active_transactions.read();
-        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
-        let mut tx = tx_mutex.lock();
-        tx.collections_involved.insert(collection.to_string());
-
-        for doc in &matching {
-            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col.get_version(doc_id);
-                tx.read_set.push(ReadRecord {
-                    collection: collection.to_string(),
-                    doc_id,
-                    version,
-                });
+        self.with_tx(tx_id, |tx| {
+            tx.collections_involved.insert(collection.to_string());
+            for doc in &matching {
+                if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let version = col.get_version(doc_id);
+                    tx.read_set.push(ReadRecord {
+                        collection: collection.to_string(),
+                        doc_id,
+                        version,
+                    });
+                }
             }
-        }
-
-        tx.write_ops.push(WriteOp::Delete {
-            collection: collection.to_string(),
-            query: query.clone(),
-        });
-        Ok(())
+            tx.write_ops.push(WriteOp::Delete {
+                collection: collection.to_string(),
+                query: query.clone(),
+            });
+        })
     }
 
     /// Commit a transaction using OCC validation.
@@ -2773,10 +2924,18 @@ impl OxiDb {
         // 1. Remove transaction from active set
         let tx = {
             let mut txs = self.active_transactions.write();
-            txs.remove(&tx_id)
-                .ok_or(Error::TransactionNotFound(tx_id))?
+            txs.remove(&tx_id).ok_or_else(|| self.tx_gone(tx_id))?
         };
         let tx = tx.into_inner();
+
+        // An expired transaction must not commit: its owner was told (or
+        // would have been told) it was rolled back, and honoring a commit
+        // that raced the sweeper would make "expired" mean "maybe".
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.tx_idle_expired(&tx) {
+            self.remember_expired(tx_id);
+            return Err(Error::TransactionExpired(tx_id));
+        }
 
         // 2. Resolve all involved collections
         let mut locked_collections: Vec<(String, Arc<BTreeCollection>)> = Vec::new();

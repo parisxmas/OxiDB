@@ -48,6 +48,13 @@ pub struct Transaction {
     pub write_ops: Vec<WriteOp>,
     /// BTreeSet for sorted lock acquisition (deadlock-free ordering).
     pub collections_involved: BTreeSet<String>,
+    /// Last time the owning client touched this transaction (begin or any
+    /// tx_* operation). Drives the engine's idle-expiry: a client that
+    /// vanished mid-transaction must not park state — and
+    /// `find_for_update` locks — on the server forever. Not on wasm32
+    /// (no monotonic clock; single caller, so abandonment isn't a thing).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub last_active: std::time::Instant,
 }
 
 impl Transaction {
@@ -57,6 +64,8 @@ impl Transaction {
             read_set: Vec::new(),
             write_ops: Vec::new(),
             collections_involved: BTreeSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            last_active: std::time::Instant::now(),
         }
     }
 }

@@ -66,6 +66,13 @@ pub enum Error {
     #[error("transaction not found: {0}")]
     TransactionNotFound(u64),
 
+    /// An interactive transaction sat idle past `OXIDB_TX_MAX_IDLE_SECS`
+    /// and was rolled back by the engine. Distinct from
+    /// `TransactionNotFound` so a client that abandoned a transaction and
+    /// came back learns what actually happened to its buffered writes.
+    #[error("transaction {0} expired: idle past the transaction idle timeout and rolled back")]
+    TransactionExpired(u64),
+
     #[error("no active transaction")]
     NoActiveTransaction,
 
