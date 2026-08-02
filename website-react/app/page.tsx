@@ -7,7 +7,7 @@ export const metadata: Metadata = {
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
-    <p class="hero-kicker"><span class="hero-pulse"></span>v0.42.6 &middot; geospatial + graph queries &mdash; $near, $geoWithin, $graphLookup, $shortestPath &middot; PostgreSQL wire protocol &middot; embedded EF Core &middot; <a href="/license/">source-available</a>, free for your own production use</p>
+    <p class="hero-kicker"><span class="hero-pulse"></span>v0.42.6 &middot; geospatial + graph queries &middot; PostgreSQL wire protocol &middot; embedded EF Core &middot; <a href="/license/">source-available</a>, free for production use</p>
     <div class="hero-lockup">
       <img src="/oxidb-logo.svg" class="hero-logo" alt="OxiDB logo" width="96" height="96" />
       <h1>OxiDB</h1>
