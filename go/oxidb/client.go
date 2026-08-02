@@ -5,6 +5,7 @@
 package oxidb
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -633,6 +634,17 @@ func (c *Client) Count(collection string, query map[string]any) (int, error) {
 // CreateIndex creates a non-unique index on a field.
 func (c *Client) CreateIndex(collection, field string) error {
 	_, err := c.checked(map[string]any{"cmd": "create_index", "collection": collection, "field": field})
+	return err
+}
+
+// CreateGeoIndex creates a geospatial index on a field holding a point.
+//
+// The field may be GeoJSON ({"type":"Point","coordinates":[lon,lat]}),
+// [lon, lat], or {"lat":..,"lon":..}. Anything else is skipped rather than
+// rejected, so a collection where only some documents carry a location
+// indexes cleanly. Needed for $near and $geoWithin.
+func (c *Client) CreateGeoIndex(collection, field string) error {
+	_, err := c.checked(map[string]any{"cmd": "create_geo_index", "collection": collection, "field": field})
 	return err
 }
 
@@ -1496,4 +1508,112 @@ func toMapSlice(data any) []map[string]any {
 		}
 	}
 	return result
+}
+
+// ------------------------------------------------------------------
+// Change streams
+// ------------------------------------------------------------------
+
+// ChangeEvent is one document change reported by [Client.Watch].
+type ChangeEvent struct {
+	// Token orders events and is what a later Watch passes as resumeAfter to
+	// pick up where this one stopped.
+	Token      uint64         `json:"token"`
+	Operation  string         `json:"operation"` // Insert | Update | Delete
+	Collection string         `json:"collection"`
+	DocID      uint64         `json:"doc_id"`
+	Document   map[string]any `json:"document"`
+}
+
+// WatchOverflow reports events the server dropped because the consumer fell
+// behind. It is delivered in-band rather than silently: a gap in a change
+// stream is the kind of thing a caller must decide about (usually by
+// resynchronising), not something a library should hide.
+type WatchOverflow struct {
+	Dropped uint64 `json:"dropped"`
+}
+
+// Watch turns this connection into a change stream and blocks, calling onEvent
+// for every change to collection (empty for all collections).
+//
+// The connection is dedicated for the duration: watch is a mode, not a
+// request, so the client must not be shared with ordinary commands while it
+// runs. Pass resumeAfter to continue after a known token, or 0 to start from
+// now. Returns when ctx is cancelled, the server closes, or onEvent fails.
+//
+// Requires the Admin role when the server has auth enabled.
+func (c *Client) Watch(
+	ctx context.Context,
+	collection string,
+	resumeAfter uint64,
+	onEvent func(ChangeEvent) error,
+	onOverflow func(WatchOverflow),
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := map[string]any{"cmd": "watch"}
+	if collection != "" {
+		req["collection"] = collection
+	}
+	if resumeAfter > 0 {
+		req["resume_after"] = resumeAfter
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	if err := c.sendRaw(payload); err != nil {
+		return fmt.Errorf("oxidb: watch: %w", err)
+	}
+
+	// Cancellation closes the socket: the read below is blocking, and there is
+	// no in-band way to interrupt it.
+	if ctx != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = c.conn.Close()
+			case <-stop:
+			}
+		}()
+	}
+
+	for {
+		raw, err := c.recvRaw()
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		var msg struct {
+			Event string          `json:"event"`
+			Data  json.RawMessage `json:"data"`
+			OK    *bool           `json:"ok"`
+			Error string          `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return fmt.Errorf("oxidb: watch decode: %w", err)
+		}
+		switch {
+		case msg.Error != "":
+			return fmt.Errorf("oxidb: watch: %s", msg.Error)
+		case msg.Event == "change":
+			var ev ChangeEvent
+			if err := json.Unmarshal(msg.Data, &ev); err != nil {
+				return fmt.Errorf("oxidb: watch event: %w", err)
+			}
+			if err := onEvent(ev); err != nil {
+				return err
+			}
+		case msg.Event == "overflow":
+			var ov WatchOverflow
+			if err := json.Unmarshal(msg.Data, &ov); err == nil && onOverflow != nil {
+				onOverflow(ov)
+			}
+		}
+	}
 }
