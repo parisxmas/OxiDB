@@ -109,3 +109,6 @@ deploy/.env
 # Dart client build artefacts
 oxibase-dart/.dart_tool/
 oxibase-dart/pubspec.lock
+
+# Release artifacts (published to GitHub/the web server; never in the repo)
+releases/
