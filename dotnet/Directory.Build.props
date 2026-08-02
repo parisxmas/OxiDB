@@ -1,7 +1,7 @@
 <Project>
 
   <PropertyGroup>
-    <Version>0.42.0</Version>
+    <Version>0.42.6</Version>
     <Authors>OxiDB Contributors</Authors>
     <Company>OxiDB</Company>
     <Product>OxiDB</Product>

@@ -11,12 +11,54 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.42.6 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.42.6</h3>
+        <span class="version-date">2026-08-02</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; geospatial queries (document engine)</h4>
+        <ul>
+          <li><strong><code>$geoWithin</code></strong> (<code>$centerSphere</code>, <code>$box</code>) and <strong><code>$near</code>/<code>$nearSphere</code></strong> with <code>$maxDistance</code>/<code>$minDistance</code> in meters, with implicit nearest-first ordering. Points are stored as GeoJSON <code>Point</code>, <code>[lon, lat]</code>, or <code>{lat, lon}</code>; distances are haversine on a spherical earth. Shapes that cannot be answered correctly (planar <code>$center</code>, polygons) are <strong>refused by name</strong> rather than answered approximately.</li>
+          <li><strong>Geohash index</strong> (<code>create_geo_index</code>): a query shape becomes a small cell cover, and every candidate is verified against the live document &mdash; the index can be generous but never wrong. Replicated in cluster mode, reported by <code>list_indexes</code>, and it works in the WASM build too: the <a href="/demo/geo/">geo globe demo</a> runs 10,000 cities with <code>$near</code>/<code>$geoWithin</code> entirely in the browser.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; graph queries (document engine)</h4>
+        <ul>
+          <li><strong><code>$graphLookup</code></strong> aggregation stage: breadth-first traversal issuing <strong>one <code>$in</code> query per frontier</strong>, so an index on <code>connectToField</code> serves the whole traversal. Cycle-safe, <code>restrictSearchWithMatch</code> prunes <em>during</em> traversal, and the 100k-document ceiling is a loud error &mdash; never a silent partial answer.</li>
+          <li><strong><code>$shortestPath</code></strong>: Dijkstra over an edge collection, adjacency fetched lazily in batched <code>$in</code> lookups so endpoint indexes serve the search. Negative weights are refused by name, <code>maxCost</code> answers an honest &ldquo;no route&rdquo;, and the 500k settled-node ceiling errs loudly. The globe demo routes İstanbul&rarr;Belgium (2,600&nbsp;km, 136 road segments) through this stage <em>in the browser</em>.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; transaction idle timeout (both engines)</h4>
+        <ul>
+          <li><strong><code>OXIDB_TX_MAX_IDLE_SECS</code></strong> (default 300, <code>0</code> = never): a client that vanishes mid-transaction while its connection stays open no longer parks buffered state &mdash; or <code>FOR UPDATE</code> locks &mdash; on the server forever. The document engine rolls the transaction back and answers <code>TransactionExpired</code> (distinct from &ldquo;not found&rdquo;, so the returning client learns what actually happened); the SQL engine expires parked session transactions the same way, reported over the PostgreSQL wire as SQLSTATE <code>25P03</code> &mdash; PostgreSQL&rsquo;s own <code>idle_in_transaction_session_timeout</code>. Steady activity resets the clock; disconnect rollback is unchanged.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; Go client</h4>
+        <ul>
+          <li><strong><code>Watch</code> change streams</strong>: per-change callbacks with resume tokens, and dropped-event overflow reported in-band rather than hidden. Plus <code>CreateGeoIndex</code> for the new geospatial index.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>A load test surfaced the server going silent after a few hundred users.</strong> Two paths held hot locks across slow work: storage scans ran caller callbacks under the data lock (deadlocking against a queued compaction the moment a callback read back into storage), and the background sync/TTL passes held the collection registry lock across seconds of file I/O &mdash; one queued writer then parked every request in the process. Both now snapshot their handles and release the lock before the slow part; a regression test pins the scan-vs-compaction case.</li>
+          <li><strong>SQL: a session that failed to resume its transaction kept the dead id</strong>, so every later statement &mdash; including the <code>ROLLBACK</code> a client sends to recover &mdash; repeated the same error forever. The session now starts clean.</li>
+          <li><code>find_for_update</code> no longer leaks just-acquired document locks when the transaction lookup fails.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.42.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.42.0</h3>
         <span class="version-date">2026-07-31</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; PostgreSQL wire protocol</h4>
