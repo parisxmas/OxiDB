@@ -40,8 +40,9 @@ Each surface is a first-class citizen, not an adapter: they share the process, t
 
 | Surface | Enable with | What it is |
 |---|---|---|
-| **Documents** | on by default | Schemaless JSON, MongoDB-style query and aggregation |
+| **Documents** | on by default | Schemaless JSON, MongoDB-style query and aggregation — plus geospatial and graph queries |
 | **SQL** | `OXIDB_SQL=1` | A relational engine with its own files — tables, joins, transactions, an EF Core provider |
+| **PostgreSQL wire** | `OXIDB_PG_PORT` | The PostgreSQL v3 protocol against the SQL engine — psql, psycopg, JDBC, Npgsql and DBeaver connect unmodified |
 | **Time series** | `OXIDB_TSDB=1` | Gorilla-compressed series, retention by block, continuous rollups |
 | **Key-value** | `OXIDB_OXIMEM_PORT` | RESP wire protocol — real Redis clients, 50+ commands |
 | **Objects** | `OXIDB_S3_PORT` | S3 API — `aws-cli`, `boto3` and the MinIO SDKs work unmodified |
@@ -67,7 +68,11 @@ Collections are created on first insert. No schema, no migration step.
 
 **Vector search** — k-NN with cosine, Euclidean and dot-product metrics; exact for small collections, HNSW for large, optional GPU acceleration through wgpu (`--features gpu`).
 
-**Transactions** — optimistic concurrency with a three-phase commit; writes buffer until commit and collections lock in a fixed order, so deadlock is not possible. The exact guarantee and its anomaly scorecard are written down in [`docs/isolation.md`](docs/isolation.md) and pinned by tests.
+**Geospatial** — `$geoWithin` (`$centerSphere`, `$box`) and `$near`/`$nearSphere` with meter distances and nearest-first ordering, over GeoJSON points, `[lon, lat]` pairs or `{lat, lon}` objects. Backed by a geohash index whose every candidate is verified against the live document — the index can be generous but never wrong. Shapes that cannot be answered correctly (planar `$center`, polygons) are refused by name rather than answered approximately.
+
+**Graph** — `$graphLookup` (breadth-first traversal issuing one `$in` per frontier, so an index on the connect field serves the whole walk; cycle-safe, prunable mid-traversal) and `$shortestPath` (Dijkstra over an edge collection with lazily fetched adjacency) run inside the aggregation pipeline. Ceilings err loudly — never a silent partial answer.
+
+**Transactions** — optimistic concurrency with a three-phase commit; writes buffer until commit and collections lock in a fixed order, so deadlock is not possible. The exact guarantee and its anomaly scorecard are written down in [`docs/isolation.md`](docs/isolation.md) and pinned by tests. An abandoned transaction expires (`OXIDB_TX_MAX_IDLE_SECS`, default 300 s): a client that vanishes mid-transaction cannot park state — or `FOR UPDATE` locks — on the server forever, and a late touch is told `TransactionExpired`, not "not found".
 
 **Read snapshots** ([ADR-0017](docs/decisions/0017-mvcc-lite-read-snapshots.md)) — aggregation is snapshot-consistent by default, so a report can never see half a transfer, and `snapshot_begin`…`snapshot_end` gives an explicit point-in-time view. The write path is untouched: with no snapshot open the cost is one atomic load per write.
 
@@ -77,11 +82,15 @@ A second engine ([ADR-0010](docs/decisions/0010-sql-engine-crate.md)) with entir
 
 DDL and DML, `INNER`/`LEFT`/`RIGHT`/`FULL` joins, `GROUP BY`/`HAVING`, secondary indexes, parameterised statements and interactive transactions. Analytics: CTEs including `WITH RECURSIVE`, set operations, `LATERAL` joins, `DISTINCT ON`, ordered-set aggregates, window functions, and calendar-correct date arithmetic.
 
+**Constraints are enforced, not just parsed** — composite `PRIMARY KEY`, `UNIQUE` (declared or `CREATE UNIQUE INDEX`, validated against existing rows), single-column `FOREIGN KEY` with `ON DELETE` `CASCADE`/`SET NULL`/`RESTRICT`, `NOT NULL`, `VARCHAR(n)` length, and integer width (`SMALLINT` out of range is an error, never a silent widening). What cannot be enforced is refused by name.
+
+**Disk-first by default** — rows, primary keys and every index are mapped files bounded by the checkpoint interval, not by row count: a warm 1.2M-row, index-heavy database costs ~39 MB of process memory, and the sparse row index costs 0.69 bytes per row. Measured against stock PostgreSQL 18 on identical data, 5 of 8 query workloads run at parity ([`docs/query-benchmark.md`](docs/query-benchmark.md)). **Group commit** lets concurrent writers share fsyncs — a flat ~266 writes/s at any concurrency becomes ~1.2k/s at 16 connections.
+
 `ALTER TABLE ADD/DROP COLUMN` is metadata-only — O(1) on a table of any size, with the physical rewrite folded into a later checkpoint.
 
 **Stored procedures** come in two languages ([ADR-0014](docs/decisions/0014-cobra-stored-procedures.md)): SQL text, and compiled **Cobra** bytecode run by a VM with a fuel cap and determinism checked at creation, so a call replicates safely.
 
-**Entity Framework Core** — a full provider with migrations and scaffolding. It passes the official EF Core relational specification suite, 3832 of 3832, across all twelve Northwind suites.
+**Entity Framework Core** — a full provider with migrations and scaffolding. It passes the official EF Core relational specification suite, 3832 of 3832, across all twelve Northwind suites. It runs **embedded** too: `UseOxiDb("Path=./mydata")` runs the whole EF Core stack in-process with no server, SQLite-style — the same `DbContext` points at a server by changing one connection string. And EF Core also works over the **unmodified Npgsql provider** through the PostgreSQL wire port.
 
 ## Time series
 
@@ -92,6 +101,8 @@ Typed fields (float, integer, boolean, string). Aggregations include mean, sum, 
 ## Talking to it
 
 **Wire protocol** — length-prefixed JSON over TCP, or the compact OxiWire binary framing. One request shape for every engine.
+
+**PostgreSQL wire** ([ADR-0023](docs/decisions/0023-postgres-wire-protocol.md)) — `OXIDB_PG_PORT` speaks the PostgreSQL v3 protocol against the SQL engine, verified with real drivers rather than the spec: **psql 18, psycopg 3, Npgsql in its default mode, pgjdbc** (including `DatabaseMetaData` introspection) **and DBeaver** connect unmodified, over the same SCRAM accounts and TLS as the native port. System-catalog queries are answered with PostgreSQL's real column sets filled from OxiDB's schema; what cannot be answered truthfully is refused by name, because an empty result would be believed.
 
 **REST** — JSON over HTTP for documents, aggregation, indexes, procedures, SQL and storage.
 
@@ -121,7 +132,7 @@ The server can also *emit* to a GELF or MessagePack endpoint (`OXIDB_GELF_ADDR`,
 
 Every write goes through a WAL with CRC32 checksums, and a commit is acknowledged only after the WAL fsync, the data fsync and the commit-log fsync. Documents live in an mmap'd data file with a small resident offset index, so memory does not scale with the retention window; set `OXIDB_DISK_FIRST=0` for the older all-resident mode.
 
-The WAL checkpoints online — it seals rather than truncates, so a checkpoint never races a writer — and a transaction's writes are invisible on disk until its commit point, which is what makes a transaction spanning several collections all-or-nothing after a crash.
+The WAL checkpoints online — it seals rather than truncates, so a checkpoint never races a writer — and a transaction's writes are invisible on disk until its commit point, which is what makes a transaction spanning several collections all-or-nothing after a crash. The SQL and time-series engines checkpoint by writing a whole new generation and promoting it with a single atomic `MANIFEST` rename — a crash on either side of the rename leaves the previous generation in force; unchanged tables are hard-linked rather than rewritten.
 
 **Point-in-time recovery** (opt-in, `OXIDB_PITR`) stamps every durable WAL record with a global sequence number and a wall clock, archives sealed segments with a self-healing manifest, and rebuilds to any GSN, timestamp or `Latest` on top of a base backup — with transactionally consistent cuts. **Backup and restore** are low-lock for the SQL and time-series engines: the slow compression runs with the lock released.
 
@@ -143,7 +154,7 @@ Nine fuzz targets live in [`fuzz/`](fuzz/), four mutation-based and two differen
 
 ## Tools
 
-A CLI with an interactive shell (embedded or client mode), a VS Code extension with a collection browser and query editor, [OxiDB Studio](oxidb-app/) — a Tauri desktop app with a SQL editor and data grid — and a WASM build of the document engine that runs in a browser with OPFS persistence.
+A CLI with an interactive shell (embedded or client mode), a VS Code extension with a collection browser and query editor, [OxiDB Studio](oxidb-app/) — a Tauri desktop app with a SQL editor and data grid — and a WASM build of the document engine that runs in a browser with OPFS persistence. The [geo globe demo](https://oxidb.baltavista.com/demo/geo/) is that WASM build live: 10,000 cities, `$near`/`$geoWithin` and `$shortestPath` routing, entirely in the browser.
 
 ## Configuration
 
@@ -154,6 +165,10 @@ A CLI with an interactive shell (embedded or client mode), a VS Code extension w
 | `OXIDB_POOL_SIZE` | `4` | Worker threads |
 | `OXIDB_DISK_FIRST` | `1` | Documents in an mmap'd file; `0` keeps them resident |
 | `OXIDB_SQL` / `OXIDB_TSDB` | off | Enable the SQL / time-series engines |
+| `OXIDB_SQL_DISK_FIRST` | `1` | SQL rows and indexes as mapped files; `0` keeps them resident |
+| `OXIDB_PG_PORT` | off | PostgreSQL wire listener (needs `OXIDB_SQL=1`) |
+| `OXIDB_DOC` | on | `0` runs the server without the document engine (SQL/TSDB only) |
+| `OXIDB_TX_MAX_IDLE_SECS` | `300` | Idle interactive transactions roll back; `0` = never |
 | `OXIDB_HTTP_PORT` / `OXIDB_WS_PORT` | off | REST and realtime listeners |
 | `OXIDB_S3_PORT` / `OXIDB_OXIMEM_PORT` | off | S3 and RESP listeners |
 | `OXIDB_MQTT_PORT` / `OXIDB_AMQP_PORT` | off | Messaging listeners |
