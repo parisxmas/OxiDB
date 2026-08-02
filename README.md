@@ -2,7 +2,9 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">One database process, several shapes of data: JSON documents, SQL tables, time series, a Redis-compatible key-value store, S3-compatible object storage, and MQTT/AMQP messaging — behind one binary, with no configuration to start.</p>
+<p align="center">One database process, several shapes of data: <strong>JSON documents</strong> with MongoDB-style queries, aggregation pipelines, geospatial and graph stages · <strong>SQL tables</strong> with joins, window functions, stored procedures and an EF Core provider — reachable over the <strong>PostgreSQL wire protocol</strong>, so psql, JDBC, Npgsql and DBeaver connect unmodified · Gorilla-compressed <strong>time series</strong> with continuous rollups · a <strong>Redis-compatible</strong> key-value store with MULTI/EXEC and Lua · <strong>S3-compatible</strong> object storage that aws-cli and boto3 speak to unmodified · <strong>MQTT/AMQP</strong> messaging, bridged across protocols · and <strong>full-text + vector search</strong> over all of it.</p>
+
+<p align="center">ACID transactions, snapshot-consistent reads, Raft replication, point-in-time recovery, SCRAM/TLS/RBAC and AES-GCM encryption at rest are built in — one ~20 MB zero-dependency binary that starts with no configuration, runs embedded in your process, and compiles to WASM for the browser.</p>
 
 <p align="center"><strong>Clients:</strong> <a href="python/">Python</a> · <a href="go/">Go</a> · <a href="dotnet/">.NET</a> · <a href="oxidb-js/">JS/TS</a> · <a href="julia/">Julia</a> · <a href="swift/">Swift</a> · <a href="oxidb-client-ffi/">C FFI</a> · <a href="oxidb-wasm/">WASM</a> · <a href="oxidb-vscode/">VS Code</a></p>
 
