@@ -4,7 +4,7 @@
 
 <p align="center">One database process, several shapes of data: JSON documents, SQL tables, time series, a Redis-compatible key-value store, S3-compatible object storage, and MQTT/AMQP messaging — behind one binary, with no configuration to start.</p>
 
-<p align="center"><strong>Clients:</strong> <a href="python/">Python</a> · <a href="go/">Go</a> · <a href="dotnet/">.NET</a> · <a href="oxidb-js/">JS/TS</a> · <a href="julia/">Julia</a> · <a href="swift/">Swift</a> · <a href="php/">PHP</a> · <a href="oxidb-client-ffi/">C FFI</a> · <a href="oxidb-wasm/">WASM</a> · <a href="oxidb-vscode/">VS Code</a></p>
+<p align="center"><strong>Clients:</strong> <a href="python/">Python</a> · <a href="go/">Go</a> · <a href="dotnet/">.NET</a> · <a href="oxidb-js/">JS/TS</a> · <a href="julia/">Julia</a> · <a href="swift/">Swift</a> · <a href="oxidb-client-ffi/">C FFI</a> · <a href="oxidb-wasm/">WASM</a> · <a href="oxidb-vscode/">VS Code</a></p>
 
 ---
 

@@ -24,7 +24,7 @@ export default function Page() {
     <p>A commercial license is negotiated directly and can also cover source access and modification rights, support, and update terms. To obtain one, email <a href="mailto:barisakin@gmail.com">barisakin@gmail.com</a>.</p>
 
     <h3>Client libraries</h3>
-    <p>The thin <strong>TCP client libraries</strong> (Python <code>oxidb</code>, the JavaScript clients, <code>OxiDb.Client.Tcp</code> / <code>OxiDb.Linq</code> / <code>OxiDb.Data</code> on NuGet, Go, Julia, Dart, PHP, Swift) are <strong>MIT-licensed</strong>, redistribution included — shipping one inside your application needs no license.</p>
+    <p>The thin <strong>TCP client libraries</strong> (Python <code>oxidb</code>, the JavaScript clients, <code>OxiDb.Client.Tcp</code> / <code>OxiDb.Linq</code> / <code>OxiDb.Data</code> on NuGet, Go, Julia, Dart, Swift) are <strong>MIT-licensed</strong>, redistribution included — shipping one inside your application needs no license.</p>
     <p>Packages that <strong>bundle the engine itself</strong> — <code>oxidb-embedded</code> on PyPI, <code>OxiDb.Client.Embedded</code> on NuGet, and the FFI/WASM artifacts — contain the engine and are covered by the source-available license.</p>
 
     <h3>Prior versions</h3>

@@ -46,7 +46,7 @@ OxiDB &mdash; a database engine in Rust:
  &#9642; REST + WebSocket + JWT auth + security rules
  &#9642; Prometheus metrics, explain &amp; slow-query profiler
  &#9642; Multi-database, RBAC, SCRAM auth, TLS, audit log
- &#9642; Runs embedded too &mdash; Python, Go, .NET (EF Core), JS, Julia, Swift, PHP
+ &#9642; Runs embedded too &mdash; Python, Go, .NET (EF Core), JS, Julia, Swift
  &#9642; Compiles to WASM
 
 Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
@@ -69,7 +69,6 @@ Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
           <span class="arch-chip">JS / TS</span>
           <span class="arch-chip">Julia</span>
           <span class="arch-chip">Swift</span>
-          <span class="arch-chip">PHP</span>
           <span class="arch-chip alt">redis-cli</span>
           <span class="arch-chip alt">mosquitto</span>
           <span class="arch-chip alt">pika / RabbitMQ.Client</span>
@@ -300,7 +299,7 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Multi-Language</h3>
-        <p>Official clients for Rust, Python, Go, .NET (ADO.NET + EF Core + LINQ + Embedded), Java, Julia, Swift, PHP/WordPress, and JS/TS &mdash; plus a WebAssembly build.</p>
+        <p>Official clients for Rust, Python, Go, .NET (ADO.NET + EF Core + LINQ + Embedded), Java, Julia, Swift, and JS/TS &mdash; plus a WebAssembly build.</p>
       </div>
     </div>
   </div>
