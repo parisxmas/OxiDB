@@ -60,7 +60,7 @@ fn env_truthy(key: &str) -> bool {
 }
 
 fn registry() -> Option<&'static Registry> {
-    REGISTRY
+    let reg = REGISTRY
         .get_or_init(|| {
             if !env_truthy("OXIDB_SQL") {
                 return None;
@@ -81,7 +81,37 @@ fn registry() -> Option<&'static Registry> {
                 engines: RwLock::new(HashMap::new()),
             })
         })
-        .as_ref()
+        .as_ref();
+    if let Some(r) = reg {
+        spawn_txn_sweeper(r);
+    }
+    reg
+}
+
+/// Periodic sweeper for abandoned interactive transactions
+/// (`OXIDB_TX_MAX_IDLE_SECS`): every engine's parked session transactions
+/// are expired on a heartbeat, so a client that vanished — without closing
+/// its connection and without sending further SQL — still frees its row
+/// locks. The engines also sweep lazily on their own traffic; this thread
+/// covers the zero-traffic case. Spawned once, outside `get_or_init`
+/// (calling `registry()` from inside it would deadlock the `OnceLock`).
+fn spawn_txn_sweeper(reg: &'static Registry) {
+    static SWEEPER: OnceLock<()> = OnceLock::new();
+    SWEEPER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("oxidb-sql-txn-sweep".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    let engines: Vec<Arc<SqlEngine>> =
+                        reg.engines.read().unwrap().values().cloned().collect();
+                    for engine in engines {
+                        engine.expire_stale_session_txns();
+                    }
+                }
+            })
+            .expect("failed to spawn SQL transaction sweeper");
+    });
 }
 
 /// `postgres` is an alias for the default database; an empty name means the

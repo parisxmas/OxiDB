@@ -65,6 +65,7 @@ pub const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
 pub const SQLSTATE_STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
 pub const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 pub const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+pub const SQLSTATE_IDLE_IN_TRANSACTION_TIMEOUT: &str = "25P03";
 pub const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 pub const SQLSTATE_READ_ONLY_SQL_TRANSACTION: &str = "25006";
 pub const SQLSTATE_CONFIGURATION_LIMIT_EXCEEDED: &str = "53400";
@@ -89,6 +90,9 @@ impl From<SqlError> for PgError {
             SqlError::Parse(_) => SQLSTATE_SYNTAX_ERROR,
             SqlError::Unsupported(_) => SQLSTATE_FEATURE_NOT_SUPPORTED,
             SqlError::LockTimeout { .. } => SQLSTATE_LOCK_NOT_AVAILABLE,
+            // PostgreSQL's idle_in_transaction_session_timeout SQLSTATE —
+            // the exact condition this reports.
+            SqlError::TxnExpired(_) => SQLSTATE_IDLE_IN_TRANSACTION_TIMEOUT,
             SqlError::ValueTooLong { .. } => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
             SqlError::IntegerOutOfRange { .. } => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             // The engine reports a NOT NULL breach through SchemaMismatch, so
@@ -143,8 +147,8 @@ mod tests {
 
     #[test]
     fn a_not_null_breach_is_23502_not_a_generic_type_error() {
-        let e: PgError = SqlError::SchemaMismatch("column \"a\" is NOT NULL but got NULL".into())
-            .into();
+        let e: PgError =
+            SqlError::SchemaMismatch("column \"a\" is NOT NULL but got NULL".into()).into();
         assert_eq!(e.code, SQLSTATE_NOT_NULL_VIOLATION);
         let other: PgError = SqlError::SchemaMismatch("column \"a\" expects Int".into()).into();
         assert_eq!(other.code, SQLSTATE_DATATYPE_MISMATCH);

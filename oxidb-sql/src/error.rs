@@ -18,6 +18,14 @@ pub enum SqlError {
     #[error("lock timeout: row {row_id} of '{table}' is locked by another transaction")]
     LockTimeout { table: String, row_id: u64 },
 
+    /// A parked interactive transaction sat idle past
+    /// `OXIDB_TX_MAX_IDLE_SECS` and was rolled back by the engine —
+    /// buffered writes discarded, row locks released. Distinct from the
+    /// generic "no such transaction" so a client that abandoned a
+    /// transaction and came back learns what actually happened.
+    #[error("transaction {0} expired: idle past the transaction idle timeout and rolled back")]
+    TxnExpired(u64),
+
     /// The on-disk catalog or a data/WAL file is structurally invalid.
     #[error("corrupt storage: {0}")]
     Corrupt(String),

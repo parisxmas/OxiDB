@@ -882,14 +882,49 @@ struct Inner {
     pinned_gens: std::collections::BTreeMap<u64, usize>,
 }
 
+/// A session transaction parked between calls, stamped so the engine can
+/// expire one whose owner vanished (`OXIDB_TX_MAX_IDLE_SECS`). A parked
+/// transaction is idle by definition — execution checks it out of the map
+/// while a statement runs — so the clock resets at every park.
+struct ParkedTxn {
+    state: transaction::TxnState,
+    parked_at: std::time::Instant,
+}
+
+/// How many expired session-transaction ids are remembered for accurate
+/// error reporting. Ids are monotonic, so eviction drops the oldest.
+const EXPIRED_TXN_REMEMBERED: usize = 1024;
+
+/// `OXIDB_TX_MAX_IDLE_SECS` (default 300, `0` = never expire), in ms.
+/// The same knob as the document engine's: one concept, two engines.
+fn txn_max_idle_ms_from_env() -> u64 {
+    std::env::var("OXIDB_TX_MAX_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        .saturating_mul(1000)
+}
+
 /// The public SQL engine handle. Cheap to share behind an `Arc`.
 pub struct SqlEngine {
     inner: Mutex<Inner>,
     /// Interactive (session) transactions parked between calls, keyed by id
     /// (ADR-0013 Phase B). A transaction lives here while its connection is
     /// between requests; execution takes it out and puts it back.
-    session_txns: Mutex<std::collections::HashMap<u64, transaction::TxnState>>,
+    session_txns: Mutex<std::collections::HashMap<u64, ParkedTxn>>,
     next_session_txn: std::sync::atomic::AtomicU64,
+    /// Idle timeout for parked session transactions, in ms (see
+    /// [`txn_max_idle_ms_from_env`]). A transaction whose owner goes quiet
+    /// past this is rolled back — buffered writes discarded, row locks
+    /// released — because a lost client must not park state (and
+    /// `SELECT ... FOR UPDATE` locks) in the engine forever. The server's
+    /// disconnect rollback covers a *closed* connection; this covers one
+    /// that stays open, and embedded callers that leak a tx id.
+    txn_max_idle_ms: std::sync::atomic::AtomicU64,
+    /// Recently expired session-transaction ids (bounded to
+    /// [`EXPIRED_TXN_REMEMBERED`]) so a returning client is told
+    /// "expired", not "no such transaction".
+    expired_txns: Mutex<std::collections::BTreeSet<u64>>,
     /// Parsed-statement cache: SQL text -> AST. Applications loop over a
     /// small set of parameterized texts, and parsing costs more than an AST
     /// clone; execution works on a clone, so the cached AST is never touched.
@@ -1195,6 +1230,8 @@ impl SqlEngine {
         let engine = SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
+            txn_max_idle_ms: std::sync::atomic::AtomicU64::new(txn_max_idle_ms_from_env()),
+            expired_txns: Mutex::new(std::collections::BTreeSet::new()),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             row_locks: row_locks::RowLocks::default(),
             lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
@@ -2875,21 +2912,25 @@ impl SqlEngine {
         params: &[Value],
         session_tx: &mut Option<u64>,
     ) -> Result<Vec<QueryResult>> {
+        // Expired parked transactions die on any traffic through the
+        // engine, not only their own session's — a vanished client's row
+        // locks should not wait for the periodic sweeper.
+        self.expire_stale_session_txns();
+
         // Resume a parked transaction, if the session has one.
         let mut txn: Option<Transaction<'_>> = match *session_tx {
-            Some(id) => {
-                let state = self
-                    .session_txns
-                    .lock()
-                    .unwrap()
-                    .remove(&id)
-                    .ok_or_else(|| {
-                        SqlError::Unsupported(format!(
-                            "no such transaction: {id} (rolled back, committed, or busy)"
-                        ))
-                    })?;
-                Some(Transaction::from_state(self, state))
-            }
+            Some(id) => match self.take_parked(id) {
+                Ok(state) => Some(Transaction::from_state(self, state)),
+                Err(e) => {
+                    // The parked transaction is gone (expired, or already
+                    // finished elsewhere): the session must start clean —
+                    // otherwise every later statement, including the
+                    // ROLLBACK a client sends to recover, repeats this
+                    // same error forever.
+                    *session_tx = None;
+                    return Err(e);
+                }
+            },
             None => None,
         };
 
@@ -2904,7 +2945,13 @@ impl SqlEngine {
                             self.next_session_txn
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         });
-                        self.session_txns.lock().unwrap().insert(id, t.into_state());
+                        self.session_txns.lock().unwrap().insert(
+                            id,
+                            ParkedTxn {
+                                state: t.into_state(),
+                                parked_at: std::time::Instant::now(),
+                            },
+                        );
                         *session_tx = Some(id);
                     }
                     None => *session_tx = None,
@@ -3335,17 +3382,89 @@ impl SqlEngine {
     /// ops via [`apply_replicated_txn_ops`](Self::apply_replicated_txn_ops)
     /// on every node (including this one) completes the commit.
     pub fn take_session_txn_ops(&self, id: u64) -> Result<serde_json::Value> {
-        let state = self
-            .session_txns
-            .lock()
-            .unwrap()
-            .remove(&id)
-            .ok_or_else(|| {
+        let state = self.take_parked(id)?;
+        Ok(serde_json::to_value(state.take_ops())?)
+    }
+
+    /// Check a parked transaction out of the map, enforcing the idle
+    /// timeout: an expired one is rolled back right here (row locks
+    /// released) and the caller gets [`SqlError::TxnExpired`] — never a
+    /// silent resume of state the sweeper was about to drop.
+    fn take_parked(&self, id: u64) -> Result<transaction::TxnState> {
+        match self.session_txns.lock().unwrap().remove(&id) {
+            Some(p) => {
+                if self.txn_idle_expired(p.parked_at) {
+                    self.row_locks.release_all(p.state.lock_owner());
+                    self.remember_expired(id);
+                    return Err(SqlError::TxnExpired(id));
+                }
+                Ok(p.state)
+            }
+            None => Err(if self.expired_txns.lock().unwrap().contains(&id) {
+                SqlError::TxnExpired(id)
+            } else {
                 SqlError::Unsupported(format!(
                     "no such transaction: {id} (rolled back, committed, or busy)"
                 ))
-            })?;
-        Ok(serde_json::to_value(state.take_ops())?)
+            }),
+        }
+    }
+
+    fn txn_idle_expired(&self, parked_at: std::time::Instant) -> bool {
+        let ms = self
+            .txn_max_idle_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        ms > 0 && parked_at.elapsed() >= std::time::Duration::from_millis(ms)
+    }
+
+    /// Remember an expired id (bounded) for accurate late-caller errors.
+    fn remember_expired(&self, id: u64) {
+        let mut expired = self.expired_txns.lock().unwrap();
+        expired.insert(id);
+        while expired.len() > EXPIRED_TXN_REMEMBERED {
+            let oldest = *expired.iter().next().unwrap();
+            expired.remove(&oldest);
+        }
+    }
+
+    /// Set the parked-transaction idle timeout in milliseconds (`0` =
+    /// never expire). Programmatic override of `OXIDB_TX_MAX_IDLE_SECS`
+    /// for embedded callers and tests.
+    pub fn set_txn_max_idle_ms(&self, ms: u64) {
+        self.txn_max_idle_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Expire every parked session transaction past the idle timeout —
+    /// buffered writes discarded, row locks released. Called on every
+    /// session execute and periodically by the server, so an abandoned
+    /// transaction dies even with no further traffic from its owner.
+    pub fn expire_stale_session_txns(&self) {
+        if self
+            .txn_max_idle_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return;
+        }
+        let stale: Vec<(u64, ParkedTxn)> = {
+            let mut map = self.session_txns.lock().unwrap();
+            if map.is_empty() {
+                return;
+            }
+            let ids: Vec<u64> = map
+                .iter()
+                .filter(|(_, p)| self.txn_idle_expired(p.parked_at))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| map.remove(&id).map(|p| (id, p)))
+                .collect()
+        };
+        for (id, p) in stale {
+            self.row_locks.release_all(p.state.lock_owner());
+            self.remember_expired(id);
+        }
     }
 
     /// Apply a replicated buffered commit (the ops from
@@ -3381,8 +3500,8 @@ impl SqlEngine {
     pub fn rollback_session_txn(&self, id: u64) {
         // Dropping the state discards the buffered writes; its row locks go
         // with it.
-        if let Some(state) = self.session_txns.lock().unwrap().remove(&id) {
-            self.row_locks.release_all(state.lock_owner());
+        if let Some(parked) = self.session_txns.lock().unwrap().remove(&id) {
+            self.row_locks.release_all(parked.state.lock_owner());
         }
     }
 
@@ -3934,7 +4053,13 @@ impl Store for SqlEngine {
     fn drop_table(&self, name: &str) -> Result<()> {
         SqlEngine::drop_table(self, name)
     }
-    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()> {
+    fn create_index(
+        &self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<()> {
         SqlEngine::create_index(self, name, table, columns, unique)
     }
     fn drop_index(&self, name: &str) -> Result<()> {
