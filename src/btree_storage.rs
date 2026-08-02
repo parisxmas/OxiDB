@@ -1323,17 +1323,37 @@ impl BTreeStorage {
     {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
-            let data = d.data.read();
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
             d.index.iter_sync(|k, loc| {
                 items.push((*k, *loc));
                 true
             });
             items.sort_unstable_by_key(|(k, _)| *k);
-            for (key, loc) in items {
-                if let Ok(value) = data.read_lockfree(loc)
-                    && !f(key, &value)?
-                {
+            for (key, _) in items {
+                // Read under a short-lived guard and release it before handing
+                // control to `f`. Holding it across the callback deadlocks the
+                // whole engine: this lock is fair and not reentrant, so as soon
+                // as `compact` queues on the write side, a callback that reaches
+                // back into storage — `load_doc_arc`, a nested `find_one`, an
+                // index probe — blocks behind that writer on a lock its own
+                // thread already holds, and `compact` waits on that thread
+                // forever. Every later request then piles up behind the
+                // collection registry and the server is done.
+                //
+                // Re-resolving the location inside the guard is what makes the
+                // shorter hold safe: a compaction between two iterations moves
+                // records, and the index is exactly what it rewrites, so a
+                // location cached before the loop would point at the old file.
+                let value = {
+                    let data = d.data.read();
+                    d.index
+                        .read_sync(&key, |_, loc| *loc)
+                        .and_then(|loc| data.read_lockfree(loc).ok())
+                };
+                // Gone means deleted while we scanned; skip it, as a scan that
+                // started a moment later would have.
+                let Some(value) = value else { continue };
+                if !f(key, &value)? {
                     break;
                 }
             }
@@ -1363,17 +1383,22 @@ impl BTreeStorage {
     {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
-            let data = d.data.read();
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
             d.index.iter_sync(|k, loc| {
                 items.push((*k, *loc));
                 true
             });
             items.sort_unstable_by_key(|(k, _)| *k);
-            for (_key, loc) in items {
-                if let Ok(value) = data.read_lockfree(loc)
-                    && !f(&value)?
-                {
+            for (key, _) in items {
+                // Guard released before `f` runs — see scan_all_while.
+                let value = {
+                    let data = d.data.read();
+                    d.index
+                        .read_sync(&key, |_, loc| *loc)
+                        .and_then(|loc| data.read_lockfree(loc).ok())
+                };
+                let Some(value) = value else { continue };
+                if !f(&value)? {
                     break;
                 }
             }
@@ -1521,6 +1546,13 @@ impl BTreeStorage {
 
     /// Iterate all entries in arbitrary order (no key sort). Faster for full scans
     /// like aggregation where key order doesn't matter.
+    ///
+    /// Unlike [`scan_all_while`](Self::scan_all_while), `f` runs while the data
+    /// lock is held: the bytes are borrowed straight out of the mmap, so the
+    /// mapping has to stay put. That makes re-entrancy fatal — a callback that
+    /// calls back into this storage (directly, or via the collection's document
+    /// loaders) deadlocks against a queued compaction. Callbacks here must work
+    /// only from the bytes they are given.
     pub fn for_each_value<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
@@ -1575,6 +1607,82 @@ impl BTreeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for a full-engine deadlock that a load test surfaced as
+    /// "the server stops answering after a few hundred users".
+    ///
+    /// `scan_all_while` used to hold the data lock across the caller's
+    /// callback. That lock is fair and not reentrant, so the moment
+    /// compaction queued on the write side, a callback that read anything
+    /// back out of storage blocked behind that writer — waiting on a lock its
+    /// own thread was holding, which compaction was in turn waiting to be
+    /// released. Nothing broke it: every later request piled up behind the
+    /// collection registry and the process had to be killed.
+    ///
+    /// Reading a document from inside a scan is ordinary (`load_doc_arc` on an
+    /// update path does it), so the scan must not hold the lock across it.
+    #[test]
+    fn scan_callback_may_read_while_compaction_waits() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            disk_first: true,
+            compact_min_bytes: 0,
+            ..StorageOptions::default()
+        };
+        let storage = Arc::new(
+            BTreeStorage::open_with_options("deadlock", dir.path(), None, opts).unwrap(),
+        );
+        for i in 1..=200u64 {
+            storage.insert(i, vec![b'x'; 512]);
+        }
+        // Dead space, so compaction has real work and holds the write lock
+        // long enough for the scan to still be running underneath it.
+        for i in (1..=200u64).step_by(2) {
+            storage.remove(i);
+        }
+
+        let (done, finished) = mpsc::channel();
+
+        let scanner = {
+            let storage = Arc::clone(&storage);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut read_back = 0usize;
+                storage
+                    .scan_all_while(|key, _bytes| {
+                        // Widen the window so compaction is reliably queued
+                        // while this scan is mid-flight.
+                        std::thread::sleep(Duration::from_millis(1));
+                        if storage.get(key).is_some() {
+                            read_back += 1;
+                        }
+                        Ok(true)
+                    })
+                    .unwrap();
+                let _ = done.send(("scan", read_back));
+            })
+        };
+
+        let compactor = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                storage.compact().unwrap();
+                let _ = done.send(("compact", 0));
+            })
+        };
+
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(20))
+                .expect("deadlock: a scan callback read blocked against a queued compaction");
+        }
+        scanner.join().unwrap();
+        compactor.join().unwrap();
+    }
 
     #[test]
     fn basic_crud() {

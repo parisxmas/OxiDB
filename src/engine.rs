@@ -712,12 +712,17 @@ impl OxiDb {
                     // snapshot either wholly sees a doc TTL kept, or
                     // resolves the recorded prior of one it evicted.
                     let _occ_guard = db.commit_lock.read();
-                    let cols = db.collections.read();
-                    for col_arc in cols.values() {
+                    // Snapshot before evicting: eviction walks documents and
+                    // can write, and holding the registry across the whole
+                    // sweep parks every request behind us. See the sync loop.
+                    let targets: Vec<_> = {
+                        let cols = db.collections.read();
+                        cols.values().cloned().collect()
+                    };
+                    for col_arc in targets {
                         col_arc.evict_expired();
                         col_arc.evict_ttl_indexed();
                     }
-                    drop(cols);
                     drop(_occ_guard);
                     #[cfg(not(target_arch = "wasm32"))]
                     db.snap_gate.expire_tick();
@@ -1159,18 +1164,26 @@ impl OxiDb {
     /// durable point without shutting down.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn sync_all(&self) -> Result<()> {
-        let cols = self.collections.read();
-        for col in cols.values() {
+        // Snapshot the handles and let go of the registry: the flush below is
+        // file work, and this lock is on the path of every read and write.
+        // See the background sync loop for the full reasoning.
+        let targets: Vec<_> = {
+            let cols = self.collections.read();
+            cols.values().cloned().collect()
+        };
+        for col in targets {
             col.sync_writes()?;
         }
-        drop(cols);
         self.flush_indexes();
         Ok(())
     }
 
     pub fn flush_indexes(&self) {
-        let cols = self.collections.read();
-        for col_arc in cols.values() {
+        let targets: Vec<_> = {
+            let cols = self.collections.read();
+            cols.values().cloned().collect()
+        };
+        for col_arc in targets {
             col_arc.save_index_data();
         }
     }
@@ -1337,13 +1350,26 @@ impl OxiDb {
                             .unwrap_or_default()
                     };
                     let mut all_persisted = true;
-                    let cols = db.collections.read();
-                    for col_arc in cols.values() {
+                    // Snapshot the handles, then release the registry before
+                    // doing any file work. Holding the read lock across the
+                    // whole pass is what wedges the server: sync_writes can
+                    // snapshot, checkpoint and even compact a collection —
+                    // seconds of I/O on a large one — and this lock is fair,
+                    // so a single writer queued behind us (any request that
+                    // opens a *new* collection) parks every subsequent reader.
+                    // Since every insert and find starts by resolving its
+                    // collection through this lock, the whole engine stops
+                    // until the pass ends. The Arcs keep these alive; a
+                    // collection created meanwhile is picked up next tick.
+                    let targets: Vec<_> = {
+                        let cols = db.collections.read();
+                        cols.values().cloned().collect()
+                    };
+                    for col_arc in targets {
                         if col_arc.sync_writes().is_err() {
                             all_persisted = false;
                         }
                     }
-                    drop(cols);
                     if all_persisted && !prune.is_empty() {
                         let _ = db.tx_log.remove_committed_many(&prune);
                     }
@@ -1356,11 +1382,15 @@ impl OxiDb {
                         db.flush_indexes();
                     }
                 }
-                let cols = db.collections.read();
-                for col_arc in cols.values() {
+                // Same reasoning as the periodic pass above: snapshot, then
+                // release, then do the slow part.
+                let targets: Vec<_> = {
+                    let cols = db.collections.read();
+                    cols.values().cloned().collect()
+                };
+                for col_arc in targets {
                     let _ = col_arc.sync_writes();
                 }
-                drop(cols);
                 db.flush_indexes();
             })
             .expect("failed to spawn sync thread");
