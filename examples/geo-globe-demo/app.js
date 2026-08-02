@@ -559,7 +559,7 @@ function addRouteGlow(verts) {
     vertexShader:
       `void main() {\n` +
       `  vec4 mv = modelViewMatrix * vec4(position, 1.0);\n` +
-      `  gl_PointSize = clamp(${(9 * Math.min(devicePixelRatio, 2)).toFixed(1)} / -mv.z, 2.5, 26.0);\n` +
+      `  gl_PointSize = clamp(${(4.5 * Math.min(devicePixelRatio, 2)).toFixed(1)} / -mv.z, 2.0, 12.0);\n` +
       `  gl_Position = projectionMatrix * mv;\n` +
       `}`,
     fragmentShader:
