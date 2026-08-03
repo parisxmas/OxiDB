@@ -111,3 +111,6 @@ oxibase-dart/pubspec.lock
 
 # Release artifacts (published to GitHub/the web server; never in the repo)
 releases/
+
+# Local runtime data — never in the repo
+oxidb_data_local/
