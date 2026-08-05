@@ -185,7 +185,7 @@ cargo build --release -p oxidb-cli</code></pre>
               <td>Linux</td>
               <td>x86_64</td>
               <td><code>oxidb-mcp-v0.42.8-linux-amd64.tar.gz</code></td>
-              <td>358 KB</td>
+              <td>500 KB</td>
               <td>musl static</td>
               <td><a href="/releases/v0.42.8/oxidb-mcp-v0.42.8-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
@@ -193,7 +193,7 @@ cargo build --release -p oxidb-cli</code></pre>
               <td>Linux</td>
               <td>ARM64</td>
               <td><code>oxidb-mcp-v0.42.8-linux-arm64.tar.gz</code></td>
-              <td>329 KB</td>
+              <td>456 KB</td>
               <td>musl static</td>
               <td><a href="/releases/v0.42.8/oxidb-mcp-v0.42.8-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
@@ -201,7 +201,7 @@ cargo build --release -p oxidb-cli</code></pre>
               <td>macOS</td>
               <td>ARM64 (Apple Silicon)</td>
               <td><code>oxidb-mcp-v0.42.8-darwin-arm64.tar.gz</code></td>
-              <td>272 KB</td>
+              <td>386 KB</td>
               <td>tar.gz</td>
               <td><a href="/releases/v0.42.8/oxidb-mcp-v0.42.8-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
@@ -209,7 +209,7 @@ cargo build --release -p oxidb-cli</code></pre>
               <td>macOS</td>
               <td>x86_64 (Intel)</td>
               <td><code>oxidb-mcp-v0.42.8-darwin-amd64.tar.gz</code></td>
-              <td>298 KB</td>
+              <td>424 KB</td>
               <td>tar.gz</td>
               <td><a href="/releases/v0.42.8/oxidb-mcp-v0.42.8-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
@@ -217,7 +217,7 @@ cargo build --release -p oxidb-cli</code></pre>
               <td>Windows</td>
               <td>x86_64</td>
               <td><code>oxidb-mcp-v0.42.8-windows-amd64.zip</code></td>
-              <td>284 KB</td>
+              <td>416 KB</td>
               <td>zip</td>
               <td><a href="/releases/v0.42.8/oxidb-mcp-v0.42.8-windows-amd64.zip" class="dl-btn">Download</a></td>
             </tr>
