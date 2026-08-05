@@ -11,12 +11,34 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.42.8 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.42.8</h3>
+        <span class="version-date">2026-08-05</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Security &mdash; two holes in the read path (upgrade if you use security rules)</h4>
+        <ul>
+          <li><strong>A rule&rsquo;s numeric comparison could publish the rows it meant to hide.</strong> Rule literals were parsed as floating point while documents store whole numbers as integers, and the two were compared by representation rather than by value &mdash; so <em>every</em> numeric comparison in a rule was wrong, in both directions. <code>read: "doc.hidden != 1"</code> matched the hidden rows too and returned them; <code>read: "doc.hidden == 0"</code>, the same intent written the other way, matched nothing and hid everything. Numbers now compare by value. <strong>If you have a rule comparing a number, re-read it after upgrading</strong> &mdash; it starts behaving as written, which may be a change either way.</li>
+          <li><strong><code>GET /api/{'{collection}'}/count</code> ignored the read rule entirely.</strong> A collection with <code>read: false</code> refused <code>find</code> with 403 and answered <code>count</code> anyway. Because the endpoint takes an arbitrary filter, this was not merely a row-count leak but a disclosure oracle: a caller could ask &ldquo;how many rows have this email&rdquo; as an existence check, or binary-search a numeric field with <code>$gte</code>, without ever being permitted to read a document. It is now refused like <code>find</code>, and a row-level rule filters the count to the rows the caller may actually see. Same class as the aggregation gap closed in 0.39.21; this path was missed in that pass.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; hosted MCP endpoint</h4>
+        <ul>
+          <li><strong>An AI assistant can now reach a project over HTTP</strong>, with nothing installed locally: <code>POST /mcp/&lt;project&gt;</code> carrying the project&rsquo;s own key. It is served by forwarding that key to the REST surface, so the project&rsquo;s rules, roles and rate limits apply exactly as they do to any other request &mdash; the MCP layer decides nothing. Each request is independent, so one process can serve many projects with no shared state between them. See the <a href="/mcp/">MCP docs</a>.</li>
+          <li><code>oxidb-mcp --version</code> and <code>--help</code> now answer instead of waiting for a host to talk to them.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.42.7 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.42.7</h3>
         <span class="version-date">2026-08-05</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; MCP server (<code>oxidb-mcp</code>)</h4>

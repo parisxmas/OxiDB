@@ -78,6 +78,21 @@ export default function Page() {
     <h3>Results are budgeted for a context window</h3>
     <p>A read returns 50 rows by default and 500 at most. When a result is trimmed it <strong>says so</strong> and reports the true total from an index-only count, so an assistant knows to narrow the query rather than believe it has seen everything. A silent cap would read as &ldquo;that was all of it&rdquo; &mdash; a different, and wrong, answer.</p>
 
+    <h3>Hosted: one endpoint per project</h3>
+    <p>The setup above spawns <code>oxidb-mcp</code> on the machine running the host. For a hosted project there is a second mode: run it once as a server, and an assistant reaches a project over plain HTTP with nothing installed.</p>
+    <pre><code class="lang-bash">OXIDB_MCP_HTTP_PORT=8090 \\
+OXIDB_MCP_UPSTREAM=http://127.0.0.1:8080 \\
+  oxidb-mcp
+
+<span class="co"># the endpoint, carrying the project's own key</span>
+curl -X POST https://your-host/mcp/&lt;project-ref&gt; \\
+  -H "Authorization: Bearer $ANON_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'</code></pre>
+    <p><strong>The key is forwarded, not interpreted.</strong> The request is served by passing your project key to the REST surface, which verifies it against that project&rsquo;s own secret and applies the project&rsquo;s security rules, role and rate limit &mdash; the same gate every other request to the project passes. The MCP layer decides nothing about access; if a rule refuses a collection to your anon key, the tool call is refused with it.</p>
+    <p>Each request is independent: the project comes from the path and the key from the header, and nothing is cached between requests. One process can serve many projects with no shared state. Set <code>OXIDB_MCP_DB</code> to fix it to a single project, and a ref in the path is then ignored rather than honoured. <code>GET /mcp/health</code> answers without a key.</p>
+    <p>Two differences from the local mode: <code>explain</code> is not available (it is a wire-protocol diagnostic with no HTTP equivalent), and the time-series tool goes through the PostgREST time-series route, so its rows come back flattened.</p>
+
     <h3>How it fits</h3>
     <p><code>oxidb-mcp</code> is a <strong>client</strong>, not a listener: it talks to any OxiDB server over the native protocol, changes nothing on the server side, and works against deployments you already have running. It is a separate process the AI host starts and stops, so an instance with no assistant attached pays nothing for it.</p>
     <p>The design decisions &mdash; and what was deliberately left out &mdash; are recorded in ADR-0024 in the repository. Not in this version: MCP resources and prompts (tools only), realtime subscriptions, and the remote HTTP transport; each is refused by name rather than silently ignored.</p>
