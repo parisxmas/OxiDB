@@ -18,7 +18,7 @@
 
 | Directory | What lives there |
 |---|---|
-| `src/` + `oxidb-*/`, `oxipool/`, `oxibase/` | The Rust workspace: core engine, server, SQL/TSDB engines, CLI, pooler, FFI, WASM, control plane |
+| `src/` + `oxidb-*/`, `oxipool/`, `oxibase/` | The Rust workspace: core engine, server, SQL/TSDB engines, CLI, pooler, FFI, WASM, MCP server, control plane |
 | [`clients/`](clients/) | Language SDKs — Python (+embedded), Go, .NET, JS/TS, Java, Julia, Swift, Android, and the OxiBase JS/Dart SDKs |
 | [`apps/`](apps/) | Tools — OxiDB Studio (Tauri), the VS Code extension, the OxiBase dashboard |
 | [`examples/`](examples/) | Runnable demos and showcase apps — per-language samples, the FTS demo, the geo globe, ColdChain, the bug tracker, cluster drills |

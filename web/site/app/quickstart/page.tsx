@@ -19,30 +19,30 @@ export default function Page() {
     <p>Pre-built static binaries — no runtime, no installer, no dependencies. Pick your platform:</p>
 
     <h4>Linux (x86_64)</h4>
-    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-linux-amd64.tar.gz
-tar xzf oxidb-server-v0.42.6-linux-amd64.tar.gz
+    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.42.7/oxidb-server-v0.42.7-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.42.7-linux-amd64.tar.gz
 sudo mv oxidb-server /usr/local/bin/
 oxidb-server --version</code></pre>
 
     <h4>Linux (ARM64)</h4>
-    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-linux-arm64.tar.gz
-tar xzf oxidb-server-v0.42.6-linux-arm64.tar.gz
+    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.42.7/oxidb-server-v0.42.7-linux-arm64.tar.gz
+tar xzf oxidb-server-v0.42.7-linux-arm64.tar.gz
 sudo mv oxidb-server /usr/local/bin/</code></pre>
 
     <h4>macOS (Apple Silicon / Intel)</h4>
     <pre><code class="lang-bash"><span class="co"># Apple Silicon</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.42.6-darwin-arm64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.42.7/oxidb-server-v0.42.7-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.42.7-darwin-arm64.tar.gz
 
 <span class="co"># Intel</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-darwin-amd64.tar.gz
-tar xzf oxidb-server-v0.42.6-darwin-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.42.7/oxidb-server-v0.42.7-darwin-amd64.tar.gz
+tar xzf oxidb-server-v0.42.7-darwin-amd64.tar.gz
 
 sudo mv oxidb-server /usr/local/bin/</code></pre>
 
     <h4>Windows (x86_64)</h4>
     <pre><code class="lang-bash"><span class="co"># PowerShell</span>
-Invoke-WebRequest -Uri https://oxidb.baltavista.com/releases/v0.42.6/oxidb-server-v0.42.6-windows-amd64.zip -OutFile oxidb-server.zip
+Invoke-WebRequest -Uri https://oxidb.baltavista.com/releases/v0.42.7/oxidb-server-v0.42.7-windows-amd64.zip -OutFile oxidb-server.zip
 Expand-Archive oxidb-server.zip -DestinationPath .
 .\\oxidb-server.exe --version</code></pre>
 
@@ -84,8 +84,8 @@ oxidb-server</code></pre>
 
     <h3>3. Install the CLI &amp; run your first query</h3>
     <pre><code class="lang-bash"><span class="co"># Linux example — pick the matching CLI archive from /downloads/ for your OS</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.42.6/oxidb-v0.42.6-linux-amd64.tar.gz
-tar xzf oxidb-v0.42.6-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.42.7/oxidb-v0.42.7-linux-amd64.tar.gz
+tar xzf oxidb-v0.42.7-linux-amd64.tar.gz
 sudo mv oxidb /usr/local/bin/
 
 <span class="co"># Open the REPL against the running server</span>
@@ -194,7 +194,7 @@ db.insert(<span class="str">"users"</span>, {<span class="str">"name"</span>: <s
     <h4>WebAssembly (browser)</h4>
     <p>Run the full engine in the browser — in-memory, no server. See <a href="/wasm/">WebAssembly</a>.</p>
 
-    <h3>Production: 3-node Raft cluster <span class="version-badge latest">v0.42.6</span></h3>
+    <h3>Production: 3-node Raft cluster <span class="version-badge latest">v0.42.7</span></h3>
     <p>Each node sets a unique <code>OXIDB_NODE_ID</code> and the same <code>OXIDB_RAFT_PEERS</code> list. After all three are up, bootstrap once via the leader candidate. Raft state is persisted to disk, so nodes survive container restarts.</p>
     <pre><code class="lang-bash"><span class="co"># node 1 — initial leader candidate</span>
 OXIDB_NODE_ID=1 OXIDB_RAFT_ADDR=0.0.0.0:5000 \\

@@ -34,7 +34,46 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
+const HELP: &str = "\
+oxidb-mcp — MCP (Model Context Protocol) server for OxiDB
+
+An MCP host (Claude Code, Claude Desktop, Cursor, …) launches this and speaks
+JSON-RPC over stdin/stdout. Running it by hand does nothing visible: it waits
+for a host to talk to it.
+
+  claude mcp add oxidb -e OXIDB_ADDR=127.0.0.1:4444 -- oxidb-mcp
+
+Environment:
+  OXIDB_ADDR         server to connect to (default 127.0.0.1:4444)
+  OXIDB_USER         SCRAM username — a Read-role account keeps it read-only
+  OXIDB_PASSWORD     SCRAM password
+  OXIDB_MCP_DB       pin every call to one database
+  OXIDB_MCP_WRITES   1 to offer the write tools (off by default)
+
+Options:
+  -V, --version      print the version and exit
+  -h, --help         print this help and exit";
+
 fn main() {
+    // A release binary people download: answer the two flags they will try
+    // before the stdin loop, which otherwise looks like a hang.
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("oxidb-mcp {SERVER_VERSION}");
+                return;
+            }
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return;
+            }
+            other => {
+                eprintln!("oxidb-mcp: unknown argument {other:?} (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let addr = std::env::var("OXIDB_ADDR").unwrap_or_else(|_| "127.0.0.1:4444".into());
     let user = std::env::var("OXIDB_USER").ok().filter(|s| !s.is_empty());
     let password = std::env::var("OXIDB_PASSWORD")

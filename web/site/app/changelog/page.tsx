@@ -11,12 +11,30 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.42.7 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.42.7</h3>
+        <span class="version-date">2026-08-05</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; MCP server (<code>oxidb-mcp</code>)</h4>
+        <ul>
+          <li><strong>An AI assistant can now query OxiDB directly.</strong> <code>oxidb-mcp</code> is a new binary speaking the <strong>Model Context Protocol</strong> &mdash; the standard Claude Code, Claude Desktop, Cursor and the other agentic editors use to reach external tools. Point a host at it and the model can orient itself in a database and answer questions about the data without anything being copy-pasted into a prompt.</li>
+          <li><strong>All three engines, plus full-text search.</strong> Orientation (<code>list_databases</code>, <code>list_collections</code> with counts, <code>list_tables</code>, <code>describe_table</code>, <code>list_indexes</code> for documents or SQL), document queries (<code>find</code>, <code>count</code>, <code>aggregate</code>), <code>sql_query</code>, <code>tsdb_query</code> and <code>text_search</code>. <strong><code>explain</code> is a tool of its own</strong>, so the model can read the plan behind a slow query and fix it rather than guess.</li>
+          <li><strong>Read-only by default, and the gate that matters is the server&rsquo;s.</strong> The write tools are not registered at all without <code>OXIDB_MCP_WRITES=1</code> &mdash; a model cannot call a tool it was never offered &mdash; and the documented setup gives the assistant a <strong>Read-role account</strong>, so writes are refused by RBAC no matter what the tool layer asks for. That matters because anything read out of a database enters the model&rsquo;s context: a hostile document that talks a model into writing has nothing to write with.</li>
+          <li><strong>Results are budgeted for a context window, and truncation is stated.</strong> A read returns 50 rows by default and 500 at most; when a result is trimmed it says so and reports the true total from an index-only count. A silent cap would read as &ldquo;that was everything&rdquo;.</li>
+          <li><strong>Nothing in the server changed.</strong> It is a standalone client binary over the native OxiWire protocol &mdash; two dependencies, no engine code &mdash; so it works against any existing deployment. Setup and the security model: <a href="/mcp/">MCP server docs</a>.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.42.6 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.42.6</h3>
         <span class="version-date">2026-08-02</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; geospatial queries (document engine)</h4>
