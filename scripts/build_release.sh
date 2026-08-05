@@ -6,6 +6,8 @@
 #   <binary>-<linux-x86_64|linux-arm64|macos-x86_64|macos-arm64|windows-x86_64>.{tar.gz,zip}  (versionless aliases)
 #   oxidb-wasm-v$VERSION.tar.gz + oxidb-wasm.tar.gz
 #   SHA256SUMS.txt
+#
+# 4 binaries × 5 platforms × 2 (versioned + alias) + 2 WASM + SHA256SUMS = 43 assets.
 
 set -euo pipefail
 
@@ -36,6 +38,7 @@ declare -a BINS=(
   "oxidb-server:oxidb-server:--features cluster"
   "oxidb-cli:oxidb:"
   "oxipool:oxipool:"
+  "oxidb-mcp:oxidb-mcp:"
 )
 
 # ─── 1. cross-compile ───────────────────────────────────────────────
