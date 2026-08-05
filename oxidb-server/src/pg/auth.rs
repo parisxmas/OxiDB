@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 
 use super::errors::{PgError, SQLSTATE_INVALID_AUTHORIZATION, SQLSTATE_INVALID_PASSWORD};
-use super::wire::{self, Conn, Reader, F_PASSWORD};
+use super::wire::{self, Conn, F_PASSWORD, Reader};
 use crate::auth::{Role, UserStore};
 use crate::scram::ScramState;
 
@@ -152,7 +152,11 @@ fn cleartext<S: Read + Write>(
         )));
     }
     let password = Reader::new(&msg.body).cstring().map_err(io_err)?;
-    let ok = store.lock().unwrap().authenticate(user, &password).is_some();
+    let ok = store
+        .lock()
+        .unwrap()
+        .authenticate(user, &password)
+        .is_some();
     if !ok {
         return Err(auth_failed(format!(
             "password authentication failed for user \"{user}\""

@@ -101,7 +101,10 @@ impl MsgpackLogger {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let mut m = serde_json::Map::with_capacity(extra.len() + 4);
-        m.insert("host".into(), serde_json::Value::String(self.hostname.clone()));
+        m.insert(
+            "host".into(),
+            serde_json::Value::String(self.hostname.clone()),
+        );
         m.insert(
             "short_message".into(),
             serde_json::Value::String(short_message.to_string()),

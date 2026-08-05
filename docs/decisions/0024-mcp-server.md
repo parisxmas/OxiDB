@@ -186,13 +186,64 @@ TSDB, FTS, an explain-guided index fix — plus an offline test that speaks
 stdio JSON-RPC directly and pins the handshake, the tool schemas, the
 truncation notice, and that no write tool appears without the flag.
 
-**Phase 2 — hosted OxiBase endpoints** (separate work, same crate): a
-streamable-HTTP mode serving one MCP endpoint per OxiBase project,
-authenticated with the project's existing keys — anon key honouring rules
-exactly as `/rest/v1` does, service key bypassing them, the same two-secret
-boundary as ADR-0021. "Point Claude at your OxiBase project" is the strategic
-version of this feature; it is deferred only because stdio proves the tool set
-first.
+## Phase 2 — the hosted HTTP endpoint (landed 2026-08-05)
+
+A second transport in the same crate: `POST /mcp/<project-ref>` with the
+project's own key as a bearer token, selected by `OXIDB_MCP_HTTP_PORT`.
+"Point Claude at your OxiBase project" with nothing installed locally.
+
+**It backs onto the REST surface, not OxiWire — and that is the whole design.**
+An OxiBase project authenticates with a per-project JWT, and the component that
+verifies those keys, applies the project's row-level rules, and enforces its
+per-project rate limit is the REST listener (ADR-0019/0020). Reaching the
+engine over OxiWire instead would mean re-implementing all three here, holding
+a copy of the seal key. So the hosted mode **forwards the caller's key
+untouched** and inherits the gate that already exists. Nothing in `http.rs` or
+`rest_wire.rs` decides who may read what; they translate shapes.
+
+Two properties follow, and both are pinned by tests:
+
+- **Every request is independent.** The ref comes from the path, the key from
+  the header, and both build a `RestWire` for that one request. No session
+  table, no cached credential — there is no state in which one tenant's key
+  could be applied to another tenant's database.
+- **The `Wire` trait, introduced to make the tools testable, turned out to be
+  the seam for the second transport.** The tool logic, the truncation
+  accounting and the write gating are byte-for-byte the same on both.
+
+`explain` is refused by name here: it is a wire diagnostic with no REST
+equivalent, and a 404 from a path that never existed is a worse answer.
+
+**This work found two real holes in the read path** — both in shipped code,
+neither reachable from the MCP layer's own logic, both fixed with red-first
+regression tests (0.42.8):
+
+1. **`GET /api/{col}/count` never consulted the read rule.** A collection with
+   `read: false` answered `find` with 403 and `count` with the number anyway.
+   Because count takes an arbitrary `?q=`, this was not a cardinality leak but
+   an **arbitrary-predicate disclosure oracle**: `count?q={"email":"…"}` is an
+   existence check, and `$gte` binary-searches a numeric field, all without
+   ever being allowed to see a document. Same class as the `aggregate` gap
+   closed in 0.39.21; this path was missed in that pass. A row-level rule is
+   now *filtered* rather than refused — unlike `aggregate`, a count over the
+   visible subset is exact, so refusing it would be gratuitous.
+2. **Numeric rule comparisons compared JSON representations.** A rule literal
+   parses with `parse::<f64>()`, so `1` in a rule is `Number(1.0)`, while a
+   document that stored `1` holds `Number(1)` — and `serde_json::Value`
+   equality calls those different. Every numeric comparison in a security rule
+   was wrong, **in both directions**: `read: "doc.hidden != 1"` matched the
+   drafts too and published them, while `read: "doc.hidden == 0"` — the same
+   intent written the other way — hid everything. The leak direction is the
+   serious one, and it is the one a developer is more likely to write.
+
+Neither was findable by reading the MCP code; both surfaced from asking the
+question *"does a rule actually stop this?"* and running it. That is the same
+lesson as ADR-0023's driver work, in a different costume.
+
+**Still deferred:** SSE streaming (nothing to stream — every tool is
+request/response), MCP sessions (`Mcp-Session-Id`), resources and prompts, and
+serving the endpoint from the `oxibase` control plane rather than beside the
+data plane.
 
 **Deliberately missing in v1** (each refused by name where a host asks):
 MCP resources and prompts (tools only), sampling/elicitation, notifications

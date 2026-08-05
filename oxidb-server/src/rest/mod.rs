@@ -757,7 +757,7 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         }
 
         // Count
-        ("GET", ["api", col, "count"]) => handle_count(col, req, state),
+        ("GET", ["api", col, "count"]) => handle_count_with_rules(col, req, state, &auth_ctx),
 
         // Aggregation
         ("POST", ["api", col, "aggregate"]) => handle_aggregate(col, req, state, &auth_ctx),
@@ -1447,6 +1447,42 @@ fn handle_find_with_rules(
                 arr.retain(|d| rules::row_visible(&expr, auth, d));
             }
             Ok(v)
+        }
+    }
+}
+
+/// `GET /api/{col}/count` under the read rule.
+///
+/// Counting was the one read path that never consulted the rules, which made
+/// it a **disclosure oracle**: a collection with `read: false` answered
+/// `find` with 403 and `count` with the number anyway, and because the count
+/// takes an arbitrary `?q=` filter, a caller could ask
+/// `count?q={"email":"someone@example.com"}` — or binary-search a numeric
+/// field with `$gte` — and read out values one bit at a time without ever
+/// being allowed to see a document. Same class as the `aggregate` gap closed
+/// in 0.39.21; this path was missed in that pass.
+///
+/// A row-level rule is *filtered* rather than refused, matching `find`: the
+/// answer is the number of rows this caller may see. That is honest and leaks
+/// nothing — unlike `aggregate`, a count can be computed over the visible
+/// subset, so there is no reason to refuse it.
+fn handle_count_with_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
+    match rules::read_access(&state.db, col, auth) {
+        rules::ReadAccess::None => Err((403, "access denied")),
+        rules::ReadAccess::All => handle_count(col, req, state),
+        rules::ReadAccess::Filter(expr) => {
+            let query = query_param_json(&req.query, "q").unwrap_or(json!({}));
+            let docs = state.db.find(col, &query).map_err(db_err)?;
+            let n = docs
+                .iter()
+                .filter(|d| rules::row_visible(&expr, auth, d))
+                .count();
+            Ok(json!({ "count": n }))
         }
     }
 }

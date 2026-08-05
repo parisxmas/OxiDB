@@ -131,11 +131,11 @@ impl Metrics {
             "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => &self.oximem_tx,
             "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "GETSET" | "GETDEL" | "SETRANGE"
             | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "DEL"
-            | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "RENAME"
-            | "COPY" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
-            | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "SADD" | "SREM" | "SINTERSTORE"
-            | "SUNIONSTORE" | "SDIFFSTORE" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN"
-            | "ZPOPMAX" | "BZPOPMIN" | "FLUSHALL" | "FLUSHDB" => &self.oximem_writes,
+            | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "RENAME" | "COPY"
+            | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
+            | "RPOP" | "BLPOP" | "BRPOP" | "SADD" | "SREM" | "SINTERSTORE" | "SUNIONSTORE"
+            | "SDIFFSTORE" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "BZPOPMIN"
+            | "FLUSHALL" | "FLUSHDB" => &self.oximem_writes,
             _ => &self.oximem_other,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -144,7 +144,9 @@ impl Metrics {
 
 /// Escape a Prometheus label value: backslash, double quote, newline.
 fn escape_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn counter(out: &mut String, name: &str, help: &str, v: u64) {
@@ -275,16 +277,21 @@ pub fn render_prometheus(db: &Arc<OxiDb>) -> String {
         let mut cum = 0u64;
         for (le, v) in b {
             cum += v;
-            out.push_str(&format!("oximem_command_duration_seconds_bucket{{le=\"{le}\"}} {cum}\n"));
+            out.push_str(&format!(
+                "oximem_command_duration_seconds_bucket{{le=\"{le}\"}} {cum}\n"
+            ));
         }
         cum += inf;
-        out.push_str(&format!("oximem_command_duration_seconds_bucket{{le=\"+Inf\"}} {cum}\n"));
-        out.push_str(&format!("oximem_command_duration_seconds_sum {}\n", m.oximem_lat_sum_us.load(Ordering::Relaxed) as f64 / 1e6));
+        out.push_str(&format!(
+            "oximem_command_duration_seconds_bucket{{le=\"+Inf\"}} {cum}\n"
+        ));
+        out.push_str(&format!(
+            "oximem_command_duration_seconds_sum {}\n",
+            m.oximem_lat_sum_us.load(Ordering::Relaxed) as f64 / 1e6
+        ));
         out.push_str(&format!("oximem_command_duration_seconds_count {cum}\n"));
     }
-    out.push_str(
-        "# HELP oximem_keys OxiMem live keys by type.\n# TYPE oximem_keys gauge\n",
-    );
+    out.push_str("# HELP oximem_keys OxiMem live keys by type.\n# TYPE oximem_keys gauge\n");
     for (t, v) in [
         ("string", m.oximem_keys_strings.load(Ordering::Relaxed)),
         ("hash", m.oximem_keys_hashes.load(Ordering::Relaxed)),

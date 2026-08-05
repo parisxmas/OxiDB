@@ -56,22 +56,47 @@ Options:
 
 fn main() {
     // A release binary people download: answer the two flags they will try
-    // before the stdin loop, which otherwise looks like a hang.
-    for arg in std::env::args().skip(1) {
+    // before the stdin loop, which otherwise looks like a hang. Everything
+    // else is configured by environment, so one argument is the whole grammar.
+    if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
-            "-V" | "--version" => {
-                println!("oxidb-mcp {SERVER_VERSION}");
-                return;
-            }
-            "-h" | "--help" => {
-                println!("{HELP}");
-                return;
-            }
+            "-V" | "--version" => println!("oxidb-mcp {SERVER_VERSION}"),
+            "-h" | "--help" => println!("{HELP}"),
             other => {
                 eprintln!("oxidb-mcp: unknown argument {other:?} (try --help)");
                 std::process::exit(2);
             }
         }
+        return;
+    }
+
+    // HTTP mode (ADR-0024 Phase 2): serve many callers over one port instead
+    // of being spawned per host. Selected by the port being set, because the
+    // two modes cannot share a process — stdio owns stdin/stdout.
+    if let Some(port) = std::env::var("OXIDB_MCP_HTTP_PORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let bind = if port.contains(':') {
+            port
+        } else {
+            format!("0.0.0.0:{port}")
+        };
+        let config = oxidb_mcp::http::HttpConfig {
+            upstream: std::env::var("OXIDB_MCP_UPSTREAM")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+            allow_writes: env_flag("OXIDB_MCP_WRITES"),
+            fixed_db: std::env::var("OXIDB_MCP_DB").ok().filter(|s| !s.is_empty()),
+        };
+        let pool = std::env::var("OXIDB_MCP_POOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        if let Err(e) = oxidb_mcp::http::serve(&bind, pool, config) {
+            eprintln!("oxidb-mcp: cannot serve on {bind}: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let addr = std::env::var("OXIDB_ADDR").unwrap_or_else(|_| "127.0.0.1:4444".into());

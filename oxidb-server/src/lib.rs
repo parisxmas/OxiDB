@@ -4,16 +4,16 @@ pub mod amqp_wire;
 pub mod audit;
 pub mod auth;
 pub mod db_admin;
-pub mod doc_engine;
 pub mod disk_usage;
+pub mod doc_engine;
 pub mod fdw;
 pub mod gelf;
 pub mod gelf_ingest;
-pub mod msgpack_ingest;
 pub mod handler;
 pub mod hello;
 pub mod mqtt;
 pub mod mqtt_session;
+pub mod msgpack_ingest;
 pub mod oximem;
 pub mod oxiwire;
 pub mod pg;
@@ -31,11 +31,11 @@ pub mod udp_ingest;
 
 pub mod jwt;
 pub mod metrics;
-pub mod tenant_auth;
 pub mod proc_stats;
 pub mod profiler;
 pub mod rest;
 pub mod rules;
+pub mod tenant_auth;
 pub mod ws;
 
 #[cfg(feature = "s3")]

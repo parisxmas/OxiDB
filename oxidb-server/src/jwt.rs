@@ -342,7 +342,8 @@ mod tests {
         let pubkey = point.as_bytes();
 
         let header = b64url_encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-        let payload = b64url_encode(br#"{"sub":"read@proj","role":"read","iat":1,"exp":9999999999}"#);
+        let payload =
+            b64url_encode(br#"{"sub":"read@proj","role":"read","iat":1,"exp":9999999999}"#);
         let signing_input = format!("{header}.{payload}");
         let sig: Signature = sk.sign(signing_input.as_bytes());
         let sig_b = sig.to_bytes();

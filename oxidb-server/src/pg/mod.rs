@@ -133,7 +133,11 @@ fn serve_after_startup<S: Read + Write>(
     };
     let user = get("user").unwrap_or_default();
     if user.is_empty() {
-        fatal(&mut conn, errors::SQLSTATE_INVALID_AUTHORIZATION, "no user name was supplied");
+        fatal(
+            &mut conn,
+            errors::SQLSTATE_INVALID_AUTHORIZATION,
+            "no user name was supplied",
+        );
         return;
     }
     // PostgreSQL defaults the database to the user name; OxiDB's default
@@ -184,7 +188,10 @@ fn serve_after_startup<S: Read + Write>(
         return;
     }
 
-    eprintln!("[pg] {peer} connected as {user:?} to {database:?} (role {})", role.as_str());
+    eprintln!(
+        "[pg] {peer} connected as {user:?} to {database:?} (role {})",
+        role.as_str()
+    );
     let result = message_loop(&mut conn, &mut sess);
     sess.close();
     if let Err(e) = result
@@ -200,10 +207,7 @@ fn fatal<S: Read + Write>(conn: &mut Conn<S>, code: &str, message: &str) {
 }
 
 /// The main loop: one frontend message at a time until Terminate or EOF.
-fn message_loop<S: Read + Write>(
-    conn: &mut Conn<S>,
-    sess: &mut PgSession,
-) -> std::io::Result<()> {
+fn message_loop<S: Read + Write>(conn: &mut Conn<S>, sess: &mut PgSession) -> std::io::Result<()> {
     // The extended protocol's error rule: after an error the server discards
     // every message until the next Sync, so a client that pipelined a whole
     // batch is not answered statement by statement for work it abandoned.
@@ -384,11 +388,9 @@ fn bind<S: Read + Write>(
     let portal_name = r.cstring().map_err(protocol)?;
     let stmt_name = r.cstring().map_err(protocol)?;
 
-    let stmt = sess
-        .prepared
-        .get(&stmt_name)
-        .cloned()
-        .ok_or_else(|| PgError::protocol(format!("prepared statement {stmt_name:?} does not exist")))?;
+    let stmt = sess.prepared.get(&stmt_name).cloned().ok_or_else(|| {
+        PgError::protocol(format!("prepared statement {stmt_name:?} does not exist"))
+    })?;
 
     // Parameter formats, then the parameters themselves, then result formats.
     let fmt_count = r.i16().map_err(protocol)?;
@@ -446,7 +448,13 @@ fn describe<S: Read + Write>(
             let oids: Vec<i32> = stmt
                 .param_oids
                 .iter()
-                .map(|o| if *o == types::OID_UNSPECIFIED { types::OID_TEXT } else { *o })
+                .map(|o| {
+                    if *o == types::OID_UNSPECIFIED {
+                        types::OID_TEXT
+                    } else {
+                        *o
+                    }
+                })
                 .collect();
             wire::parameter_description(conn.w(), &oids).map_err(protocol)?;
             // Column types are only knowable by running the statement, which

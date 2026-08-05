@@ -71,15 +71,14 @@ fn ping_ok(port: u16) -> bool {
     let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return false;
     };
-    if stream.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .is_err()
+    {
         return false;
     }
     let mut conn = BufReader::new(stream);
-    if conn
-        .get_mut()
-        .write_all(b"*1\r\n$4\r\nPING\r\n")
-        .is_err()
-    {
+    if conn.get_mut().write_all(b"*1\r\n$4\r\nPING\r\n").is_err() {
         return false;
     }
     let mut line = String::new();
@@ -291,12 +290,18 @@ fn wire_execabort_on_unknown_command() {
 fn wire_eval_roundtrip() {
     let srv = spawn_server();
     let mut c = connect(srv.oximem_port);
-    assert_eq!(cmd(&mut c, &["SET", "bal", "100"]), Reply::Simple("OK".into()));
+    assert_eq!(
+        cmd(&mut c, &["SET", "bal", "100"]),
+        Reply::Simple("OK".into())
+    );
     let script = "local b = tonumber(redis.call('GET', KEYS[1])) \
                   if b >= tonumber(ARGV[1]) then \
                     redis.call('INCRBYFLOAT', KEYS[1], '-' .. ARGV[1]) return 1 \
                   end return 0";
-    assert_eq!(cmd(&mut c, &["EVAL", script, "1", "bal", "30"]), Reply::Int(1));
+    assert_eq!(
+        cmd(&mut c, &["EVAL", script, "1", "bal", "30"]),
+        Reply::Int(1)
+    );
     assert_eq!(cmd(&mut c, &["GET", "bal"]), Reply::Bulk("70".into()));
 }
 
@@ -311,7 +316,10 @@ fn wire_psubscribe_pmessage() {
         o => panic!("{o:?}"),
     }
     let mut publ = connect(srv.oximem_port);
-    assert_eq!(cmd(&mut publ, &["PUBLISH", "news.tech", "hi"]), Reply::Int(1));
+    assert_eq!(
+        cmd(&mut publ, &["PUBLISH", "news.tech", "hi"]),
+        Reply::Int(1)
+    );
     match read_reply(&mut sub) {
         Reply::Array(v) => {
             assert_eq!(v[0], Reply::Bulk("pmessage".into()));

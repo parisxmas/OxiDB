@@ -185,7 +185,8 @@ impl Msg {
 impl Client {
     fn connect(port: u16, params: &[(&str, &str)]) -> Client {
         let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut c = Client { sock };
         let mut body = 196_608i32.to_be_bytes().to_vec();
         for (k, v) in params {
@@ -330,7 +331,8 @@ fn a_startup_without_a_user_is_refused() {
 fn ssl_is_declined_when_no_certificate_is_configured() {
     let g = spawn();
     let mut sock = TcpStream::connect(("127.0.0.1", g.port)).unwrap();
-    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     // SSLRequest: length 8, magic 80877103.
     let mut req = 8i32.to_be_bytes().to_vec();
     req.extend_from_slice(&80_877_103i32.to_be_bytes());
@@ -516,13 +518,19 @@ fn the_transaction_status_byte_tracks_the_session() {
     assert_eq!(tx_status(&c.query("BEGIN")), b'T', "in a transaction");
     assert_eq!(tx_status(&c.query("INSERT INTO t VALUES (1)")), b'T');
     assert_eq!(tx_status(&c.query("COMMIT")), b'I', "back to idle");
-    assert_eq!(rows(&c.query("SELECT COUNT(*) FROM t"))[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        rows(&c.query("SELECT COUNT(*) FROM t"))[0][0].as_deref(),
+        Some("1")
+    );
 
     // A rollback discards the work.
     c.query("BEGIN");
     c.query("INSERT INTO t VALUES (2)");
     assert_eq!(tx_status(&c.query("ROLLBACK")), b'I');
-    assert_eq!(rows(&c.query("SELECT COUNT(*) FROM t"))[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        rows(&c.query("SELECT COUNT(*) FROM t"))[0][0].as_deref(),
+        Some("1")
+    );
 }
 
 #[test]
@@ -650,7 +658,10 @@ fn psql_dt_is_answered_from_the_engine_catalog() {
          FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind IN ('r','p')",
     );
-    let names: Vec<String> = rows(&msgs).into_iter().filter_map(|r| r[1].clone()).collect();
+    let names: Vec<String> = rows(&msgs)
+        .into_iter()
+        .filter_map(|r| r[1].clone())
+        .collect();
     assert!(names.contains(&"giraffe".to_string()), "{names:?}");
 }
 
@@ -745,7 +756,8 @@ fn the_type_catalog_answers_what_drivers_load_on_connect() {
     assert_eq!(rows(&msgs).len(), 0);
     assert_eq!(command_tags(&msgs), vec!["SELECT 0"]);
 
-    let msgs = c.query("SELECT pg_type.oid, enumlabel FROM pg_enum JOIN pg_type ON pg_type.oid=enumtypid");
+    let msgs =
+        c.query("SELECT pg_type.oid, enumlabel FROM pg_enum JOIN pg_type ON pg_type.oid=enumtypid");
     assert_eq!(rows(&msgs).len(), 0);
 }
 
@@ -757,11 +769,7 @@ fn row_map(msgs: &[Msg], row: usize) -> std::collections::HashMap<String, Option
         .expect("RowDescription")
         .fields();
     let cells = rows(msgs).remove(row);
-    fields
-        .into_iter()
-        .map(|(n, _)| n)
-        .zip(cells)
-        .collect()
+    fields.into_iter().map(|(n, _)| n).zip(cells).collect()
 }
 
 #[test]
@@ -770,7 +778,9 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
     let mut c = Client::connect(g.port, &[("user", "admin")]);
     c.handshake();
     c.query("CREATE TABLE parent (id INT PRIMARY KEY, label TEXT)");
-    c.query("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id), note VARCHAR(50))");
+    c.query(
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id), note VARCHAR(50))",
+    );
     c.query("CREATE TABLE enrol (a INT, b TEXT, CONSTRAINT pk PRIMARY KEY (a, b))");
     c.query("CREATE INDEX idx_note ON child (note)");
 
@@ -780,7 +790,10 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
          '' AS SELF_REFERENCING_COL_NAME FROM pg_catalog.pg_class c \
          WHERE c.relname LIKE '%' AND ( c.relkind = 'r' )",
     );
-    let names: Vec<String> = rows(&msgs).into_iter().filter_map(|r| r[2].clone()).collect();
+    let names: Vec<String> = rows(&msgs)
+        .into_iter()
+        .filter_map(|r| r[2].clone())
+        .collect();
     assert!(names.contains(&"parent".to_string()), "{names:?}");
     assert!(names.contains(&"child".to_string()), "{names:?}");
     // ...and the name pattern is honoured, not ignored.
@@ -811,7 +824,11 @@ fn jdbc_metadata_reports_the_engines_own_schema() {
     );
     let note = row_map(&msgs, 0);
     assert_eq!(note["atttypid"].as_deref(), Some("1043"), "varchar");
-    assert_eq!(note["atttypmod"].as_deref(), Some("54"), "50 + varlena header");
+    assert_eq!(
+        note["atttypmod"].as_deref(),
+        Some("54"),
+        "50 + varlena header"
+    );
 
     // A `BIGINT` column keeps int8, and an out-of-range write is refused with
     // the SQLSTATE a client recovers from.
@@ -997,11 +1014,7 @@ fn session_functions_resolve_in_any_combination() {
     assert!(r[2].as_ref().unwrap().contains("OxiDB"));
     // An alias is honoured.
     let msgs = c.query("SELECT current_schema() AS sch");
-    let fields = msgs
-        .iter()
-        .find(|m| m.tag == b'T')
-        .unwrap()
-        .fields();
+    let fields = msgs.iter().find(|m| m.tag == b'T').unwrap().fields();
     assert_eq!(fields[0].0, "sch");
     // A select that is not all session functions still reaches the engine.
     c.query("CREATE TABLE t (id INT PRIMARY KEY)");
@@ -1036,7 +1049,10 @@ fn a_catalog_query_is_never_answered_in_another_ones_shape() {
         .map(|(n, _)| n)
         .collect();
     assert!(fields.contains(&"index_name".to_string()), "{fields:?}");
-    assert!(!fields.contains(&"Name".to_string()), "that is the \\dt shape");
+    assert!(
+        !fields.contains(&"Name".to_string()),
+        "that is the \\dt shape"
+    );
 
     // A type query must not come back as the table list either.
     let msgs = c.query(
@@ -1083,7 +1099,11 @@ fn per_table_introspection_is_still_refused_not_answered_empty() {
          WHERE c.relkind in ('r','p','v','f','m') AND c.relname LIKE 'jt') c",
     ));
     assert_eq!(e.field(b'C').as_deref(), Some("0A000"));
-    assert!(e.field(b'M').unwrap().contains("DESCRIBE"), "{:?}", e.field(b'M'));
+    assert!(
+        e.field(b'M').unwrap().contains("DESCRIBE"),
+        "{:?}",
+        e.field(b'M')
+    );
 }
 
 #[test]
@@ -1101,7 +1121,11 @@ fn psql_backslash_d_on_one_table_is_refused_rather_than_mis_shaped() {
          WHERE c.relname OPERATOR(pg_catalog.~) '^(demo)$'",
     ));
     assert_eq!(e.field(b'C').as_deref(), Some("0A000"));
-    assert!(e.field(b'M').unwrap().contains("DESCRIBE"), "{:?}", e.field(b'M'));
+    assert!(
+        e.field(b'M').unwrap().contains("DESCRIBE"),
+        "{:?}",
+        e.field(b'M')
+    );
 }
 
 #[test]
@@ -1120,7 +1144,10 @@ fn an_unimplemented_catalog_query_is_refused_by_name() {
         let e = error(&c.query(sql));
         assert_eq!(e.field(b'C').as_deref(), Some("0A000"), "for {sql}");
         let m = e.field(b'M').unwrap();
-        assert!(m.contains("system catalogs") && m.contains("SHOW TABLES"), "{m}");
+        assert!(
+            m.contains("system catalogs") && m.contains("SHOW TABLES"),
+            "{m}"
+        );
     }
 }
 
@@ -1223,7 +1250,10 @@ fn describe_reports_the_parameters_it_was_given() {
     c.parse("s1", "SELECT $1", &[20]);
     c.describe(b'S', "s1");
     let msgs = c.sync();
-    let pd = msgs.iter().find(|m| m.tag == b't').expect("ParameterDescription");
+    let pd = msgs
+        .iter()
+        .find(|m| m.tag == b't')
+        .expect("ParameterDescription");
     assert_eq!(i16::from_be_bytes([pd.body[0], pd.body[1]]), 1);
     assert_eq!(
         i32::from_be_bytes([pd.body[2], pd.body[3], pd.body[4], pd.body[5]]),
@@ -1276,7 +1306,10 @@ fn a_row_limit_suspends_the_portal_and_resumes() {
     // Resuming returns the rest and finishes.
     c.execute_portal("p", 0);
     let msgs = c.sync();
-    let rest: Vec<String> = rows(&msgs).into_iter().filter_map(|r| r[0].clone()).collect();
+    let rest: Vec<String> = rows(&msgs)
+        .into_iter()
+        .filter_map(|r| r[0].clone())
+        .collect();
     assert_eq!(rest, vec!["3", "4", "5"]);
 }
 
@@ -1343,7 +1376,11 @@ fn scram_is_offered_and_a_wrong_password_is_refused() {
     {
         let mut store = oxidb_server::auth::UserStore::open(dir.path()).unwrap();
         store
-            .create_user("alice", "s3cret-passphrase", oxidb_server::auth::Role::ReadWrite)
+            .create_user(
+                "alice",
+                "s3cret-passphrase",
+                oxidb_server::auth::Role::ReadWrite,
+            )
             .unwrap();
     }
 
@@ -1407,7 +1444,7 @@ fn scram_is_offered_and_a_wrong_password_is_refused() {
 /// the server's own client-side implementation (`scram_client`) for the proof.
 /// Returns once `ReadyForQuery` has arrived.
 fn scram_login(c: &mut Client, user: &str, password: &str) {
-    use oxidb_server::scram_client::{verify_server_final, ScramClient};
+    use oxidb_server::scram_client::{ScramClient, verify_server_final};
 
     let m = c.read_msg();
     assert_eq!(m.tag, b'R');
@@ -1511,9 +1548,16 @@ fn a_real_scram_login_succeeds_and_the_read_role_may_not_write() {
     // the native port applies to a `read` role.
     let mut r = Client::connect(pg, &[("user", "reader"), ("database", "oxidb")]);
     scram_login(&mut r, "reader", "reader-passphrase");
-    assert_eq!(rows(&r.query("SELECT id FROM t"))[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        rows(&r.query("SELECT id FROM t"))[0][0].as_deref(),
+        Some("1")
+    );
     let e = error(&r.query("INSERT INTO t VALUES (2)"));
-    assert_eq!(e.field(b'C').as_deref(), Some("42501"), "insufficient_privilege");
+    assert_eq!(
+        e.field(b'C').as_deref(),
+        Some("42501"),
+        "insufficient_privilege"
+    );
     let e = error(&r.query("DROP TABLE t"));
     assert_eq!(e.field(b'C').as_deref(), Some("42501"));
 

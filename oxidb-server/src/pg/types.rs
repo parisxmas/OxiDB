@@ -194,8 +194,17 @@ pub fn to_binary(v: &Value, oid: i32) -> Option<Vec<u8>> {
 pub fn can_binary(oid: i32) -> bool {
     matches!(
         oid,
-        OID_BOOL | OID_BYTEA | OID_INT2 | OID_INT4 | OID_INT8 | OID_FLOAT4 | OID_FLOAT8 | OID_TEXT
-            | OID_VARCHAR | OID_TIMESTAMP | OID_TIMESTAMPTZ
+        OID_BOOL
+            | OID_BYTEA
+            | OID_INT2
+            | OID_INT4
+            | OID_INT8
+            | OID_FLOAT4
+            | OID_FLOAT8
+            | OID_TEXT
+            | OID_VARCHAR
+            | OID_TIMESTAMP
+            | OID_TIMESTAMPTZ
     )
 }
 
@@ -303,9 +312,7 @@ fn decode_binary_param(bytes: &[u8], oid: i32) -> Result<Value, String> {
         // int64 microseconds since 2000-01-01T00:00:00 (UTC either way — the
         // engine's timestamps are UTC epoch-ms). div_euclid so pre-2000
         // instants round toward earlier, not toward zero.
-        OID_TIMESTAMP | OID_TIMESTAMPTZ => {
-            Value::Timestamp(int(8)?.div_euclid(1000) + PG_EPOCH_MS)
-        }
+        OID_TIMESTAMP | OID_TIMESTAMPTZ => Value::Timestamp(int(8)?.div_euclid(1000) + PG_EPOCH_MS),
         other => {
             return Err(format!(
                 "binary parameter format for type {} is not supported — send it as text",
@@ -325,7 +332,9 @@ fn parse_bytea(s: &str) -> Result<Vec<u8>, String> {
     }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "invalid bytea hex".to_string()))
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "invalid bytea hex".to_string())
+        })
         .collect()
 }
 
@@ -347,7 +356,11 @@ pub fn parse_timestamp(s: &str) -> Result<i64, String> {
         }
     }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(d.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_millis());
+        return Ok(d
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc()
+            .timestamp_millis());
     }
     Err(format!("invalid timestamp parameter {s:?}"))
 }
@@ -419,7 +432,10 @@ mod tests {
             decode_param(Some(b"true"), OID_BOOL, FORMAT_TEXT).unwrap(),
             Value::Bool(true)
         );
-        assert_eq!(decode_param(None, OID_INT8, FORMAT_TEXT).unwrap(), Value::Null);
+        assert_eq!(
+            decode_param(None, OID_INT8, FORMAT_TEXT).unwrap(),
+            Value::Null
+        );
         assert!(decode_param(Some(b"nope"), OID_INT8, FORMAT_TEXT).is_err());
     }
 

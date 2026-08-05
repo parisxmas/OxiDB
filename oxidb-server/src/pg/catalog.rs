@@ -14,7 +14,7 @@
 use oxidb_sql::{CommandKind, FkAction, SqlType, Value};
 
 use super::errors::{PgError, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_UNDEFINED_OBJECT};
-use super::session::{describe_columns, PgSession, Reply};
+use super::session::{PgSession, Reply, describe_columns};
 use super::types;
 use super::wire::FieldDesc;
 use crate::auth::Role;
@@ -130,14 +130,10 @@ fn setting(session: &PgSession, name: &str) -> Option<String> {
     if let Some(v) = session.settings.get(&lower) {
         return Some(v.clone());
     }
-    defaults(
-        &session.user,
-        session.readonly,
-        session.role == Role::Admin,
-    )
-    .into_iter()
-    .find(|(k, _)| k.to_ascii_lowercase() == lower)
-    .map(|(_, v)| v)
+    defaults(&session.user, session.readonly, session.role == Role::Admin)
+        .into_iter()
+        .find(|(k, _)| k.to_ascii_lowercase() == lower)
+        .map(|(_, v)| v)
 }
 
 /// Handle `sql` here, or hand it on to the engine.
@@ -204,10 +200,16 @@ fn session_command(session: &mut PgSession, norm: &str) -> Result<Vec<Reply>, Pg
         // Accepted and remembered, never rejected: a client that cannot set a
         // parameter usually refuses to proceed at all, and none of these
         // change how the engine executes anything.
-        let rest = rest.trim_start_matches("session ").trim_start_matches("local ");
+        let rest = rest
+            .trim_start_matches("session ")
+            .trim_start_matches("local ");
         if let Some((name, value)) = rest.split_once('=').or_else(|| rest.split_once(" to ")) {
             let name = name.trim().trim_matches('"').to_ascii_lowercase();
-            let value = value.trim().trim_matches('\'').trim_matches('"').to_string();
+            let value = value
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string();
             session.settings.insert(name, value);
         }
         return Ok(vec![Reply::Tag("SET".into())]);
@@ -435,7 +437,9 @@ fn catalog_query(
             .execute("SHOW TABLES")
             .map_err(PgError::from)?
             .first()
-            .is_some_and(|r| matches!(r, oxidb_sql::QueryResult::Select { rows, .. } if !rows.is_empty()));
+            .is_some_and(
+                |r| matches!(r, oxidb_sql::QueryResult::Select { rows, .. } if !rows.is_empty()),
+            );
         return Ok(Some(vec![typed_rows(
             &[("case", types::OID_BOOL)],
             vec![vec![Value::Bool(any)]],
@@ -592,71 +596,67 @@ fn catalog_rows(session: &PgSession, norm: &str, sql: &str) -> Option<Reply> {
     // `pg_description`'s columns and no rows).
     let target = from_table(norm)?;
     let target = target.as_str();
-    let (columns, mut rows): (&[pgc::Col], Vec<Vec<Value>>) =
-        if target.contains("pg_namespace") {
-            (pgc::PG_NAMESPACE, pgc::pg_namespace_rows(owner))
-        } else if target.contains("pg_database") {
-            (
-                pgc::PG_DATABASE,
-                pgc::pg_database_rows(&session.database, owner),
-            )
-        } else if target.contains("pg_settings") {
-            let name = like_pattern(sql, "name")
-                .or_else(|| equals_literal(sql, "name"))
-                .unwrap_or_default();
-            let value = setting(session, &name).unwrap_or_default();
-            (pgc::PG_SETTINGS, vec![pgc::pg_settings_row(&name, &value)])
-        } else if target.contains("pg_enum") {
-            (pgc::PG_ENUM, Vec::new())
-        } else if target.contains("pg_description") && !norm.contains("pg_type") {
-            (pgc::PG_DESCRIPTION, Vec::new())
-        } else if target.contains("pg_type") {
-            (pgc::PG_TYPE, pgc::pg_type_rows(owner))
-        } else if target.contains("pg_attrdef") {
-            (pgc::PG_ATTRDEF, Vec::new())
-        } else if target.contains("pg_attribute") {
-            (pgc::PG_ATTRIBUTE, pgc::pg_attribute_rows(&session.engine))
-        } else if target.contains("pg_constraint") {
-            (
-                pgc::PG_CONSTRAINT,
-                pgc::pg_constraint_rows(&session.engine),
-            )
-        } else if target.contains("pg_index") && !norm.contains("pg_indexes") {
-            (pgc::PG_INDEX, pgc::pg_index_rows(&session.engine))
-        } else if target.contains("pg_proc") {
-            (pgc::PG_PROC, Vec::new())
-        } else if target.contains("pg_roles") || norm.contains("pg_authid") {
-            (
-                pgc::PG_ROLES,
-                pgc::pg_roles_rows(&session.user, session.role == Role::Admin),
-            )
-        } else if target.contains("pg_available_extensions") {
-            (pgc::PG_AVAILABLE_EXTENSIONS, Vec::new())
-        } else if target.contains("pg_extension") {
-            (pgc::PG_EXTENSION, Vec::new())
-        } else if target.contains("pg_trigger") && !norm.contains("pg_event_trigger") {
-            (pgc::PG_TRIGGER, Vec::new())
-        } else if target.contains("pg_event_trigger") {
-            (pgc::PG_EVENT_TRIGGER, Vec::new())
-        } else if target.contains("pg_tablespace") {
-            (pgc::PG_TABLESPACE, Vec::new())
-        } else if target.contains("pg_sequence") {
-            (pgc::PG_SEQUENCE, Vec::new())
-        } else if target.contains("pg_collation") {
-            (pgc::PG_COLLATION, Vec::new())
-        } else if target.contains("pg_publication") {
-            (pgc::PG_PUBLICATION, Vec::new())
-        } else if target.contains("pg_foreign_server") {
-            (pgc::PG_FOREIGN_SERVER, Vec::new())
-        } else if target.contains("pg_inherits") {
-            (pgc::PG_INHERITS, Vec::new())
-        } else if target.contains("pg_am") {
-            (pgc::PG_AM, Vec::new())
-        } else if target.contains("pg_class") {
-            (pgc::PG_CLASS, pgc::pg_class_rows(&session.engine, owner))
-        } else {
-            return None;
-        };
+    let (columns, mut rows): (&[pgc::Col], Vec<Vec<Value>>) = if target.contains("pg_namespace") {
+        (pgc::PG_NAMESPACE, pgc::pg_namespace_rows(owner))
+    } else if target.contains("pg_database") {
+        (
+            pgc::PG_DATABASE,
+            pgc::pg_database_rows(&session.database, owner),
+        )
+    } else if target.contains("pg_settings") {
+        let name = like_pattern(sql, "name")
+            .or_else(|| equals_literal(sql, "name"))
+            .unwrap_or_default();
+        let value = setting(session, &name).unwrap_or_default();
+        (pgc::PG_SETTINGS, vec![pgc::pg_settings_row(&name, &value)])
+    } else if target.contains("pg_enum") {
+        (pgc::PG_ENUM, Vec::new())
+    } else if target.contains("pg_description") && !norm.contains("pg_type") {
+        (pgc::PG_DESCRIPTION, Vec::new())
+    } else if target.contains("pg_type") {
+        (pgc::PG_TYPE, pgc::pg_type_rows(owner))
+    } else if target.contains("pg_attrdef") {
+        (pgc::PG_ATTRDEF, Vec::new())
+    } else if target.contains("pg_attribute") {
+        (pgc::PG_ATTRIBUTE, pgc::pg_attribute_rows(&session.engine))
+    } else if target.contains("pg_constraint") {
+        (pgc::PG_CONSTRAINT, pgc::pg_constraint_rows(&session.engine))
+    } else if target.contains("pg_index") && !norm.contains("pg_indexes") {
+        (pgc::PG_INDEX, pgc::pg_index_rows(&session.engine))
+    } else if target.contains("pg_proc") {
+        (pgc::PG_PROC, Vec::new())
+    } else if target.contains("pg_roles") || norm.contains("pg_authid") {
+        (
+            pgc::PG_ROLES,
+            pgc::pg_roles_rows(&session.user, session.role == Role::Admin),
+        )
+    } else if target.contains("pg_available_extensions") {
+        (pgc::PG_AVAILABLE_EXTENSIONS, Vec::new())
+    } else if target.contains("pg_extension") {
+        (pgc::PG_EXTENSION, Vec::new())
+    } else if target.contains("pg_trigger") && !norm.contains("pg_event_trigger") {
+        (pgc::PG_TRIGGER, Vec::new())
+    } else if target.contains("pg_event_trigger") {
+        (pgc::PG_EVENT_TRIGGER, Vec::new())
+    } else if target.contains("pg_tablespace") {
+        (pgc::PG_TABLESPACE, Vec::new())
+    } else if target.contains("pg_sequence") {
+        (pgc::PG_SEQUENCE, Vec::new())
+    } else if target.contains("pg_collation") {
+        (pgc::PG_COLLATION, Vec::new())
+    } else if target.contains("pg_publication") {
+        (pgc::PG_PUBLICATION, Vec::new())
+    } else if target.contains("pg_foreign_server") {
+        (pgc::PG_FOREIGN_SERVER, Vec::new())
+    } else if target.contains("pg_inherits") {
+        (pgc::PG_INHERITS, Vec::new())
+    } else if target.contains("pg_am") {
+        (pgc::PG_AM, Vec::new())
+    } else if target.contains("pg_class") {
+        (pgc::PG_CLASS, pgc::pg_class_rows(&session.engine, owner))
+    } else {
+        return None;
+    };
 
     if empty_probe {
         rows.clear();
@@ -671,12 +671,10 @@ fn catalog_rows(session: &PgSession, norm: &str, sql: &str) -> Option<Reply> {
 /// opposed to the ones it joins on for descriptions and namespaces.
 fn from_table(norm: &str) -> Option<String> {
     let after = norm.split(" from ").nth(1)?;
-    after
-        .split_whitespace()
-        .find_map(|word| {
-            let name = word.trim_start_matches("pg_catalog.").trim_matches(',');
-            name.starts_with("pg_").then(|| name.to_string())
-        })
+    after.split_whitespace().find_map(|word| {
+        let name = word.trim_start_matches("pg_catalog.").trim_matches(',');
+        name.starts_with("pg_").then(|| name.to_string())
+    })
 }
 
 /// Apply a `relkind` restriction, the one filter these queries genuinely
@@ -709,9 +707,7 @@ fn filter_relkind(norm: &str, columns: &[(&'static str, i32)], rows: &mut Vec<Ve
         };
         // `norm` is lowercased, so a relkind letter's case is not meaningful
         // here; compare case-insensitively.
-        let listed_has = listed
-            .iter()
-            .any(|l| l.eq_ignore_ascii_case(&kind));
+        let listed_has = listed.iter().any(|l| l.eq_ignore_ascii_case(&kind));
         listed_has != negated
     });
 }
@@ -973,10 +969,10 @@ fn jdbc_columns(session: &PgSession, sql: &str) -> Reply {
                 Value::Int(i64::from(types::type_len(oid))),
                 Value::Int(-1), // typtypmod
                 Value::Int(i as i64 + 1),
-                Value::Null, // attidentity — no identity columns
-                Value::Null, // attgenerated — no generated columns
-                Value::Null, // adsrc — defaults are not rendered as SQL text
-                Value::Null, // description — no column comments
+                Value::Null,   // attidentity — no identity columns
+                Value::Null,   // attgenerated — no generated columns
+                Value::Null,   // adsrc — defaults are not rendered as SQL text
+                Value::Null,   // description — no column comments
                 Value::Int(0), // typbasetype — nothing is a domain
                 text("b"),     // typtype — every type here is a base type
             ]);
@@ -1366,7 +1362,9 @@ mod tests {
     #[test]
     fn catalog_tables_are_detected() {
         assert!(mentions_catalog_table("select * from pg_class"));
-        assert!(mentions_catalog_table("select * from information_schema.tables"));
+        assert!(mentions_catalog_table(
+            "select * from information_schema.tables"
+        ));
         assert!(!mentions_catalog_table("select * from users"));
     }
 }

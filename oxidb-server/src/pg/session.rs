@@ -180,12 +180,7 @@ impl PgSession {
         Ok(())
     }
 
-    fn run(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-        formats: &[i16],
-    ) -> Result<Vec<Reply>, PgError> {
+    fn run(&mut self, sql: &str, params: &[Value], formats: &[i16]) -> Result<Vec<Reply>, PgError> {
         if let Some(mut replies) = super::catalog::intercept(self, sql)? {
             // Canned replies are built in text format, but this portal's Bind
             // may have asked for binary — and Npgsql decodes *only* binary

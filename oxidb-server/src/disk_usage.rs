@@ -158,7 +158,10 @@ mod tests {
         let v = snapshot_at(r);
         let e = &v["engines"];
         assert_eq!(e["documents"], 151, "collection data+wal+disk-first files");
-        assert_eq!(e["documents_mmap"], 41, "the mmap'd (.bdat/.bopts) breakdown");
+        assert_eq!(
+            e["documents_mmap"], 41,
+            "the mmap'd (.bdat/.bopts) breakdown"
+        );
         assert_eq!(e["sql"], 230, "both databases' sql dirs");
         assert_eq!(e["tsdb"], 300);
         assert_eq!(e["blobs"], 400);

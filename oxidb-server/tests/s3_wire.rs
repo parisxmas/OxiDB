@@ -15,7 +15,11 @@ const AK: &str = "testkey";
 const SK: &str = "testsecret";
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct Guard {
@@ -44,7 +48,11 @@ fn spawn() -> Guard {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let g = Guard { child, _dir: dir, port: s3 };
+    let g = Guard {
+        child,
+        _dir: dir,
+        port: s3,
+    };
     let deadline = Instant::now() + Duration::from_secs(15);
     while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
         assert!(Instant::now() < deadline, "s3 port never opened");
@@ -54,7 +62,10 @@ fn spawn() -> Guard {
 }
 
 fn sha256_hex(b: &[u8]) -> String {
-    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 fn hmac256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
@@ -91,20 +102,28 @@ fn req(port: u16, method: &str, path_q: &str, body: &[u8], sig_break: bool) -> R
     let scope = format!("{date}/us-east-1/s3/aws4_request");
     let payload_hash = sha256_hex(body);
     // Canonical query: sorted key=value (values here are pre-encoded simple).
-    let mut qparts: Vec<&str> = if query.is_empty() { vec![] } else { query.split('&').collect() };
+    let mut qparts: Vec<&str> = if query.is_empty() {
+        vec![]
+    } else {
+        query.split('&').collect()
+    };
     qparts.sort();
     let canonical_q: String = qparts
         .iter()
-        .map(|p| if p.contains('=') { p.to_string() } else { format!("{p}=") })
+        .map(|p| {
+            if p.contains('=') {
+                p.to_string()
+            } else {
+                format!("{p}=")
+            }
+        })
         .collect::<Vec<_>>()
         .join("&");
     let signed = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
-    let creq = format!(
-        "{method}\n{path}\n{canonical_q}\n{canonical_headers}\n{signed}\n{payload_hash}"
-    );
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let creq =
+        format!("{method}\n{path}\n{canonical_q}\n{canonical_headers}\n{signed}\n{payload_hash}");
     let sts = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(creq.as_bytes())
@@ -125,7 +144,11 @@ fn req(port: u16, method: &str, path_q: &str, body: &[u8], sig_break: bool) -> R
     );
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let target = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+    let target = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
     let mut msg = format!(
         "{method} {target} HTTP/1.1\r\nHost: {host}\r\nx-amz-date: {amz_date}\r\nx-amz-content-sha256: {payload_hash}\r\nAuthorization: {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -140,7 +163,12 @@ fn read_resp(s: &mut TcpStream) -> Resp {
     let mut r = BufReader::new(s);
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
-    let status: u16 = line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    let status: u16 = line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
@@ -158,9 +186,9 @@ fn read_resp(s: &mut TcpStream) -> Resp {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<usize>().ok());
-    let chunked = headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked")
-    });
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
     if let Some(n) = clen {
         body.resize(n, 0);
         r.read_exact(&mut body).unwrap();
@@ -179,7 +207,11 @@ fn read_resp(s: &mut TcpStream) -> Resp {
     } else {
         let _ = r.read_to_end(&mut body);
     }
-    Resp { status, headers, body }
+    Resp {
+        status,
+        headers,
+        body,
+    }
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -237,16 +269,41 @@ fn multipart_upload_assembles_parts() {
     let r = req(g.port, "POST", "/mp/big.bin?uploads", b"", false);
     assert_eq!(r.status, 200);
     let t = r.text();
-    let upid = t.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap().to_string();
-    let p1 = req(g.port, "PUT", &format!("/mp/big.bin?partNumber=1&uploadId={upid}"), b"AAAA", false);
+    let upid = t
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let p1 = req(
+        g.port,
+        "PUT",
+        &format!("/mp/big.bin?partNumber=1&uploadId={upid}"),
+        b"AAAA",
+        false,
+    );
     assert_eq!(p1.status, 200);
     let e1 = p1.header("ETag").unwrap().trim_matches('"').to_string();
-    let p2 = req(g.port, "PUT", &format!("/mp/big.bin?partNumber=2&uploadId={upid}"), b"BBBB", false);
+    let p2 = req(
+        g.port,
+        "PUT",
+        &format!("/mp/big.bin?partNumber=2&uploadId={upid}"),
+        b"BBBB",
+        false,
+    );
     let e2 = p2.header("ETag").unwrap().trim_matches('"').to_string();
     let complete = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{e1}\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"{e2}\"</ETag></Part></CompleteMultipartUpload>"
     );
-    let r = req(g.port, "POST", &format!("/mp/big.bin?uploadId={upid}"), complete.as_bytes(), false);
+    let r = req(
+        g.port,
+        "POST",
+        &format!("/mp/big.bin?uploadId={upid}"),
+        complete.as_bytes(),
+        false,
+    );
     assert_eq!(r.status, 200, "{}", r.text());
     let r = req(g.port, "GET", "/mp/big.bin", b"", false);
     assert_eq!(r.text(), "AAAABBBB");

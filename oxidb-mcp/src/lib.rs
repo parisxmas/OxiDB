@@ -14,6 +14,9 @@
 //! so and reports the true total. "No more" and "no more that I'll show you"
 //! are different answers.
 
+pub mod http;
+pub mod rest_wire;
+
 use serde_json::{Value, json};
 
 /// Spec revisions this server implements, newest first. `initialize` echoes

@@ -765,6 +765,17 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
+    // **Numbers compare by value, never by representation.** A rule literal is
+    // parsed with `parse::<f64>()`, so `1` in a rule is `Number(1.0)`, while a
+    // document that stored `1` holds `Number(1)` — and `serde_json::Value`
+    // equality calls those two different. Every numeric comparison in a
+    // security rule was therefore wrong, in both directions:
+    // `read: "doc.hidden != 1"` (meaning "hide the drafts") matched the
+    // drafts too and **published them**, and `read: "doc.hidden == 0"` — the
+    // same intent written the other way — matched nothing and hid everything.
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x == y;
+    }
     a == b
 }
 
@@ -1141,6 +1152,80 @@ mod tests {
 
     fn anon() -> AuthContext {
         AuthContext::anonymous()
+    }
+
+    /// A rule literal is parsed as `f64`; a document that stored `1` holds an
+    /// integer. `serde_json::Value` equality calls those different, so every
+    /// numeric rule comparison was wrong — and the `!=` direction failed
+    /// **open**, publishing exactly the rows the rule meant to hide.
+    #[test]
+    fn numeric_rule_comparisons_are_by_value_not_representation() {
+        let draft = json!({ "title": "SECRET DRAFT", "hidden": 1 });
+        let public = json!({ "title": "public post", "hidden": 0 });
+
+        // The leak: "hide the drafts" must not match a draft.
+        assert!(
+            !eval_rule_expr("doc.hidden != 1", &anon(), Some(&draft), None),
+            "a draft must not be visible under `doc.hidden != 1`"
+        );
+        assert!(eval_rule_expr(
+            "doc.hidden != 1",
+            &anon(),
+            Some(&public),
+            None
+        ));
+
+        // The mirror: the same intent written the other way must not hide
+        // everything.
+        assert!(eval_rule_expr(
+            "doc.hidden == 0",
+            &anon(),
+            Some(&public),
+            None
+        ));
+        assert!(!eval_rule_expr(
+            "doc.hidden == 0",
+            &anon(),
+            Some(&draft),
+            None
+        ));
+
+        // Integer/float and negative/large values agree across the divide.
+        let mixed = json!({ "i": 42, "f": 42.0, "neg": -7, "big": 9007199254740993i64 });
+        assert!(eval_rule_expr("doc.i == 42", &anon(), Some(&mixed), None));
+        assert!(eval_rule_expr("doc.f == 42", &anon(), Some(&mixed), None));
+        assert!(eval_rule_expr("doc.neg == -7", &anon(), Some(&mixed), None));
+        assert!(eval_rule_expr("doc.big != 0", &anon(), Some(&mixed), None));
+        assert!(!eval_rule_expr("doc.i == 43", &anon(), Some(&mixed), None));
+
+        // A missing field is still null, and null equals only null — the
+        // number path must not make an absent field compare equal to 0.
+        assert!(!eval_rule_expr(
+            "doc.absent == 0",
+            &anon(),
+            Some(&mixed),
+            None
+        ));
+        assert!(eval_rule_expr(
+            "doc.absent != 0",
+            &anon(),
+            Some(&mixed),
+            None
+        ));
+
+        // Non-numeric comparisons are unchanged.
+        assert!(eval_rule_expr(
+            "doc.title == 'public post'",
+            &anon(),
+            Some(&public),
+            None
+        ));
+        assert!(!eval_rule_expr(
+            "doc.title == '0'",
+            &anon(),
+            Some(&public),
+            None
+        ));
     }
 
     #[test]
