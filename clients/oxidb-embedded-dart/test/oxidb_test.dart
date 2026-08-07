@@ -155,7 +155,18 @@ void main() {
     expect(db.listObjects('avatars'), isEmpty);
   });
 
-  test('sql engine works in the same directory', () {
+  test('sql engine works in the same directory (lite: clear refusal)', () {
+    final lite = Platform.environment['OXIDB_LITE'] == '1';
+    if (lite) {
+      // The lite build omits the SQL engine — it must say so by name,
+      // never fail with something cryptic.
+      expect(
+        () => db.sql('SELECT 1'),
+        throwsA(predicate((e) =>
+            e is OxiDbException && e.message.contains('lite'))),
+      );
+      return;
+    }
     db.sql('CREATE TABLE todos (id INT PRIMARY KEY, title TEXT)');
     db.sql('INSERT INTO todos VALUES (?, ?)', [1, 'ship it']);
     final out = db.sql('SELECT title FROM todos WHERE id = ?', [1]);

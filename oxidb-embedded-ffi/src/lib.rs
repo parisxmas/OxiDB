@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "sql")]
+use std::sync::OnceLock;
 
 use base64::Engine;
 use oxidb::OxiDb;
 use oxidb::query::parse_find_options;
+#[cfg(feature = "sql")]
 use oxidb_sql::SqlEngine;
 use serde_json::{Value, json};
 
@@ -18,9 +21,11 @@ struct OxiDbHandle {
     db: Arc<OxiDb>,
     active_tx: Mutex<Option<u64>>,
     /// Root data directory (the SQL engine lives under `<dir>/sql`).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     dir: PathBuf,
     /// The standalone SQL engine (ADR-0010), opened lazily on the first `sql`
     /// command. `None` after a failed open (the error is reported per call).
+    #[cfg(feature = "sql")]
     sql: OnceLock<Option<Arc<SqlEngine>>>,
 }
 
@@ -28,6 +33,7 @@ impl OxiDbHandle {
     /// The SQL engine for this handle, opened at `<dir>/sql` on first use.
     /// Unlike the server there is no env-var gate: calling `sql` *is* the
     /// opt-in, and the engine costs nothing until then.
+    #[cfg(feature = "sql")]
     fn sql_engine(&self) -> Option<Arc<SqlEngine>> {
         self.sql
             .get_or_init(|| match SqlEngine::open(self.dir.join("sql")) {
@@ -726,6 +732,7 @@ pub unsafe extern "C" fn oxidb_open(path: *const c_char) -> *mut Handle {
                 db: Arc::new(db),
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
+                #[cfg(feature = "sql")]
                 sql: OnceLock::new(),
             });
             Box::into_raw(handle) as *mut Handle
@@ -762,6 +769,7 @@ pub unsafe extern "C" fn oxidb_open_encrypted(
                 db: Arc::new(db),
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
+                #[cfg(feature = "sql")]
                 sql: OnceLock::new(),
             });
             Box::into_raw(handle) as *mut Handle
@@ -802,6 +810,7 @@ pub unsafe extern "C" fn oxidb_open_encrypted_bytes(
                 db: Arc::new(db),
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
+                #[cfg(feature = "sql")]
                 sql: OnceLock::new(),
             });
             Box::into_raw(handle) as *mut Handle
@@ -824,7 +833,9 @@ pub unsafe extern "C" fn oxidb_open_encrypted_bytes(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_close(handle: *mut Handle) {
     if !handle.is_null() {
+        #[cfg_attr(not(feature = "sql"), allow(unused_variables))]
         let h = unsafe { Box::from_raw(handle as *mut OxiDbHandle) };
+        #[cfg(feature = "sql")]
         if let Some(Some(engine)) = h.sql.get() {
             let _ = engine.checkpoint_if_dirty();
         }
@@ -893,6 +904,15 @@ pub unsafe extern "C" fn oxidb_execute(
 /// here the "session" is whoever holds the token, so several logical
 /// connections (say, ADO.NET ones) can share one engine handle without
 /// sharing transactions.
+#[cfg(not(feature = "sql"))]
+fn handle_sql(_h: &OxiDbHandle, _request: &Value) -> Vec<u8> {
+    err_bytes(
+        "the SQL engine is not included in this build (lite) — \
+         use the full library, or build with the 'sql' feature",
+    )
+}
+
+#[cfg(feature = "sql")]
 fn handle_sql(h: &OxiDbHandle, request: &Value) -> Vec<u8> {
     if request.get("cmd").and_then(|v| v.as_str()) != Some("sql") {
         return err_bytes("SQL engine requests must use cmd \"sql\"");

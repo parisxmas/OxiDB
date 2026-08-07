@@ -4,6 +4,8 @@
 //! generation per open/close cycle — that is the difference between a tidy
 //! close and a directory that grows a generation every time the app starts.
 
+#![cfg(feature = "sql")]
+
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 

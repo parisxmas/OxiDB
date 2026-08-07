@@ -73,10 +73,31 @@ This package binds to `liboxidb_embedded_ffi` (prebuilt binaries ship with
 - **macOS / Linux / tests**: set `Bindings.libraryPath` to the
   `.dylib`/`.so`, or let the default name resolution find it.
 
-Binary size cost: roughly 5–10 MB per ABI (the whole engine). That buys
-queries, indexes, aggregation, FTS, SQL, blobs and encryption in one
-dependency — where a typical stack pairs SharedPreferences + a KV store +
-sqlite + a file cache.
+## Binary size (measured, Android arm64, `--profile mobile`)
+
+| Build | On disk | Download (~gzip) |
+|---|---|---|
+| Full engine | 9.8 MB | 4.2 MB |
+| **Lite** (`--no-default-features`) | **4.8 MB** | **2.0 MB** |
+
+The **lite** build drops the SQL engine and the PDF/DOCX/XLSX text
+extractors; everything else — documents, queries, all index types, geo,
+aggregation, FTS over text/HTML/JSON, transactions, blobs, encryption —
+is identical, and both are covered by this package's test suite
+(`OXIDB_LITE=1 dart test`). On lite, `db.sql(...)` throws an
+`OxiDbException` naming the lite build, and PDF/DOCX/XLSX blobs are
+stored fine but not text-indexed.
+
+```bash
+# full
+cargo ndk -t arm64-v8a -o jniLibs build --profile mobile -p oxidb-embedded-ffi --features android
+# lite
+cargo ndk -t arm64-v8a -o jniLibs build --profile mobile -p oxidb-embedded-ffi --no-default-features --features android
+```
+
+That buys queries, indexes, aggregation, FTS, blobs and encryption (plus
+SQL on the full build) in one dependency — where a typical stack pairs
+SharedPreferences + a KV store + sqlite + a file cache.
 
 ## Tests
 

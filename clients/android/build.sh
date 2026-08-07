@@ -22,12 +22,23 @@ done
 export ANDROID_NDK_HOME="$NDK_DIR"
 echo "Using NDK: $ANDROID_NDK_HOME"
 
-# Step 1: Build Rust native libraries for all ABIs
-echo "Building native libraries..."
+# Step 1: Build Rust native libraries for all ABIs.
+# `mobile` profile = release + opt-level=z (measured ~20% smaller).
+# OXIDB_LITE=1 drops the SQL engine and the PDF/DOCX/XLSX text extractors
+# (documents on those types are stored but not text-indexed; `sql` commands
+# answer an explicit error).
+FEATURES="android"
+if [ "${OXIDB_LITE:-0}" = "1" ]; then
+    FEATURE_ARGS="--no-default-features --features $FEATURES"
+    echo "Building LITE native libraries (no SQL engine, no doc-format extraction)..."
+else
+    FEATURE_ARGS="--features $FEATURES"
+    echo "Building native libraries..."
+fi
 cd "$REPO_ROOT"
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
     -o "$JNILIB_DIR" \
-    build --release -p oxidb-embedded-ffi --features android
+    build --profile mobile -p oxidb-embedded-ffi $FEATURE_ARGS
 
 echo ""
 echo "Native libraries:"

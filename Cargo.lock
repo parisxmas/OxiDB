@@ -2514,7 +2514,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "spin",
- "sqlparser",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

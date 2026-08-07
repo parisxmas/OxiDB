@@ -926,11 +926,35 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
             Some(parts.join(" "))
         }
     } else if ct == "application/pdf" {
-        extract_pdf(data)
+        // Without `doc-formats` (mobile lite builds) these types simply
+        // yield no text — the document is stored fine, just not text-indexed,
+        // exactly like any other unrecognized content type.
+        #[cfg(feature = "doc-formats")]
+        {
+            extract_pdf(data)
+        }
+        #[cfg(not(feature = "doc-formats"))]
+        {
+            None
+        }
     } else if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
-        extract_docx(data)
+        #[cfg(feature = "doc-formats")]
+        {
+            extract_docx(data)
+        }
+        #[cfg(not(feature = "doc-formats"))]
+        {
+            None
+        }
     } else if ct == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" {
-        extract_xlsx(data)
+        #[cfg(feature = "doc-formats")]
+        {
+            extract_xlsx(data)
+        }
+        #[cfg(not(feature = "doc-formats"))]
+        {
+            None
+        }
     } else {
         #[cfg(feature = "ocr")]
         {
@@ -942,7 +966,7 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "doc-formats"))]
 fn extract_pdf(data: &[u8]) -> Option<String> {
     pdf_extract::extract_text_from_mem(data).ok().and_then(|s| {
         let trimmed = s.trim().to_string();
@@ -954,7 +978,7 @@ fn extract_pdf(data: &[u8]) -> Option<String> {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "doc-formats"))]
 fn extract_docx(data: &[u8]) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -1083,7 +1107,7 @@ fn otsu_threshold(img: &image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> u8 {
     best_t
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "doc-formats"))]
 fn extract_xlsx(data: &[u8]) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -1310,6 +1334,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "doc-formats")]
     fn extract_text_docx() {
         // Build a minimal DOCX (ZIP with word/document.xml)
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1335,6 +1360,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "doc-formats")]
     fn extract_text_xlsx() {
         // Build a minimal XLSX (ZIP with xl/sharedStrings.xml)
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1361,6 +1387,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "doc-formats")]
     fn extract_text_pdf() {
         // Use a minimal valid PDF
         let pdf_bytes = b"%PDF-1.0
