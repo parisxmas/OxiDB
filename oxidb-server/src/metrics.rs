@@ -127,15 +127,16 @@ impl Metrics {
             | "HEXISTS" | "HRANDFIELD" | "LRANGE" | "LLEN" | "LINDEX" | "SMEMBERS"
             | "SISMEMBER" | "SCARD" | "SINTER" | "SUNION" | "SDIFF" | "ZRANGE" | "ZREVRANGE"
             | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZSCORE" | "ZCARD"
-            | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "RANDOMKEY" | "DBSIZE" => &self.oximem_reads,
+            | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "RANDOMKEY" | "DBSIZE" | "GEOPOS" | "GEODIST"
+            | "GEOHASH" | "GEOSEARCH" => &self.oximem_reads,
             "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => &self.oximem_tx,
             "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "GETSET" | "GETDEL" | "SETRANGE"
             | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "DEL"
             | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "RENAME" | "COPY"
             | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
             | "RPOP" | "BLPOP" | "BRPOP" | "SADD" | "SREM" | "SINTERSTORE" | "SUNIONSTORE"
-            | "SDIFFSTORE" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "BZPOPMIN"
-            | "FLUSHALL" | "FLUSHDB" => &self.oximem_writes,
+            | "SDIFFSTORE" | "ZADD" | "GEOADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX"
+            | "BZPOPMIN" | "FLUSHALL" | "FLUSHDB" => &self.oximem_writes,
             _ => &self.oximem_other,
         };
         counter.fetch_add(1, Ordering::Relaxed);

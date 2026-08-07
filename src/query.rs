@@ -149,11 +149,11 @@ pub enum QueryOp {
     Exists(bool),
     Regex(regex::Regex),
     ElemMatch(Box<Query>),
-    Not(Vec<QueryOp>),         // negate: {"field": {"$not": {"$gt": 30}}}
-    ArrayAll(Vec<IndexValue>), // array contains all: {"tags": {"$all": ["a","b"]}}
-    Size(usize),               // array length: {"tags": {"$size": 3}}
-    Type(String),              // JSON type check: {"field": {"$type": "string"}}
-    Mod(i64, i64),             // modulo: {"qty": {"$mod": [4, 0]}}
+    Not(Vec<QueryOp>),               // negate: {"field": {"$not": {"$gt": 30}}}
+    ArrayAll(Vec<IndexValue>),       // array contains all: {"tags": {"$all": ["a","b"]}}
+    Size(usize),                     // array length: {"tags": {"$size": 3}}
+    Type(String),                    // JSON type check: {"field": {"$type": "string"}}
+    Mod(i64, i64),                   // modulo: {"qty": {"$mod": [4, 0]}}
     GeoWithin(crate::geo::GeoShape), // {"loc": {"$geoWithin": {...}}}
     Near(crate::geo::GeoNear),       // {"loc": {"$near": ...}} — also sorts, see find paths
 }
@@ -404,6 +404,11 @@ fn parse_op(
         "$geoWithin" => crate::geo::shape_from_json(op_val)
             .map(QueryOp::GeoWithin)
             .map_err(Error::InvalidQuery),
+        // Point data: a point intersects a region exactly when the region
+        // contains it, so $geoIntersects shares $geoWithin's evaluator.
+        "$geoIntersects" => crate::geo::intersects_shape_from_json(op_val)
+            .map(QueryOp::GeoWithin)
+            .map_err(Error::InvalidQuery),
         "$near" | "$nearSphere" => crate::geo::near_from_json(op_val, sibling_ops)
             .map(QueryOp::Near)
             .map_err(Error::InvalidQuery),
@@ -621,7 +626,7 @@ pub fn geo_candidate_shape(query: &Query) -> Option<(String, crate::geo::GeoShap
         Query::Field {
             field,
             op: QueryOp::GeoWithin(shape),
-        } => Some((field.clone(), *shape)),
+        } => Some((field.clone(), shape.clone())),
         Query::Field {
             field,
             op: QueryOp::Near(near),

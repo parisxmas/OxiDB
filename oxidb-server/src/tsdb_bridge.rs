@@ -255,6 +255,8 @@ pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) ->
             write_line_protocol(&engine, request)
         }
         "query" => query(&engine, request),
+        "distance" => geo_track_op(&engine, request, GeoTrackOp::Distance),
+        "track" => geo_track_op(&engine, request, GeoTrackOp::Track),
         "stats" => {
             let db = engine.read().unwrap();
             ok_bytes(json!({
@@ -518,6 +520,123 @@ fn query_core(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Result<Value, Stri
         })
         .collect();
     Ok(json!(out))
+}
+
+/// Which geo-track query the shared parser serves.
+enum GeoTrackOp {
+    Distance,
+    Track,
+}
+
+/// `op: "distance"` — path length in meters over a measurement's lat/lon
+/// field pair (defaults `lat`/`lon`, override with `lat_field`/`lon_field`;
+/// `tags`/`start`/`end`/`group_by`/`interval` as in `query`). Result: the
+/// same series-array shape as `query`, value = meters per bucket.
+///
+/// `op: "track"` — the (ts, lat, lon) fix list per matching tag-set,
+/// Douglas-Peucker simplified when `tolerance` (meters) is given — so a
+/// day-long track needn't ship every raw point to a map.
+fn geo_track_op(engine: &Arc<RwLock<Tsdb>>, request: &Value, op: GeoTrackOp) -> Vec<u8> {
+    let Some(measurement) = request.get("measurement").and_then(|v| v.as_str()) else {
+        return err_bytes("distance/track requires a 'measurement'");
+    };
+    let tag_filters = request
+        .get("tags")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str().map(|s| TagPredicate {
+                        key: k.clone(),
+                        value: s.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let group_tags = request
+        .get("group_by")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let field_or = |key: &str, default: &str| {
+        request
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+    let spec = oxidb_tsdb::TrackSpec {
+        measurement: measurement.to_string(),
+        lat_field: field_or("lat_field", "lat"),
+        lon_field: field_or("lon_field", "lon"),
+        tag_filters,
+        start: request
+            .get("start")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MIN / 2),
+        end: request
+            .get("end")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MAX / 2),
+        group_tags,
+        interval: request
+            .get("interval")
+            .and_then(|v| v.as_i64())
+            .filter(|&i| i > 0),
+    };
+    let db = engine.read().unwrap();
+    match op {
+        GeoTrackOp::Distance => {
+            let out: Vec<Value> = db
+                .distance_query(&spec)
+                .into_iter()
+                .map(|r| {
+                    let tags: serde_json::Map<String, Value> = r
+                        .tags
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect();
+                    json!({
+                        "tags": tags,
+                        "type": "float",
+                        "points": r.points.into_iter()
+                            .map(|p| json!({ "ts": p.ts, "value": p.value }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            ok_bytes(json!(out))
+        }
+        GeoTrackOp::Track => {
+            let tolerance = request
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .filter(|t| t.is_finite() && *t >= 0.0)
+                .unwrap_or(0.0);
+            let out: Vec<Value> = db
+                .track_query(&spec, tolerance)
+                .into_iter()
+                .map(|(tags, fixes)| {
+                    let tags: serde_json::Map<String, Value> = tags
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect();
+                    json!({
+                        "tags": tags,
+                        "points": fixes.into_iter()
+                            .map(|(ts, lat, lon)| json!({ "ts": ts, "lat": lat, "lon": lon }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            ok_bytes(json!(out))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

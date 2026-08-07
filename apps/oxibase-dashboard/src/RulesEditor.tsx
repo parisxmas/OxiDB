@@ -44,12 +44,34 @@ function validateAtom(tok: string): string | null {
       ? null
       : `unknown field \`auth.${f}\` (only auth.username, auth.role)`;
   }
-  if (t.startsWith("doc.")) {
-    const f = t.slice(4);
-    const ok = f !== "" && f.split(".").every((seg) => seg !== "" && /^[A-Za-z0-9_]+$/.test(seg));
-    return ok ? null : `invalid document field \`doc.${f}\``;
+  for (const prefix of ["doc.", "newDoc."]) {
+    if (t.startsWith(prefix)) {
+      const f = t.slice(prefix.length);
+      const ok = f !== "" && f.split(".").every((seg) => seg !== "" && /^[A-Za-z0-9_]+$/.test(seg));
+      return ok ? null : `invalid document field \`${prefix}${f}\``;
+    }
   }
-  return `unknown term \`${t}\` — use auth, auth.username, auth.role, doc.<field>, 'string', true/false/null, or a number`;
+  return `unknown term \`${t}\` — use auth, auth.username, auth.role, doc.<field>, newDoc.<field>, 'string', true/false/null, or a number`;
+}
+
+// Comma-split of a `[...]` list literal, respecting quoted strings.
+function splitListItems(inner: string): string[] {
+  const items: string[] = [];
+  let start = 0;
+  let inSq = false;
+  let inDq = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "'" && !inDq) inSq = !inSq;
+    else if (ch === '"' && !inSq) inDq = !inDq;
+    else if (ch === "," && !inSq && !inDq) {
+      items.push(inner.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = inner.slice(start).trim();
+  if (last !== "" || items.length > 0) items.push(last);
+  return items.filter((s) => s !== "");
 }
 
 export function validateRuleExpr(input: string): string | null {
@@ -62,11 +84,29 @@ export function validateRuleExpr(input: string): string | null {
   if (s) return validateRuleExpr(s[0]) ?? validateRuleExpr(s[1]);
   if (e.startsWith("!")) return validateRuleExpr(e.slice(1).trim());
   if (e.startsWith("(") && e.endsWith(")")) return validateRuleExpr(e.slice(1, -1));
-  for (const op of ["!=", "=="]) {
+  // Two-char ops before their one-char prefixes, mirroring the server.
+  for (const op of ["!=", "==", "<=", ">=", "<", ">"]) {
     const idx = e.indexOf(op);
     if (idx >= 0) {
       return validateAtom(e.slice(0, idx).trim()) ?? validateAtom(e.slice(idx + op.length).trim());
     }
+  }
+  // Membership: `x in doc.<field>` or `x in ['a', 'b']`.
+  s = splitLogical(e, " in ");
+  if (s) {
+    const left = validateAtom(s[0].trim());
+    if (left) return left;
+    const r = s[1].trim();
+    if (r.startsWith("[") && r.endsWith("]")) {
+      const items = splitListItems(r.slice(1, -1));
+      if (items.length === 0) return "`in` list must not be empty";
+      for (const item of items) {
+        const err = validateAtom(item);
+        if (err) return err;
+      }
+      return null;
+    }
+    return validateAtom(r);
   }
   return validateAtom(e);
 }

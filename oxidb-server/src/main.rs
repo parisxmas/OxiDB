@@ -1212,6 +1212,10 @@ PROTOCOLS (off unless set):
     OXIDB_MQTT_PERSIST     persist MQTT sessions, queued QoS-1 messages and
                            retained topics via the document engine (they
                            survive a crash); default off
+    OXIDB_MQTT_INGEST      MQTT → collection bridge: comma-separated
+                           `topic-filter:collection` routes (wildcards ok,
+                           e.g. fleet/+/pos:pings); a mapped publish is
+                           inserted as a queryable document
     OXIDB_AMQP_PORT        AMQP 0-9-1 (RabbitMQ protocol) listener; durable
                            queues + delivery_mode=2 messages persist via the
                            document engine and survive a crash. When the MQTT
@@ -1779,6 +1783,19 @@ fn main() {
         // queues, which is what enforces the per-session cap against a publisher
         // that keeps sending while nobody is connected. ADR-0015.
         oxidb_server::mqtt_session::spawn_reaper();
+
+        // MQTT → collection bridge: declarative `topic-filter:collection`
+        // routes; a malformed spec refuses startup, never a bridge that
+        // silently never fires.
+        if let Ok(spec) = env::var("OXIDB_MQTT_INGEST") {
+            let n = oxidb_server::mqtt_ingest::init(&spec, Arc::clone(&state.db))
+                .unwrap_or_else(|e| panic!("{e}"));
+            server_log!(
+                state,
+                GelfLevel::Notice,
+                format!("MQTT ingest bridge on — {n} route(s)")
+            );
+        }
 
         let state_mqtt = Arc::clone(&state);
         let mqtt_store = Arc::clone(&shared_store);

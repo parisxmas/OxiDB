@@ -380,3 +380,169 @@ fn unbounded_near_ring_respects_the_rest_of_the_query() {
     let names_b = names(&scanned);
     assert_eq!(names_a, names_b, "ring must match the scan");
 }
+
+#[test]
+fn polygon_geowithin_and_geointersects_answer_the_geofence() {
+    // A triangle geofence over the grid's northeast quadrant, with a hole
+    // cut out of its middle. Differential (index vs scan) like every other
+    // geo predicate, plus the specific membership facts the shape implies.
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    seed(&db, "idx");
+    seed(&db, "raw");
+    db.create_geo_index("idx", "loc").unwrap();
+
+    // Exterior: a box from center to the NE corner; hole: small box inside.
+    let polygon = json!({
+        "type": "Polygon",
+        "coordinates": [
+            [[CENTER.0, CENTER.1], [CENTER.0 + 0.085, CENTER.1],
+             [CENTER.0 + 0.085, CENTER.1 + 0.085], [CENTER.0, CENTER.1 + 0.085],
+             [CENTER.0, CENTER.1]],
+            [[CENTER.0 + 0.035, CENTER.1 + 0.035], [CENTER.0 + 0.055, CENTER.1 + 0.035],
+             [CENTER.0 + 0.055, CENTER.1 + 0.055], [CENTER.0 + 0.035, CENTER.1 + 0.055],
+             [CENTER.0 + 0.035, CENTER.1 + 0.035]]
+        ]
+    });
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    for op in ["$geoWithin", "$geoIntersects"] {
+        let q = json!({"loc": {op: {"$geometry": polygon}}});
+        let with_idx = sorted(names(&find(&db, "idx", q.clone())));
+        let scanned = sorted(names(&find(&db, "raw", q.clone())));
+        assert_eq!(with_idx, scanned, "index/scan divergence for {op}");
+        assert!(!with_idx.is_empty(), "{op}: polygon must match grid points");
+        // Inside the exterior, outside the hole.
+        assert!(with_idx.contains(&"g2_2".to_string()), "{op}: {with_idx:?}");
+        // Inside the hole: excluded.
+        assert!(
+            !with_idx.contains(&"g4_4".to_string()),
+            "{op} hole: {with_idx:?}"
+        );
+        // West of the polygon entirely.
+        assert!(
+            !with_idx.contains(&"g-3_2".to_string()),
+            "{op}: {with_idx:?}"
+        );
+        // Far away.
+        assert!(!with_idx.contains(&"toronto".to_string()));
+    }
+
+    // $geoIntersects with a Point geometry: exact-point membership.
+    let q = json!({"loc": {"$geoIntersects": {"$geometry":
+        {"type": "Point", "coordinates": [CENTER.0, CENTER.1]}}}});
+    let hits = sorted(names(&find(&db, "idx", q.clone())));
+    assert_eq!(hits, sorted(names(&find(&db, "raw", q))));
+    assert!(hits.contains(&"g0_0".to_string()) && hits.contains(&"geojson".to_string()));
+
+    // Refusals stay refusals, by name.
+    let too_wide = json!({"loc": {"$geoWithin": {"$geometry": {"type": "Polygon",
+        "coordinates": [[[-170.0, 0.0], [170.0, 0.0], [0.0, 50.0], [-170.0, 0.0]]]}}}});
+    let err = db.find("idx", &too_wide).unwrap_err().to_string();
+    assert!(err.contains("antimeridian"), "{err}");
+    let multi = json!({"loc": {"$geoWithin": {"$geometry": {"type": "MultiPolygon",
+        "coordinates": []}}}});
+    assert!(db.find("idx", &multi).is_err());
+}
+
+#[test]
+fn geonear_stage_filters_sorts_and_reports_distance() {
+    // The aggregation counterpart of $near: nearest-first, a real distance
+    // in the result (clients used to re-derive it with their own
+    // haversine), the extra `query` filter applied, and bounds honoured.
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    seed(&db, "places");
+    db.create_geo_index("places", "loc").unwrap();
+
+    let pipeline = json!([
+        {"$geoNear": {
+            "near": [CENTER.0, CENTER.1],
+            "key": "loc",
+            "distanceField": "dist_m",
+            "maxDistance": 5000.0,
+            "query": {"kind": "east"}
+        }},
+        {"$limit": 8}
+    ]);
+    let rows = db.aggregate("places", &pipeline).unwrap();
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|d| d["kind"] == "east"));
+    let ds: Vec<f64> = rows.iter().map(|d| d["dist_m"].as_f64().unwrap()).collect();
+    assert!(
+        ds.windows(2).all(|w| w[0] <= w[1] + 1e-6),
+        "not nearest-first: {ds:?}"
+    );
+    assert!(ds[0] < 1.0, "exact-center doc first: {ds:?}");
+    assert!(ds.iter().all(|d| *d <= 5000.0));
+
+    // distanceMultiplier scales the reported distance (0.001 → km).
+    let km = db
+        .aggregate(
+            "places",
+            &json!([{"$geoNear": {"near": [CENTER.0, CENTER.1], "key": "loc",
+                "distanceField": "dist_km", "maxDistance": 5000.0,
+                "distanceMultiplier": 0.001}}, {"$limit": 1}]),
+        )
+        .unwrap();
+    assert!(km[0]["dist_km"].as_f64().unwrap() < 5.0);
+
+    // Not-first is refused, as are unknown options — by name.
+    let err = db
+        .aggregate(
+            "places",
+            &json!([{"$limit": 3}, {"$geoNear":
+            {"near": [0.0, 0.0], "key": "loc", "distanceField": "d"}}]),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("first stage"), "{err}");
+    let err = db
+        .aggregate(
+            "places",
+            &json!([{"$geoNear": {"near": [0.0, 0.0], "key": "loc",
+            "distanceField": "d", "num": 5}}]),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("num"), "{err}");
+}
+
+#[test]
+fn geoidx_file_survives_reopen_and_corruption_falls_back_to_rebuild() {
+    // Disk-first (the default): create_geo_index writes a `.geoidx`; a
+    // clean reopen serves geo queries from the mmap'd base with no document
+    // scan. A corrupted file must be refused and rebuilt — never believed.
+    let dir = tempdir().unwrap();
+    let within: Value = serde_json::from_str(WITHIN_2KM).unwrap();
+    let expected = {
+        let db = OxiDb::open(dir.path()).unwrap();
+        seed(&db, "places");
+        db.create_geo_index("places", "loc").unwrap();
+        names(&find(&db, "places", within.clone()))
+    };
+    let geoidx = dir.path().join("places.loc.geoidx");
+    assert!(geoidx.exists(), "create_geo_index must write the base file");
+
+    // Clean reopen: answers must match (served via the persisted base).
+    {
+        let db = OxiDb::open(dir.path()).unwrap();
+        let got = names(&find(&db, "places", within.clone()));
+        assert_eq!(got.len(), expected.len());
+    }
+
+    // Corrupt the file: reopen must rebuild from documents, not believe it.
+    std::fs::write(&geoidx, b"OXGEgarbage").unwrap();
+    {
+        let db = OxiDb::open(dir.path()).unwrap();
+        let got = names(&find(&db, "places", within));
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "corrupt base must trigger rebuild"
+        );
+    }
+}

@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 fn edge(db: &OxiDb, a: &str, b: &str, km: f64) {
-    db.insert("roads", json!({"a": a, "b": b, "km": km})).unwrap();
+    db.insert("roads", json!({"a": a, "b": b, "km": km}))
+        .unwrap();
 }
 
 fn route_names(doc: &Value) -> Vec<(String, String)> {
@@ -113,8 +114,11 @@ fn zero_length_and_pruning_and_max_cost() {
     let dir = tempdir().unwrap();
     let db = OxiDb::open(dir.path()).unwrap();
     edge(&db, "A", "B", 10.0);
-    db.insert("roads", json!({"a": "A", "b": "B", "km": 1.0, "closed": true}))
-        .unwrap();
+    db.insert(
+        "roads",
+        json!({"a": "A", "b": "B", "km": 1.0, "closed": true}),
+    )
+    .unwrap();
     db.insert("trips", json!({"src": "A", "dst": "A"})).unwrap();
 
     // Source == target: zero-cost empty path.
@@ -178,7 +182,11 @@ fn a_real_little_road_network() {
     // No — izmit→eskisehir is 200, istanbul→izmit 100: 140+130+100+200 = 570;
     // but bursa legs (150) are gone, so 570 via izmit is the only route.
     assert_eq!(doc["total"], json!(570.0));
-    assert!(route_names(&doc).iter().any(|(a, b)| a == "izmit" || b == "izmit"));
+    assert!(
+        route_names(&doc)
+            .iter()
+            .any(|(a, b)| a == "izmit" || b == "izmit")
+    );
 }
 
 #[test]

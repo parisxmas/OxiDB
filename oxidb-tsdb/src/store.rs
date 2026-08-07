@@ -386,6 +386,226 @@ pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<
         .collect()
 }
 
+// ── Geo tracks ────────────────────────────────────────────────────────────
+// A position is a PAIR of numeric fields (`lat`, `lon` by default) written
+// with shared timestamps — the engine gains geo awareness without a new
+// storage type. Two queries build on that: `run_distance_query` (path
+// length in meters: "how many km did u42 travel today", the counter-`rate`
+// of movement) and `run_track_query` (the fix list, Douglas-Peucker
+// simplified so a 24-hour track needn't ship 20k points to a map).
+
+/// Great-circle distance in meters — the same haversine (mean earth radius
+/// 6 371 008.8 m) the document engine's geo module uses; duplicated here
+/// because this crate is standalone by design.
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_008.8;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * R * h.sqrt().asin()
+}
+
+/// What a track/distance query selects. `group_tags`/`interval` bucket the
+/// distance query exactly like [`QuerySpec`] does; the track query ignores
+/// them (a track is per tag-set by nature).
+#[derive(Debug, Clone)]
+pub struct TrackSpec {
+    pub measurement: String,
+    pub lat_field: String,
+    pub lon_field: String,
+    pub tag_filters: Vec<TagPredicate>,
+    pub start: i64,
+    pub end: i64,
+    pub group_tags: Vec<String>,
+    pub interval: Option<i64>,
+}
+
+/// One (ts, lat, lon) position fix.
+pub type Fix = (i64, f64, f64);
+/// A tag-set's simplified track: `(tags, fixes)`.
+pub type Track = (Vec<(String, String)>, Vec<Fix>);
+/// A matched lat/lon series pair: `(tags, lat series, lon series)`.
+type SeriesPair<'a> = (&'a [(String, String)], &'a Series, &'a Series);
+
+/// The (ts, lat, lon) fixes of ONE tag-set: timestamps present in BOTH
+/// fields, ascending. A lat sample without its lon twin is not a position.
+fn join_fixes(lat: &Series, lon: &Series, start: i64, end: i64) -> Vec<Fix> {
+    let mut lats: Vec<(i64, f64)> = Vec::new();
+    lat.for_each_in(start, end, |t, v| lats.push((t, v)));
+    let mut lons: Vec<(i64, f64)> = Vec::new();
+    lon.for_each_in(start, end, |t, v| lons.push((t, v)));
+    lats.sort_by_key(|(t, _)| *t);
+    lons.sort_by_key(|(t, _)| *t);
+    let mut out = Vec::with_capacity(lats.len().min(lons.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < lats.len() && j < lons.len() {
+        match lats[i].0.cmp(&lons[j].0) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push((lats[i].0, lats[i].1, lons[j].1));
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Series pairs matching `spec`, keyed by tag-set: `(tags, lat, lon)`.
+fn matching_pairs<'a>(
+    series: &'a BTreeMap<SeriesKey, Series>,
+    spec: &TrackSpec,
+) -> Vec<SeriesPair<'a>> {
+    let mut out = Vec::new();
+    for (key, lat_s) in series {
+        if key.measurement != spec.measurement || key.field != spec.lat_field {
+            continue;
+        }
+        if !spec
+            .tag_filters
+            .iter()
+            .all(|p| key.tag(&p.key) == Some(p.value.as_str()))
+        {
+            continue;
+        }
+        let lon_key = SeriesKey::new(&spec.measurement, key.tags.clone(), &spec.lon_field);
+        if let Some(lon_s) = series.get(&lon_key) {
+            out.push((key.tags.as_slice(), lat_s, lon_s));
+        }
+    }
+    out
+}
+
+/// Path length in meters per (group, bucket): consecutive fixes of each
+/// tag-set contribute their segment to the bucket of the LATER fix (the
+/// moment the movement completed). Distinct tag-sets in one group never
+/// chain into each other — two vehicles grouped by fleet add their own
+/// paths, not a phantom leg between them.
+pub fn run_distance_query(
+    series: &BTreeMap<SeriesKey, Series>,
+    spec: &TrackSpec,
+) -> Vec<ResultSeries> {
+    let mut groups: BTreeMap<Vec<String>, BTreeMap<i64, (i64, f64)>> = BTreeMap::new();
+    for (tags, lat_s, lon_s) in matching_pairs(series, spec) {
+        let key_of = |k: &str| {
+            tags.iter()
+                .find(|(tk, _)| tk == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let gvals: Vec<String> = spec.group_tags.iter().map(|k| key_of(k)).collect();
+        let buckets = groups.entry(gvals).or_default();
+        let fixes = join_fixes(lat_s, lon_s, spec.start, spec.end);
+        for w in fixes.windows(2) {
+            let ((_, lat1, lon1), (t2, lat2, lon2)) = (w[0], w[1]);
+            let d = haversine_m(lat1, lon1, lat2, lon2);
+            let bucket = match spec.interval {
+                Some(iv) if iv > 0 => t2 - t2.rem_euclid(iv),
+                _ => spec.start,
+            };
+            let e = buckets.entry(bucket).or_insert((t2, 0.0));
+            e.0 = e.0.min(t2);
+            e.1 += d;
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(gvals, buckets)| ResultSeries {
+            ftype: FieldType::Float,
+            tags: spec.group_tags.iter().cloned().zip(gvals).collect(),
+            points: buckets
+                .into_iter()
+                .map(|(bucket_ts, (first_ts, meters))| GroupPoint {
+                    // Same sentinel-avoidance as run_query: without an
+                    // interval the bucket key is `spec.start` (often an
+                    // unbounded default), so stamp the earliest real fix.
+                    ts: match spec.interval {
+                        Some(iv) if iv > 0 => bucket_ts,
+                        _ => first_ts,
+                    },
+                    value: meters,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// One simplified track per matching tag-set: `(tags, fixes)` with
+/// Douglas-Peucker applied at `tolerance_m` (0 = keep everything). The
+/// perpendicular distance is measured in meters on a local equirectangular
+/// projection — exact enough for any track a map would draw.
+pub fn run_track_query(
+    series: &BTreeMap<SeriesKey, Series>,
+    spec: &TrackSpec,
+    tolerance_m: f64,
+) -> Vec<Track> {
+    matching_pairs(series, spec)
+        .into_iter()
+        .map(|(tags, lat_s, lon_s)| {
+            let fixes = join_fixes(lat_s, lon_s, spec.start, spec.end);
+            let fixes = if tolerance_m > 0.0 {
+                douglas_peucker(&fixes, tolerance_m)
+            } else {
+                fixes
+            };
+            (tags.to_vec(), fixes)
+        })
+        .collect()
+}
+
+/// Iterative Douglas-Peucker over (ts, lat, lon) fixes. Distances are
+/// planar meters on a projection centered at the track's mean latitude.
+fn douglas_peucker(fixes: &[Fix], tolerance_m: f64) -> Vec<Fix> {
+    if fixes.len() <= 2 {
+        return fixes.to_vec();
+    }
+    let mean_lat = fixes.iter().map(|f| f.1).sum::<f64>() / fixes.len() as f64;
+    let mx = 111_320.0 * mean_lat.to_radians().cos(); // meters per lon degree
+    let my = 110_574.0; // meters per lat degree
+    let xy = |f: &(i64, f64, f64)| (f.2 * mx, f.1 * my);
+
+    let mut keep = vec![false; fixes.len()];
+    keep[0] = true;
+    *keep.last_mut().unwrap() = true;
+    let mut stack = vec![(0usize, fixes.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        let (ax, ay) = xy(&fixes[a]);
+        let (bx, by) = xy(&fixes[b]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let (mut worst, mut worst_d) = (a, -1.0f64);
+        for (i, f) in fixes.iter().enumerate().take(b).skip(a + 1) {
+            let (px, py) = xy(f);
+            let d = if len2 == 0.0 {
+                ((px - ax).powi(2) + (py - ay).powi(2)).sqrt()
+            } else {
+                // Perpendicular distance to the segment's LINE — DP's
+                // classic form (endpoints are already kept).
+                ((dy * px - dx * py + bx * ay - by * ax).abs()) / len2.sqrt()
+            };
+            if d > worst_d {
+                worst = i;
+                worst_d = d;
+            }
+        }
+        if worst_d > tolerance_m {
+            keep[worst] = true;
+            stack.push((a, worst));
+            stack.push((worst, b));
+        }
+    }
+    fixes
+        .iter()
+        .zip(keep)
+        .filter_map(|(f, k)| k.then_some(*f))
+        .collect()
+}
+
 // ── String fields ─────────────────────────────────────────────────────────
 // Text fields live outside the numeric Gorilla path. MVP: an in-memory vector
 // of (ts, string) per series; persistence serializes them raw. Aggregations

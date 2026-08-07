@@ -1023,6 +1023,11 @@ fn is_known_command(name: &str) -> bool {
             | "SISMEMBER"
             | "SCARD"
             | "ZADD"
+            | "GEOADD"
+            | "GEOPOS"
+            | "GEODIST"
+            | "GEOHASH"
+            | "GEOSEARCH"
             | "ZREM"
             | "ZSCORE"
             | "ZCARD"
@@ -1233,10 +1238,10 @@ fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "APPEND" | "INCR" | "DECR" | "INCRBY"
         | "DECRBY" | "INCRBYFLOAT" | "DECRBYFLOATGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
         | "PERSIST" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
-        | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "ZINCRBY" | "ZREM" | "ZPOPMIN"
-        | "ZPOPMAX" | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "SINTERSTORE" | "SUNIONSTORE"
-        | "SDIFFSTORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE" | "ZINTERSTORE"
-        | "LREM" | "LSET" | "LTRIM" | "SPOP" | "GETEX" | "SETBIT" => Some(vec![1]),
+        | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "GEOADD" | "ZINCRBY" | "ZREM"
+        | "ZPOPMIN" | "ZPOPMAX" | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "SINTERSTORE"
+        | "SUNIONSTORE" | "SDIFFSTORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE"
+        | "ZINTERSTORE" | "LREM" | "LSET" | "LTRIM" | "SPOP" | "GETEX" | "SETBIT" => Some(vec![1]),
         "RPOPLPUSH" | "LMOVE" | "BLMOVE" | "BRPOPLPUSH" => Some(vec![1, 2]),
         "LMPOP" | "ZMPOP" => Some((2..argc).collect()),
         "DEL" => Some((1..argc).collect()),
@@ -1317,7 +1322,7 @@ pub fn execute(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
             && let Some(cmd) = args.first().and_then(|a| a.as_str())
             && matches!(
                 cmd.to_uppercase().as_str(),
-                "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "BZPOPMIN"
+                "ZADD" | "GEOADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "BZPOPMIN"
             )
             && let Some(key) = args.get(1).and_then(|a| a.as_str())
         {
@@ -1504,6 +1509,11 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
         // -- Sorted set commands --
         "ZADD" => cmd_zadd(store, &args[1..]),
+        "GEOADD" => cmd_geoadd(store, &args[1..]),
+        "GEOPOS" => cmd_geopos(store, &args[1..]),
+        "GEODIST" => cmd_geodist(store, &args[1..]),
+        "GEOHASH" => cmd_geohash(store, &args[1..]),
+        "GEOSEARCH" => cmd_geosearch(store, &args[1..]),
         "ZREM" => cmd_zrem(store, &args[1..]),
         "ZSCORE" => cmd_zscore(store, &args[1..]),
         "ZRANK" => cmd_zrank(store, &args[1..]),
@@ -2990,6 +3000,408 @@ fn cmd_zadd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     }
 
     resp::integer(if ch { changed } else { added })
+}
+
+// ---------------------------------------------------------------------------
+// GEO commands — Redis's own design, reproduced: a GEO key IS a sorted set
+// whose score is the position packed as a 52-bit interleaved geohash
+// integer (26 bits per axis, latitude on even bits, Web-Mercator latitude
+// range ±85.05112878°). Because members live in the ordinary zset,
+// persistence (`_zset` mirror), WATCH, expiry and ZREM all work on GEO
+// keys with zero extra machinery. Searches decode each member's score and
+// measure with the same haversine the document engine uses — a linear
+// walk over the key's members, honest and exact for in-RAM set sizes.
+// ---------------------------------------------------------------------------
+
+const GEO_LAT_MIN: f64 = -85.05112878;
+const GEO_LAT_MAX: f64 = 85.05112878;
+const GEO_STEP: u32 = 26;
+
+/// Spread the low 32 bits of `v` into the even bit positions.
+fn geo_spread(v: u32) -> u64 {
+    let mut x = v as u64;
+    x = (x | (x << 16)) & 0x0000FFFF0000FFFF;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F;
+    x = (x | (x << 2)) & 0x3333333333333333;
+    x = (x | (x << 1)) & 0x5555555555555555;
+    x
+}
+
+/// Collapse the even bit positions of `v` into the low 32 bits.
+fn geo_squash(v: u64) -> u32 {
+    let mut x = v & 0x5555555555555555;
+    x = (x | (x >> 1)) & 0x3333333333333333;
+    x = (x | (x >> 2)) & 0x0F0F0F0F0F0F0F0F;
+    x = (x | (x >> 4)) & 0x00FF00FF00FF00FF;
+    x = (x | (x >> 8)) & 0x0000FFFF0000FFFF;
+    x = (x | (x >> 16)) & 0x00000000FFFFFFFF;
+    x as u32
+}
+
+/// (lon, lat) → the 52-bit score. Latitude occupies the even bits, as in
+/// Redis's `interleave64(lat, lon)`.
+fn geo_encode(lon: f64, lat: f64) -> u64 {
+    let cells = (1u64 << GEO_STEP) as f64;
+    let lat_off = ((lat - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN) * cells) as u64;
+    let lon_off = ((lon + 180.0) / 360.0 * cells) as u64;
+    let clamp = |v: u64| v.min((1u64 << GEO_STEP) - 1) as u32;
+    geo_spread(clamp(lat_off)) | (geo_spread(clamp(lon_off)) << 1)
+}
+
+/// Score → the cell-center (lon, lat) — the same quantization error
+/// Redis reports (~0.6 m at 26 bits).
+fn geo_decode(score: u64) -> (f64, f64) {
+    let cells = (1u64 << GEO_STEP) as f64;
+    let lat_idx = geo_squash(score) as f64;
+    let lon_idx = geo_squash(score >> 1) as f64;
+    let lat = GEO_LAT_MIN + (lat_idx + 0.5) / cells * (GEO_LAT_MAX - GEO_LAT_MIN);
+    let lon = -180.0 + (lon_idx + 0.5) / cells * 360.0;
+    (lon, lat)
+}
+
+fn geo_valid(lon: f64, lat: f64) -> bool {
+    lon.is_finite()
+        && lat.is_finite()
+        && (-180.0..=180.0).contains(&lon)
+        && (GEO_LAT_MIN..=GEO_LAT_MAX).contains(&lat)
+}
+
+fn geo_unit_factor(unit: &str) -> Option<f64> {
+    match unit.to_ascii_lowercase().as_str() {
+        "m" => Some(1.0),
+        "km" => Some(1000.0),
+        "mi" => Some(1609.34),
+        "ft" => Some(0.3048),
+        _ => None,
+    }
+}
+
+fn geo_point(lon: f64, lat: f64) -> oxidb::geo::Point {
+    oxidb::geo::Point { lon, lat }
+}
+
+fn cmd_geoadd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 4 {
+        return resp::err("wrong number of arguments for 'geoadd' command");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let (mut nx, mut xx, mut ch) = (false, false, false);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str().unwrap_or("").to_uppercase().as_str() {
+            "NX" => {
+                nx = true;
+                i += 1;
+            }
+            "XX" => {
+                xx = true;
+                i += 1;
+            }
+            "CH" => {
+                ch = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if (args.len() - i) == 0 || (args.len() - i) % 3 != 0 {
+        return resp::err("syntax error");
+    }
+    let mut map = store.sorted_sets.write().unwrap();
+    let zset = map.entry(key.to_string()).or_insert_with(SortedSet::new);
+    let (mut added, mut changed) = (0i64, 0i64);
+    while i + 2 < args.len() {
+        let lon: f64 = match args[i].as_str().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return resp::err("value is not a valid float"),
+        };
+        let lat: f64 = match args[i + 1].as_str().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return resp::err("value is not a valid float"),
+        };
+        if !geo_valid(lon, lat) {
+            return resp::err(&format!("invalid longitude,latitude pair {lon},{lat}"));
+        }
+        let member = args[i + 2].as_str().unwrap_or("").to_string();
+        i += 3;
+        let exists = zset.scores.contains_key(&member);
+        if (nx && exists) || (xx && !exists) {
+            continue;
+        }
+        let score = geo_encode(lon, lat) as f64;
+        let prior = zset.score(&member);
+        let was_new = zset.insert(member, score);
+        if was_new {
+            added += 1;
+            changed += 1;
+        } else if prior != Some(score) {
+            changed += 1;
+        }
+    }
+    resp::integer(if ch { changed } else { added })
+}
+
+/// Decoded position of `member`, or `None` when absent.
+fn geo_member_pos(zset: &SortedSet, member: &str) -> Option<(f64, f64)> {
+    zset.score(member).map(|s| geo_decode(s as u64))
+}
+
+fn cmd_geopos(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'geopos' command");
+    }
+    let map = store.sorted_sets.read().unwrap();
+    let zset = map.get(args[0].as_str().unwrap_or(""));
+    let out = args[1..]
+        .iter()
+        .map(|m| {
+            let pos = zset.and_then(|z| geo_member_pos(z, m.as_str().unwrap_or("")));
+            match pos {
+                Some((lon, lat)) => resp::array(vec![
+                    resp::bulk_string(&format!("{lon:.17}")),
+                    resp::bulk_string(&format!("{lat:.17}")),
+                ]),
+                None => RespValue::NullArray,
+            }
+        })
+        .collect();
+    resp::array(out)
+}
+
+fn cmd_geodist(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 || args.len() > 4 {
+        return resp::err("wrong number of arguments for 'geodist' command");
+    }
+    let factor = match args.get(3) {
+        None => 1.0,
+        Some(u) => match geo_unit_factor(u.as_str().unwrap_or("")) {
+            Some(f) => f,
+            None => return resp::err("unsupported unit provided. please use m, km, ft, mi"),
+        },
+    };
+    let map = store.sorted_sets.read().unwrap();
+    let Some(zset) = map.get(args[0].as_str().unwrap_or("")) else {
+        return RespValue::Null;
+    };
+    let a = geo_member_pos(zset, args[1].as_str().unwrap_or(""));
+    let b = geo_member_pos(zset, args[2].as_str().unwrap_or(""));
+    match (a, b) {
+        (Some((lon1, lat1)), Some((lon2, lat2))) => {
+            let d = oxidb::geo::haversine_m(geo_point(lon1, lat1), geo_point(lon2, lat2));
+            resp::bulk_string(&format!("{:.4}", d / factor))
+        }
+        _ => RespValue::Null,
+    }
+}
+
+fn cmd_geohash(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'geohash' command");
+    }
+    let map = store.sorted_sets.read().unwrap();
+    let zset = map.get(args[0].as_str().unwrap_or(""));
+    let out = args[1..]
+        .iter()
+        .map(|m| {
+            match zset.and_then(|z| geo_member_pos(z, m.as_str().unwrap_or(""))) {
+                // Standard 11-char geohash, like Redis (which re-encodes to
+                // the full ±90 latitude range for this command).
+                Some((lon, lat)) => {
+                    resp::bulk_string(&oxidb::geo::geohash(geo_point(lon, lat), 11))
+                }
+                None => RespValue::Null,
+            }
+        })
+        .collect();
+    resp::array(out)
+}
+
+/// The region a GEOSEARCH asks for.
+enum GeoRegion {
+    Radius(f64),
+    /// Half-extents in meters: (width/2, height/2).
+    Box(f64, f64),
+}
+
+fn cmd_geosearch(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'geosearch' command");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let (mut from_member, mut from_lonlat): (Option<String>, Option<(f64, f64)>) = (None, None);
+    let mut region: Option<GeoRegion> = None;
+    let (mut asc, mut desc) = (false, false);
+    let mut count: Option<usize> = None;
+    let (mut with_coord, mut with_dist, mut with_hash) = (false, false, false);
+
+    let mut i = 1;
+    let f64_at = |args: &[RespValue], i: usize| -> Option<f64> {
+        args.get(i)
+            .and_then(|a| a.as_str())
+            .and_then(|s| s.parse().ok())
+    };
+    while i < args.len() {
+        match args[i].as_str().unwrap_or("").to_uppercase().as_str() {
+            "FROMMEMBER" => {
+                let Some(m) = args.get(i + 1).and_then(|a| a.as_str()) else {
+                    return resp::err("syntax error");
+                };
+                from_member = Some(m.to_string());
+                i += 2;
+            }
+            "FROMLONLAT" => {
+                let (Some(lon), Some(lat)) = (f64_at(args, i + 1), f64_at(args, i + 2)) else {
+                    return resp::err("syntax error");
+                };
+                from_lonlat = Some((lon, lat));
+                i += 3;
+            }
+            "BYRADIUS" => {
+                let Some(r) = f64_at(args, i + 1) else {
+                    return resp::err("syntax error");
+                };
+                let Some(f) = args
+                    .get(i + 2)
+                    .and_then(|a| a.as_str())
+                    .and_then(geo_unit_factor)
+                else {
+                    return resp::err("unsupported unit provided. please use m, km, ft, mi");
+                };
+                region = Some(GeoRegion::Radius(r * f));
+                i += 3;
+            }
+            "BYBOX" => {
+                let (Some(w), Some(h)) = (f64_at(args, i + 1), f64_at(args, i + 2)) else {
+                    return resp::err("syntax error");
+                };
+                let Some(f) = args
+                    .get(i + 3)
+                    .and_then(|a| a.as_str())
+                    .and_then(geo_unit_factor)
+                else {
+                    return resp::err("unsupported unit provided. please use m, km, ft, mi");
+                };
+                region = Some(GeoRegion::Box(w * f / 2.0, h * f / 2.0));
+                i += 4;
+            }
+            "ASC" => {
+                asc = true;
+                i += 1;
+            }
+            "DESC" => {
+                desc = true;
+                i += 1;
+            }
+            "COUNT" => {
+                let Some(n) = args
+                    .get(i + 1)
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                else {
+                    return resp::err("COUNT must be > 0");
+                };
+                count = Some(n);
+                i += 2;
+                // ANY is accepted and ignored — every member is examined
+                // anyway, so the answer is simply exact.
+                if args
+                    .get(i)
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("ANY"))
+                {
+                    i += 1;
+                }
+            }
+            "WITHCOORD" => {
+                with_coord = true;
+                i += 1;
+            }
+            "WITHDIST" => {
+                with_dist = true;
+                i += 1;
+            }
+            "WITHHASH" => {
+                with_hash = true;
+                i += 1;
+            }
+            other => return resp::err(&format!("unknown GEOSEARCH option '{other}'")),
+        }
+    }
+    let Some(region) = region else {
+        return resp::err("GEOSEARCH needs BYRADIUS or BYBOX");
+    };
+    if from_member.is_some() == from_lonlat.is_some() {
+        return resp::err("GEOSEARCH needs exactly one of FROMMEMBER or FROMLONLAT");
+    }
+
+    let map = store.sorted_sets.read().unwrap();
+    let Some(zset) = map.get(key) else {
+        return resp::array(vec![]);
+    };
+    let (olon, olat) = match from_member {
+        Some(m) => match geo_member_pos(zset, &m) {
+            Some(p) => p,
+            None => return resp::err("could not decode requested zset member"),
+        },
+        None => from_lonlat.unwrap(),
+    };
+    let origin = geo_point(olon, olat);
+
+    let mut hits: Vec<(f64, String, f64, f64, u64)> = Vec::new();
+    for (member, &score) in &zset.scores {
+        let (lon, lat) = geo_decode(score as u64);
+        let p = geo_point(lon, lat);
+        let d = oxidb::geo::haversine_m(origin, p);
+        let inside = match region {
+            GeoRegion::Radius(r) => d <= r,
+            GeoRegion::Box(hw, hh) => {
+                // Axis distances, measured on the sphere like Redis: the
+                // east–west leg along the origin's latitude, the
+                // north–south leg along the origin's meridian.
+                let dx = oxidb::geo::haversine_m(origin, geo_point(lon, olat));
+                let dy = oxidb::geo::haversine_m(origin, geo_point(olon, lat));
+                dx <= hw && dy <= hh
+            }
+        };
+        if inside {
+            hits.push((d, member.clone(), lon, lat, score as u64));
+        }
+    }
+    // Deterministic nearest-first by default; DESC flips it. (Redis leaves
+    // the order unspecified without ASC/DESC — sorted is a valid instance.)
+    hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if desc && !asc {
+        hits.reverse();
+    }
+    if let Some(n) = count {
+        hits.truncate(n);
+    }
+
+    let out = hits
+        .into_iter()
+        .map(|(d, member, lon, lat, score)| {
+            if !(with_coord || with_dist || with_hash) {
+                return resp::bulk_string(&member);
+            }
+            let mut item = vec![resp::bulk_string(&member)];
+            if with_dist {
+                item.push(resp::bulk_string(&format!("{d:.4}")));
+            }
+            if with_hash {
+                item.push(resp::integer(score as i64));
+            }
+            if with_coord {
+                item.push(resp::array(vec![
+                    resp::bulk_string(&format!("{lon:.17}")),
+                    resp::bulk_string(&format!("{lat:.17}")),
+                ]));
+            }
+            resp::array(item)
+        })
+        .collect();
+    resp::array(out)
 }
 
 fn cmd_zrem(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -5608,5 +6020,118 @@ mod tests {
             execute(&store, &c(&["HGET", "bal", "usd"])).as_str(),
             Some("10")
         );
+    }
+
+    #[test]
+    fn geo_commands_roundtrip_measure_and_search() {
+        let store = OxiMemStore::new();
+        // Istanbul, Ankara, Toronto.
+        let r = execute(
+            &store,
+            &c(&[
+                "GEOADD", "cities", "28.9784", "41.0082", "ist", "32.8597", "39.9334", "ank",
+                "-79.3829", "43.6544", "tor",
+            ]),
+        );
+        assert_eq!(r, RespValue::Integer(3));
+
+        // GEOPOS decodes to ~the stored point (26-bit cell ≈ sub-meter).
+        let r = execute(&store, &c(&["GEOPOS", "cities", "ist", "ghost"]));
+        let RespValue::Array(items) = r else {
+            panic!("{r:?}")
+        };
+        let RespValue::Array(pos) = &items[0] else {
+            panic!("{items:?}")
+        };
+        let lon: f64 = pos[0].as_str().unwrap().parse().unwrap();
+        let lat: f64 = pos[1].as_str().unwrap().parse().unwrap();
+        assert!((lon - 28.9784).abs() < 1e-4 && (lat - 41.0082).abs() < 1e-4);
+        assert_eq!(items[1], RespValue::NullArray);
+
+        // GEODIST Istanbul–Ankara ≈ 351 km (unit conversion included).
+        let r = execute(&store, &c(&["GEODIST", "cities", "ist", "ank", "km"]));
+        let km: f64 = r.as_str().unwrap().parse().unwrap();
+        assert!((340.0..365.0).contains(&km), "{km}");
+        assert_eq!(
+            execute(&store, &c(&["GEODIST", "cities", "ist", "ghost"])),
+            RespValue::Null
+        );
+
+        // GEOSEARCH BYRADIUS from a member: 500 km around Istanbul finds
+        // Ankara but never Toronto; nearest-first with ASC.
+        let r = execute(
+            &store,
+            &c(&[
+                "GEOSEARCH",
+                "cities",
+                "FROMMEMBER",
+                "ist",
+                "BYRADIUS",
+                "500",
+                "km",
+                "ASC",
+            ]),
+        );
+        let RespValue::Array(hits) = r else {
+            panic!("{r:?}")
+        };
+        let names: Vec<&str> = hits.iter().filter_map(|h| h.as_str()).collect();
+        assert_eq!(names, vec!["ist", "ank"]);
+
+        // BYBOX + COUNT + WITHDIST/WITHCOORD item shape.
+        let r = execute(
+            &store,
+            &c(&[
+                "GEOSEARCH",
+                "cities",
+                "FROMLONLAT",
+                "28.9784",
+                "41.0082",
+                "BYBOX",
+                "100",
+                "100",
+                "km",
+                "ASC",
+                "COUNT",
+                "1",
+                "WITHDIST",
+                "WITHCOORD",
+            ]),
+        );
+        let RespValue::Array(hits) = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(hits.len(), 1);
+        let RespValue::Array(item) = &hits[0] else {
+            panic!("{hits:?}")
+        };
+        assert_eq!(item[0].as_str(), Some("ist"));
+        let d: f64 = item[1].as_str().unwrap().parse().unwrap();
+        assert!(d < 1.0, "distance to self ≈ 0, got {d}");
+        assert!(matches!(&item[2], RespValue::Array(p) if p.len() == 2));
+
+        // GEOHASH: standard 11-char geohash, prefix-checked against the
+        // known Istanbul vector (sxk973m6j at 9 chars).
+        let r = execute(&store, &c(&["GEOHASH", "cities", "ist"]));
+        let RespValue::Array(items) = r else {
+            panic!("{r:?}")
+        };
+        let h = items[0].as_str().unwrap();
+        assert_eq!(h.len(), 11);
+        assert!(h.starts_with("sxk973"), "{h}");
+
+        // GEO members are plain zset members: ZREM removes, ZCARD counts.
+        assert_eq!(
+            execute(&store, &c(&["ZCARD", "cities"])),
+            RespValue::Integer(3)
+        );
+        assert_eq!(
+            execute(&store, &c(&["ZREM", "cities", "tor"])),
+            RespValue::Integer(1)
+        );
+
+        // Out-of-range coordinates are refused by value.
+        let r = execute(&store, &c(&["GEOADD", "cities", "200", "10", "bad"]));
+        assert!(matches!(r, RespValue::Error(_)), "{r:?}");
     }
 }

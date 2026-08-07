@@ -1632,9 +1632,8 @@ mod tests {
             compact_min_bytes: 0,
             ..StorageOptions::default()
         };
-        let storage = Arc::new(
-            BTreeStorage::open_with_options("deadlock", dir.path(), None, opts).unwrap(),
-        );
+        let storage =
+            Arc::new(BTreeStorage::open_with_options("deadlock", dir.path(), None, opts).unwrap());
         for i in 1..=200u64 {
             storage.insert(i, vec![b'x'; 512]);
         }

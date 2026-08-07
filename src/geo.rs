@@ -7,9 +7,13 @@
 //!                        "$maxDistance": meters, "$minDistance": meters}}}`
 //!   `{"loc": {"$near": [lon, lat]}}`  (with optional sibling `$maxDistance` meters)
 //!
-//! `$nearSphere` is an alias for `$near`. MongoDB's planar `$center` and
-//! polygon `$geometry` regions are refused by name (v1 is points on the
-//! sphere) — refusal, never silent mis-measurement.
+//!   `{"loc": {"$geoWithin": {"$geometry": {"type": "Polygon", "coordinates": [...]}}}}`
+//!   `{"loc": {"$geoIntersects": {"$geometry": Polygon|Point}}}`  (point data:
+//!   intersects ≡ within, so both share one evaluator)
+//!
+//! `$nearSphere` is an alias for `$near`. MongoDB's planar `$center` is
+//! refused by name; polygons wider than 180° of longitude are refused at
+//! parse (ambiguous winding) — refusal, never silent mis-measurement.
 //!
 //! A stored point is any of: `[lon, lat]`, GeoJSON `{"type": "Point",
 //! "coordinates": [lon, lat]}`, or `{"lon"|"lng": x, "lat": y}`.
@@ -104,7 +108,7 @@ pub fn haversine_m(a: Point, b: Point) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// A `$geoWithin` region.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum GeoShape {
     /// Spherical cap: everything within `radius_m` meters of the center.
     Circle { center: Point, radius_m: f64 },
@@ -113,14 +117,45 @@ pub enum GeoShape {
         min: Point, // (min lon, min lat)
         max: Point, // (max lon, max lat)
     },
+    /// GeoJSON Polygon: an exterior ring plus optional holes, point-in-
+    /// polygon by ray casting on the lon/lat plane. Rings are stored open
+    /// (the GeoJSON closing point is dropped at parse). Planar evaluation
+    /// is the honest fit for geofence-sized regions; polygons whose
+    /// bounding box spans more than 180° of longitude are refused at parse
+    /// (ambiguous winding), never silently mis-measured.
+    Polygon {
+        exterior: Vec<Point>,
+        holes: Vec<Vec<Point>>,
+    },
+}
+
+/// Ray casting on the lon/lat plane: does `ring` (open, ≥3 points)
+/// contain `p`? The standard even-odd crossing rule; a point exactly on
+/// an edge may land on either side, as in every planar implementation.
+fn ring_contains(ring: &[Point], p: Point) -> bool {
+    let mut inside = false;
+    let mut j = ring.len() - 1;
+    for i in 0..ring.len() {
+        let (a, b) = (ring[i], ring[j]);
+        if (a.lat > p.lat) != (b.lat > p.lat)
+            && p.lon < (b.lon - a.lon) * (p.lat - a.lat) / (b.lat - a.lat) + a.lon
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 impl GeoShape {
     pub fn contains(&self, p: Point) -> bool {
-        match *self {
-            GeoShape::Circle { center, radius_m } => haversine_m(center, p) <= radius_m,
+        match self {
+            GeoShape::Circle { center, radius_m } => haversine_m(*center, p) <= *radius_m,
             GeoShape::Rect { min, max } => {
                 p.lon >= min.lon && p.lon <= max.lon && p.lat >= min.lat && p.lat <= max.lat
+            }
+            GeoShape::Polygon { exterior, holes } => {
+                ring_contains(exterior, p) && !holes.iter().any(|h| ring_contains(h, p))
             }
         }
     }
@@ -164,11 +199,81 @@ fn query_point(v: &Value) -> Result<Point, String> {
     })
 }
 
+/// Parse one GeoJSON Polygon ring into an open point list.
+fn parse_ring(v: &Value) -> Result<Vec<Point>, String> {
+    let arr = v
+        .as_array()
+        .ok_or("Polygon ring must be an array of [lon, lat] points")?;
+    let mut pts = Vec::with_capacity(arr.len());
+    for pv in arr {
+        pts.push(query_point(pv)?);
+    }
+    // GeoJSON closes rings explicitly; store them open.
+    if pts.len() >= 2 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    if pts.len() < 3 {
+        return Err("Polygon ring needs at least 3 distinct points".into());
+    }
+    Ok(pts)
+}
+
+/// Parse a GeoJSON Polygon geometry body (`coordinates`: exterior ring
+/// first, then holes).
+fn polygon_from_geojson(g: &serde_json::Map<String, Value>) -> Result<GeoShape, String> {
+    let rings = g
+        .get("coordinates")
+        .and_then(|c| c.as_array())
+        .ok_or("Polygon needs a 'coordinates' array of rings")?;
+    let mut it = rings.iter();
+    let exterior = parse_ring(it.next().ok_or("Polygon needs at least an exterior ring")?)?;
+    let holes = it.map(parse_ring).collect::<Result<Vec<_>, _>>()?;
+    let (min_lon, max_lon) = exterior
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p.lon), hi.max(p.lon))
+        });
+    if max_lon - min_lon > 180.0 {
+        // Which side of the ring is "inside" is ambiguous on the plane once
+        // the ring spans most of the globe — refuse rather than guess.
+        return Err(
+            "Polygon spanning more than 180° of longitude is ambiguous — split it at the antimeridian"
+                .into(),
+        );
+    }
+    Ok(GeoShape::Polygon { exterior, holes })
+}
+
+/// Parse the body of `$geoIntersects`: `{"$geometry": Polygon|Point}`.
+/// The document engine stores points, and a point intersects a region
+/// exactly when the region contains it — so this evaluates as a
+/// `$geoWithin` (a Point geometry degenerates to a zero-radius circle).
+pub fn intersects_shape_from_json(v: &Value) -> Result<GeoShape, String> {
+    let g = v
+        .as_object()
+        .and_then(|o| o.get("$geometry"))
+        .and_then(|g| g.as_object())
+        .ok_or("$geoIntersects takes {\"$geometry\": {...}}")?;
+    match g.get("type").and_then(|t| t.as_str()) {
+        Some("Polygon") => polygon_from_geojson(g),
+        Some("Point") => {
+            let center = query_point(&Value::Object(g.clone()))?;
+            Ok(GeoShape::Circle {
+                center,
+                radius_m: 0.0,
+            })
+        }
+        other => Err(format!(
+            "$geoIntersects supports Polygon and Point geometries, got {other:?}"
+        )),
+    }
+}
+
 /// Parse the body of `$geoWithin`.
 pub fn shape_from_json(v: &Value) -> Result<GeoShape, String> {
     let obj = v
         .as_object()
-        .ok_or("$geoWithin takes an object ($centerSphere or $box)")?;
+        .ok_or("$geoWithin takes an object ($centerSphere, $box or $geometry Polygon)")?;
     if let Some(cs) = obj.get("$centerSphere") {
         let arr = cs
             .as_array()
@@ -196,14 +301,25 @@ pub fn shape_from_json(v: &Value) -> Result<GeoShape, String> {
         }
         return Ok(GeoShape::Rect { min, max });
     }
-    for unsupported in ["$center", "$geometry", "$polygon"] {
+    if let Some(g) = obj.get("$geometry") {
+        let g = g
+            .as_object()
+            .ok_or("$geoWithin $geometry must be a GeoJSON object")?;
+        return match g.get("type").and_then(|t| t.as_str()) {
+            Some("Polygon") => polygon_from_geojson(g),
+            other => Err(format!(
+                "$geoWithin $geometry supports Polygon, got {other:?} — use $centerSphere for circles"
+            )),
+        };
+    }
+    for unsupported in ["$center", "$polygon"] {
         if obj.contains_key(unsupported) {
             return Err(format!(
-                "$geoWithin {unsupported} is not supported — use $centerSphere (spherical) or $box"
+                "$geoWithin {unsupported} is not supported — use $centerSphere (spherical), $box, or $geometry Polygon"
             ));
         }
     }
-    Err("$geoWithin needs $centerSphere or $box".into())
+    Err("$geoWithin needs $centerSphere, $box or $geometry Polygon".into())
 }
 
 /// Parse the body of `$near`/`$nearSphere`. `siblings` carries the legacy
@@ -304,6 +420,16 @@ pub fn cover(shape: &GeoShape) -> Option<Vec<String>> {
     // Bounding box of the shape in degrees.
     let (min_lon, min_lat, max_lon, max_lat) = match *shape {
         GeoShape::Rect { min, max } => (min.lon, min.lat, max.lon, max.lat),
+        GeoShape::Polygon { ref exterior, .. } => {
+            // The exterior's bbox bounds the polygon (holes only subtract).
+            let mut min = (f64::INFINITY, f64::INFINITY);
+            let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for p in exterior {
+                min = (min.0.min(p.lon), min.1.min(p.lat));
+                max = (max.0.max(p.lon), max.1.max(p.lat));
+            }
+            (min.0, min.1, max.0, max.1)
+        }
         GeoShape::Circle { center, radius_m } => {
             let dlat = (radius_m / 110_574.0).min(90.0);
             // Meters per degree of longitude shrink with latitude; use the
@@ -357,20 +483,249 @@ pub fn cover(shape: &GeoShape) -> Option<Vec<String>> {
 // The index
 // ---------------------------------------------------------------------------
 
+/// `.geoidx` v1: `[b"OXGE"][version u32][entry_count u64]` then
+/// `entry_count` fixed-width entries `[geohash: 9 ASCII bytes][doc_id u64]`,
+/// sorted by (geohash, id) — a prefix scan is one binary-searched lower
+/// bound plus a linear walk. Every geohash is exactly `INDEX_PRECISION`
+/// characters, which is what makes the fixed width possible.
+const GEO_MAGIC: &[u8; 4] = b"OXGE";
+const GEO_FORMAT_VERSION: u32 = 1;
+const GEO_HEADER: usize = 4 + 4 + 8;
+const GEO_ENTRY: usize = INDEX_PRECISION + 8;
+
+/// The mmap'd bulk of a disk-backed geo index. **The base is a HINT, not
+/// the truth** (the SQL `.sidx` contract): every candidate it nominates is
+/// verified against the live document by the query layer — geo predicates
+/// always post-filter — so a stale entry (deleted or moved doc) is
+/// self-correcting, never wrong.
+#[cfg(not(target_arch = "wasm32"))]
+struct GeoBase {
+    mmap: memmap2::Mmap,
+    entries: usize,
+}
+
+/// wasm32 has no filesystem, so a disk base is never constructed there —
+/// this stub keeps the single GeoIndex code path compiling.
+#[cfg(target_arch = "wasm32")]
+struct GeoBase {
+    entries: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl GeoBase {
+    fn entry(&self, _i: usize) -> (&[u8], DocumentId) {
+        unreachable!("no disk-backed geo base on wasm32")
+    }
+    fn scan_prefix(
+        &self,
+        _prefix: &str,
+        _dead: &std::collections::HashSet<DocumentId>,
+        _out: &mut BTreeSet<DocumentId>,
+    ) {
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GeoBase {
+    fn entry(&self, i: usize) -> (&[u8], DocumentId) {
+        let off = GEO_HEADER + i * GEO_ENTRY;
+        let hash = &self.mmap[off..off + INDEX_PRECISION];
+        let id = u64::from_le_bytes(
+            self.mmap[off + INDEX_PRECISION..off + GEO_ENTRY]
+                .try_into()
+                .unwrap(),
+        );
+        (hash, id)
+    }
+
+    /// All ids whose geohash starts with `prefix`, minus `dead`.
+    fn scan_prefix(
+        &self,
+        prefix: &str,
+        dead: &std::collections::HashSet<DocumentId>,
+        out: &mut BTreeSet<DocumentId>,
+    ) {
+        let pb = prefix.as_bytes();
+        // Lower bound: first entry whose hash is >= prefix.
+        let (mut lo, mut hi) = (0usize, self.entries);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.entry(mid).0 < pb {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for i in lo..self.entries {
+            let (hash, id) = self.entry(i);
+            if !hash.starts_with(pb) {
+                break;
+            }
+            if !dead.contains(&id) {
+                out.insert(id);
+            }
+        }
+    }
+}
+
 /// Geohash index over one field: fixed-precision geohash → document ids.
 ///
-/// Only the *definition* is persisted (in the collection's index metadata);
-/// the table is rebuilt by one document scan at open, the same deal the text
-/// index made — paid only by collections that asked for geo.
-#[derive(Debug, Default)]
+/// Two modes, decided by the collection's storage mode. In-RAM: the whole
+/// table lives in `cells`/`ids` and only the *definition* persists (rebuilt
+/// by one document scan at open). Disk-first: the bulk is an mmap'd
+/// `.geoidx` base plus a small overlay of writes since the last persist —
+/// open is instant (no scan) and resident memory is bounded by the persist
+/// interval, not by document count. `dead` records ids whose base entry
+/// was superseded; the query path skips them and `persist_disk` drops them
+/// while merging base + overlay into a fresh file.
+#[derive(Default)]
 pub struct GeoIndex {
     cells: BTreeMap<String, BTreeSet<DocumentId>>,
     ids: HashMap<DocumentId, String>,
+    dead: std::collections::HashSet<DocumentId>,
+    base: Option<GeoBase>,
+    path: Option<std::path::PathBuf>,
+    dirty: bool,
+}
+
+impl std::fmt::Debug for GeoIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoIndex")
+            .field("overlay", &self.ids.len())
+            .field("dead", &self.dead.len())
+            .field("base_entries", &self.base.as_ref().map(|b| b.entries))
+            .finish()
+    }
 }
 
 impl GeoIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A disk-backed index that will persist to `path` (no base yet — the
+    /// caller builds it with `upsert` and calls `persist_disk`).
+    pub fn new_disk(path: std::path::PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            ..Self::default()
+        }
+    }
+
+    /// No filesystem on wasm32 — always an error, so the caller rebuilds.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_disk(_path: std::path::PathBuf) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no filesystem on wasm32",
+        ))
+    }
+
+    /// Reopen a disk-backed index from its `.geoidx` file: mmap the base,
+    /// empty overlay — no document scan. Refuses a wrong magic/version/size
+    /// so a corrupt file rebuilds instead of answering garbage.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_disk(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        if mmap.len() < GEO_HEADER || &mmap[..4] != GEO_MAGIC {
+            return Err(bad("not a .geoidx file"));
+        }
+        if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) != GEO_FORMAT_VERSION {
+            return Err(bad("unsupported .geoidx version"));
+        }
+        let entries = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        if mmap.len() < GEO_HEADER + entries * GEO_ENTRY {
+            return Err(bad(".geoidx truncated"));
+        }
+        Ok(Self {
+            base: Some(GeoBase { mmap, entries }),
+            path: Some(path),
+            ..Self::default()
+        })
+    }
+
+    /// No filesystem on wasm32 — nothing to persist, nothing lost (the
+    /// overlay IS the whole index there).
+    #[cfg(target_arch = "wasm32")]
+    pub fn persist_disk(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Merge base + overlay (minus superseded entries) into a fresh file,
+    /// atomically replace the old one, and become base-only again.
+    /// Skip-clean: an idle tick costs one flag check.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn persist_disk(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(()); // in-RAM index: nothing to persist
+        };
+        if !self.dirty && self.base.is_some() {
+            return Ok(());
+        }
+        let tmp = path.with_extension("geoidx.tmp");
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        use std::io::Write;
+        w.write_all(GEO_MAGIC)?;
+        w.write_all(&GEO_FORMAT_VERSION.to_le_bytes())?;
+        w.write_all(&0u64.to_le_bytes())?; // count patched below
+        let mut count: u64 = 0;
+        {
+            // Two-way merge: the base is sorted by construction, the overlay
+            // by BTreeMap iteration. Base entries in `dead` are dropped.
+            let mut overlay = self
+                .cells
+                .iter()
+                .flat_map(|(cell, ids)| ids.iter().map(move |id| (cell.as_bytes(), *id)))
+                .peekable();
+            let mut write = |hash: &[u8], id: DocumentId| -> std::io::Result<()> {
+                w.write_all(hash)?;
+                w.write_all(&id.to_le_bytes())?;
+                count += 1;
+                Ok(())
+            };
+            if let Some(base) = &self.base {
+                let mut i = 0usize;
+                while i < base.entries {
+                    let (bh, bid) = base.entry(i);
+                    while let Some(&(oh, oid)) = overlay.peek() {
+                        if (oh, oid) < (bh, bid) {
+                            write(oh, oid)?;
+                            overlay.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !self.dead.contains(&bid) {
+                        write(bh, bid)?;
+                    }
+                    i += 1;
+                }
+            }
+            for (oh, oid) in overlay {
+                write(oh, oid)?;
+            }
+        }
+        let mut file = w.into_inner().map_err(|e| e.into_error())?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(8))?;
+        file.write_all(&count.to_le_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        self.base = Some(GeoBase {
+            mmap,
+            entries: count as usize,
+        });
+        self.cells.clear();
+        self.ids.clear();
+        self.dead.clear();
+        self.dirty = false;
+        Ok(())
     }
 
     /// Index (or re-index) a document's point; a non-point value removes any
@@ -381,6 +736,7 @@ impl GeoIndex {
             let cell = geohash(p, INDEX_PRECISION);
             self.cells.entry(cell.clone()).or_default().insert(id);
             self.ids.insert(id, cell);
+            self.dirty = true;
         }
     }
 
@@ -388,6 +744,12 @@ impl GeoIndex {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.ids.clear();
+        if let Some(base) = &self.base {
+            for i in 0..base.entries {
+                self.dead.insert(base.entry(i).1);
+            }
+        }
+        self.dirty = true;
     }
 
     pub fn remove(&mut self, id: DocumentId) {
@@ -398,6 +760,11 @@ impl GeoIndex {
                     self.cells.remove(&cell);
                 }
             }
+            self.dirty = true;
+        }
+        // The base may also hold this id (under its old cell) — supersede it.
+        if self.base.is_some() && self.dead.insert(id) {
+            self.dirty = true;
         }
     }
 
@@ -415,16 +782,24 @@ impl GeoIndex {
             {
                 out.extend(ids.iter().copied());
             }
+            if let Some(base) = &self.base {
+                base.scan_prefix(&prefix, &self.dead, &mut out);
+            }
         }
         Some(out)
     }
 
+    /// Indexed documents. Exact for a pure in-RAM or freshly persisted
+    /// index; between persists in disk mode it can over-count a document
+    /// whose base entry is superseded by an overlay one (both are counted
+    /// once, the dead set subtracts once).
     pub fn len(&self) -> usize {
-        self.ids.len()
+        let base = self.base.as_ref().map(|b| b.entries).unwrap_or(0);
+        (base + self.ids.len()).saturating_sub(self.dead.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.len() == 0
     }
 }
 
@@ -547,5 +922,69 @@ mod tests {
         };
         // Half the planet: no useful cover; candidates() says "scan".
         assert!(cover(&shape).is_none() || cover(&shape).unwrap().len() <= MAX_COVER_CELLS);
+    }
+
+    #[test]
+    fn disk_index_roundtrips_and_supersedes_stale_base_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.loc.geoidx");
+        let ist = json!([28.9784, 41.0082]);
+        let tor = json!([-79.3829, 43.6544]);
+        let circle_ist = GeoShape::Circle {
+            center: p(28.9784, 41.0082),
+            radius_m: 5_000.0,
+        };
+
+        // Build + persist.
+        let mut idx = GeoIndex::new_disk(path.clone());
+        idx.upsert(1, Some(&ist));
+        idx.upsert(2, Some(&ist));
+        idx.upsert(3, Some(&tor));
+        idx.persist_disk().unwrap();
+
+        // Reopen: base only, no overlay — same candidates.
+        let mut idx = GeoIndex::open_disk(path.clone()).unwrap();
+        let c = idx.candidates(&circle_ist).unwrap();
+        assert!(c.contains(&1) && c.contains(&2) && !c.contains(&3));
+        assert_eq!(idx.len(), 3);
+
+        // Mutations against the base: move 1 to Toronto, delete 2, add 4.
+        idx.upsert(1, Some(&tor));
+        idx.remove(2);
+        idx.upsert(4, Some(&ist));
+        let c = idx.candidates(&circle_ist).unwrap();
+        assert!(
+            !c.contains(&1) && !c.contains(&2) && c.contains(&4),
+            "dead base entries must be skipped: {c:?}"
+        );
+        let c_tor = idx
+            .candidates(&GeoShape::Circle {
+                center: p(-79.3829, 43.6544),
+                radius_m: 5_000.0,
+            })
+            .unwrap();
+        assert!(c_tor.contains(&1) && c_tor.contains(&3));
+
+        // Persist folds the overlay; a fresh reopen answers identically.
+        idx.persist_disk().unwrap();
+        let idx = GeoIndex::open_disk(path).unwrap();
+        let c = idx.candidates(&circle_ist).unwrap();
+        assert!(!c.contains(&1) && !c.contains(&2) && c.contains(&4));
+        assert_eq!(idx.len(), 3); // docs 1, 3, 4
+    }
+
+    #[test]
+    fn corrupt_geoidx_is_refused_not_believed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.geoidx");
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(GeoIndex::open_disk(path.clone()).is_err());
+        // Truncated entry table: header promises more than the file holds.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"OXGE");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(GeoIndex::open_disk(path).is_err());
     }
 }

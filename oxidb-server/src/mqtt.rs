@@ -411,6 +411,11 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                         message.as_bytes(),
                         qos,
                     );
+                    // MQTT → collection bridge (OXIDB_MQTT_INGEST): a mapped
+                    // publish becomes a queryable document, before the ack
+                    // so the collection write is covered by it too. One
+                    // atomic load when unconfigured.
+                    crate::mqtt_ingest::ingest(&topic, &message);
                     // The dedup id itself must survive a crash for a durable
                     // publisher, or its post-restart retransmission fans out a
                     // second copy — exactly-once has to hold across the crash.

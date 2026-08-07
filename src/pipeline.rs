@@ -323,6 +323,17 @@ enum FillMethod {
 #[derive(Debug, Clone)]
 enum Stage {
     Match(Value),
+    /// `$geoNear` phase 2: distance computation + nearest-first sort.
+    /// Phase 1 (the filtering) is a synthesized leading `$match` carrying
+    /// the equivalent `$near` predicate, which the parser emits right
+    /// before this stage — so the find path's geo index, candidate
+    /// intersection and pushdown all serve `$geoNear` for free.
+    GeoNear {
+        key: String,
+        center: crate::geo::Point,
+        distance_field: String,
+        multiplier: f64,
+    },
     Group {
         key: GroupKey,
         accumulators: Vec<(String, Accumulator)>,
@@ -1937,6 +1948,134 @@ fn parse_fill_stage(val: &Value) -> Result<Stage> {
         sort_by,
         outputs,
     })
+}
+
+/// Parse `$geoNear` into its two stages: a `$match` carrying the
+/// equivalent `$near` predicate (plus the user's `query`), and the
+/// distance/sort stage. `key` and `distanceField` are required — the
+/// parser cannot see the collection's indexes, so it never guesses which
+/// field holds the point. Distances are meters (spherical), scaled by
+/// `distanceMultiplier` when given; `spherical` is accepted and ignored
+/// (this engine is always spherical).
+fn parse_geo_near_stage(body: &Value) -> Result<(Stage, Stage)> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$geoNear must be an object".into()))?;
+    for k in obj.keys() {
+        match k.as_str() {
+            "near" | "key" | "distanceField" | "maxDistance" | "minDistance" | "query"
+            | "spherical" | "distanceMultiplier" => {}
+            other => {
+                return Err(Error::InvalidPipeline(format!(
+                    "$geoNear: unsupported option '{other}'"
+                )));
+            }
+        }
+    }
+    let center = obj
+        .get("near")
+        .and_then(crate::geo::point_of_value)
+        .ok_or_else(|| {
+            Error::InvalidPipeline(
+                "$geoNear requires 'near' ([lon, lat] or a GeoJSON Point)".into(),
+            )
+        })?;
+    let key = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$geoNear requires 'key' (the point field path)".into())
+        })?
+        .to_string();
+    let distance_field = obj
+        .get("distanceField")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidPipeline("$geoNear requires 'distanceField'".into()))?
+        .to_string();
+    let dist_opt = |name: &str| -> Result<Option<f64>> {
+        match obj.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .filter(|m| m.is_finite() && *m >= 0.0)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::InvalidPipeline(format!(
+                        "$geoNear {name} must be a non-negative number of meters"
+                    ))
+                }),
+        }
+    };
+    let max = dist_opt("maxDistance")?;
+    let min = dist_opt("minDistance")?;
+    let multiplier = match obj.get("distanceMultiplier") {
+        None => 1.0,
+        Some(v) => v
+            .as_f64()
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .ok_or_else(|| {
+                Error::InvalidPipeline(
+                    "$geoNear distanceMultiplier must be a positive number".into(),
+                )
+            })?,
+    };
+
+    let mut near_body =
+        json!({"$geometry": {"type": "Point", "coordinates": [center.lon, center.lat]}});
+    if let Some(m) = max {
+        near_body["$maxDistance"] = json!(m);
+    }
+    if let Some(m) = min {
+        near_body["$minDistance"] = json!(m);
+    }
+    let near_match = json!({ key.as_str(): {"$near": near_body} });
+    let combined = match obj.get("query") {
+        None => near_match,
+        Some(q) if q.is_object() => json!({"$and": [q, near_match]}),
+        Some(_) => {
+            return Err(Error::InvalidPipeline(
+                "$geoNear 'query' must be an object".into(),
+            ));
+        }
+    };
+    Ok((
+        Stage::Match(combined),
+        Stage::GeoNear {
+            key,
+            center,
+            distance_field,
+            multiplier,
+        },
+    ))
+}
+
+/// `$geoNear` phase 2: decorate each document with its distance from the
+/// center (already filtered by the synthesized `$match`), then sort
+/// nearest-first. A document whose key is not a point sorts last — it can
+/// only reach here through a hand-built pipeline, since the filter never
+/// passes one.
+fn exec_geo_near(
+    docs: Vec<Value>,
+    key: &str,
+    center: crate::geo::Point,
+    distance_field: &str,
+    multiplier: f64,
+) -> Vec<Value> {
+    let mut decorated: Vec<(f64, Value)> = docs
+        .into_iter()
+        .map(|mut doc| {
+            let dist = resolve_field_ref(&doc, key)
+                .and_then(crate::geo::point_of_value)
+                .map(|p| crate::geo::haversine_m(center, p))
+                .unwrap_or(f64::INFINITY);
+            if dist.is_finite() {
+                set_field(&mut doc, distance_field, json!(dist * multiplier));
+            }
+            (dist, doc)
+        })
+        .collect();
+    decorated.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    decorated.into_iter().map(|(_, doc)| doc).collect()
 }
 
 fn parse_accumulator(val: &Value) -> Result<Accumulator> {
@@ -5068,6 +5207,17 @@ impl Pipeline {
 
             let stage = match stage_name.as_str() {
                 "$match" => Stage::Match(stage_body.clone()),
+                "$geoNear" => {
+                    if !stages.is_empty() {
+                        return Err(Error::InvalidPipeline(
+                            "$geoNear must be the first stage in the pipeline".into(),
+                        ));
+                    }
+                    let (filter, geo) = parse_geo_near_stage(stage_body)?;
+                    stages.push(filter);
+                    stages.push(geo);
+                    continue;
+                }
                 "$group" => parse_group_stage(stage_body)?,
                 "$ohlcv" => parse_ohlcv_stage(stage_body)?,
                 "$densify" => parse_densify_stage(stage_body)?,
@@ -5168,9 +5318,14 @@ impl Pipeline {
                         Error::InvalidPipeline("$graphLookup must be an object".into())
                     })?;
                     let req = |key: &str| -> Result<String> {
-                        obj.get(key).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
-                            Error::InvalidPipeline(format!("$graphLookup requires '{key}' string"))
-                        })
+                        obj.get(key)
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .ok_or_else(|| {
+                                Error::InvalidPipeline(format!(
+                                    "$graphLookup requires '{key}' string"
+                                ))
+                            })
                     };
                     let start_with = parse_expression(obj.get("startWith").ok_or_else(|| {
                         Error::InvalidPipeline("$graphLookup requires 'startWith'".into())
@@ -5210,9 +5365,14 @@ impl Pipeline {
                         Error::InvalidPipeline("$shortestPath must be an object".into())
                     })?;
                     let req = |key: &str| -> Result<String> {
-                        obj.get(key).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
-                            Error::InvalidPipeline(format!("$shortestPath requires '{key}' string"))
-                        })
+                        obj.get(key)
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .ok_or_else(|| {
+                                Error::InvalidPipeline(format!(
+                                    "$shortestPath requires '{key}' string"
+                                ))
+                            })
                     };
                     let expr = |key: &str| -> Result<Expression> {
                         parse_expression(obj.get(key).ok_or_else(|| {
@@ -5229,14 +5389,14 @@ impl Pipeline {
                     let max_cost = match obj.get("maxCost") {
                         None => None,
                         Some(c) => Some(
-                            c.as_f64().filter(|c| *c >= 0.0 && c.is_finite()).ok_or_else(
-                                || {
+                            c.as_f64()
+                                .filter(|c| *c >= 0.0 && c.is_finite())
+                                .ok_or_else(|| {
                                     Error::InvalidPipeline(
                                         "$shortestPath maxCost must be a non-negative number"
                                             .into(),
                                     )
-                                },
-                            )?,
+                                })?,
                         ),
                     };
                     Stage::ShortestPath {
@@ -5459,6 +5619,12 @@ impl Pipeline {
         for stage in &self.stages[start..] {
             current = match stage {
                 Stage::Match(val) => exec_match(current, val)?,
+                Stage::GeoNear {
+                    key,
+                    center,
+                    distance_field,
+                    multiplier,
+                } => exec_geo_near(current, key, *center, distance_field, *multiplier),
                 Stage::Group { key, accumulators } => exec_group(&current, key, accumulators)?,
                 Stage::Sort(fields) => exec_sort(current, fields),
                 Stage::Skip(n) => exec_skip(current, *n),

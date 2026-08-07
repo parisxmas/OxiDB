@@ -22,7 +22,7 @@ pub use line_protocol::parse as parse_line_protocol;
 pub use model::{FieldType, FieldValue, Point, SeriesKey};
 pub use store::{
     Agg, Block, GroupPoint, QuerySpec, ResultSeries, StrGroupPoint, StrResultSeries, StrValue,
-    TagPredicate,
+    Fix, TagPredicate, Track, TrackSpec,
 };
 
 use std::collections::BTreeMap;
@@ -418,5 +418,21 @@ impl Tsdb {
     /// Run a query. Returns one [`ResultSeries`] per output group.
     pub fn query(&self, spec: &QuerySpec) -> Vec<ResultSeries> {
         store::run_query(&self.series, spec)
+    }
+
+    /// Path length in meters over lat/lon field pairs — see
+    /// [`store::run_distance_query`].
+    pub fn distance_query(&self, spec: &store::TrackSpec) -> Vec<ResultSeries> {
+        store::run_distance_query(&self.series, spec)
+    }
+
+    /// Douglas-Peucker-simplified (ts, lat, lon) tracks — see
+    /// [`store::run_track_query`].
+    pub fn track_query(
+        &self,
+        spec: &TrackSpec,
+        tolerance_m: f64,
+    ) -> Vec<store::Track> {
+        store::run_track_query(&self.series, spec, tolerance_m)
     }
 }

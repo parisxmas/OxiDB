@@ -445,21 +445,41 @@ impl BTreeCollection {
             })
             .transpose()?;
 
-        // Rebuild geo indexes the same way: only the definition persists,
-        // the geohash table is one document scan at open — paid only by
-        // collections that asked for geo.
+        // Geo indexes. Disk-first: reopen the mmap'd `.geoidx` base (instant,
+        // empty overlay) — after crash recovery (`needs_reindex`) or on a
+        // missing/corrupt file, rebuild from a scan of the recovered
+        // documents and persist, the `.mfidx` fallback shape. In-RAM: only
+        // the definition persists; rebuild by one document scan, the same
+        // deal the text index made.
         let mut restored_geo: HashMap<String, GeoIndex> = HashMap::new();
         for info in persisted_indexes.iter().filter(|i| i.index_type == "geo") {
             if let Some(field) = info.fields.first() {
-                let mut gidx = GeoIndex::new();
-                storage.scan_all_while(|_id, bytes| {
-                    if let Ok(doc) = crate::codec::decode_doc(bytes)
-                        && let Some(id) = doc.get("_id").and_then(|v| v.as_u64())
-                    {
-                        gidx.upsert(id, resolve_field_in_value(&doc, field));
+                let gpath = data_dir.join(format!("{}.{}.geoidx", name, field));
+                let opened = if disk_first && !needs_reindex {
+                    GeoIndex::open_disk(gpath.clone()).ok()
+                } else {
+                    None
+                };
+                let gidx = match opened {
+                    Some(idx) => idx,
+                    None => {
+                        let mut gidx = if disk_first {
+                            GeoIndex::new_disk(gpath)
+                        } else {
+                            GeoIndex::new()
+                        };
+                        storage.scan_all_while(|_id, bytes| {
+                            if let Ok(doc) = crate::codec::decode_doc(bytes)
+                                && let Some(id) = doc.get("_id").and_then(|v| v.as_u64())
+                            {
+                                gidx.upsert(id, resolve_field_in_value(&doc, field));
+                            }
+                            Ok(true)
+                        })?;
+                        let _ = gidx.persist_disk();
+                        gidx
                     }
-                    Ok(true)
-                })?;
+                };
                 restored_geo.insert(field.clone(), gidx);
             }
         }
@@ -968,8 +988,15 @@ impl BTreeCollection {
             }
         }
         // Composites too — skip-clean persist makes an idle tick free.
-        let mut ci = self.composite_indexes.write();
-        for idx in ci.iter_mut() {
+        {
+            let mut ci = self.composite_indexes.write();
+            for idx in ci.iter_mut() {
+                let _ = idx.persist_disk();
+            }
+        }
+        // And geo — the `.geoidx` base + overlay merge (skip-clean too).
+        let mut gi = self.geo_indexes.write();
+        for idx in gi.values_mut() {
             let _ = idx.persist_disk();
         }
     }
@@ -3799,6 +3826,12 @@ impl BTreeCollection {
                 gi.remove(field).is_some()
             };
             if removed {
+                // Best-effort: a stale .geoidx left behind would be adopted
+                // by a later create_geo_index reopen with old contents.
+                let _ = std::fs::remove_file(
+                    self.data_dir
+                        .join(format!("{}.{}.geoidx", self.name, field)),
+                );
                 let _ = self.save_index_metadata();
                 return Ok(());
             }
@@ -3861,7 +3894,14 @@ impl BTreeCollection {
                 return Ok(());
             }
         }
-        let mut gidx = GeoIndex::new();
+        let mut gidx = if self.storage.is_disk_first() {
+            GeoIndex::new_disk(
+                self.data_dir
+                    .join(format!("{}.{}.geoidx", self.name, field)),
+            )
+        } else {
+            GeoIndex::new()
+        };
         self.storage.scan_bytes_while(|bytes| {
             let doc: Value = codec::decode_doc(bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
@@ -3869,6 +3909,7 @@ impl BTreeCollection {
             }
             Ok(true)
         })?;
+        let _ = gidx.persist_disk();
         {
             let mut gi = self.geo_indexes.write();
             gi.insert(field.to_string(), gidx);

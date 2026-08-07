@@ -14,6 +14,9 @@
 //! | `auth.role == 'admin'` | Role check |
 //! | `auth.username == doc.owner` | Document ownership (on create, `doc` is the row being created) |
 //! | `auth.username == newDoc.owner` | The incoming row, when an update rule must compare it with the stored one |
+//! | `doc.age >= 18` | Ordering comparisons `<` `<=` `>` `>=` (numbers numerically, strings lexicographically; mixed types are never comparable — false) |
+//! | `auth.username in doc.followers` | Membership in a document array field |
+//! | `auth.role in ['admin', 'readwrite']` | Membership in a literal list |
 //! | `A && B`, `A \|\| B` | Logical AND / OR |
 //!
 //! # Commands
@@ -264,12 +267,29 @@ pub fn validate_rule_expr(expr: &str) -> Result<(), String> {
     if e.starts_with('(') && e.ends_with(')') {
         return validate_rule_expr(&e[1..e.len() - 1]);
     }
-    // Comparison — both sides must be valid atoms.
-    for op in ["!=", "=="] {
+    // Comparison — both sides must be valid atoms. Two-char ops before
+    // their one-char prefixes, mirroring the evaluator's split order.
+    for op in ["!=", "==", "<=", ">=", "<", ">"] {
         if let Some((l, r)) = e.split_once(op) {
             validate_atom(l.trim())?;
             return validate_atom(r.trim());
         }
+    }
+    // Membership: `x in doc.<field>` or `x in ['a', 'b']`.
+    if let Some((l, r)) = split_logical(e, " in ") {
+        validate_atom(l.trim())?;
+        let r = r.trim();
+        if r.starts_with('[') && r.ends_with(']') {
+            let items = split_list_items(&r[1..r.len() - 1]);
+            if items.is_empty() {
+                return Err("`in` list must not be empty".to_string());
+            }
+            for item in items {
+                validate_atom(item)?;
+            }
+            return Ok(());
+        }
+        return validate_atom(r);
     }
     // Bare atom (truthy check at eval time).
     validate_atom(e)
@@ -630,22 +650,85 @@ fn eval_rule_expr(
         return eval_rule_expr(&expr[1..expr.len() - 1], auth, doc, new_doc);
     }
 
-    // Comparison operators
-    for op in ["!=", "=="] {
+    // Comparison operators. Two-char ops MUST come before their one-char
+    // prefixes, or `a <= b` would split at `<` and compare garbage.
+    for op in ["!=", "==", "<=", ">=", "<", ">"] {
         if let Some((left, right)) = expr.split_once(op) {
             let left_val = resolve_value(left.trim(), auth, doc, new_doc);
             let right_val = resolve_value(right.trim(), auth, doc, new_doc);
             return match op {
                 "==" => values_equal(&left_val, &right_val),
                 "!=" => !values_equal(&left_val, &right_val),
-                _ => false,
+                _ => match compare_values(&left_val, &right_val) {
+                    // Mixed or non-comparable types: every ordering
+                    // comparison is false — fail closed, never coerce.
+                    None => false,
+                    Some(ord) => match op {
+                        "<" => ord == std::cmp::Ordering::Less,
+                        "<=" => ord != std::cmp::Ordering::Greater,
+                        ">" => ord == std::cmp::Ordering::Greater,
+                        ">=" => ord != std::cmp::Ordering::Less,
+                        _ => unreachable!(),
+                    },
+                },
             };
         }
+    }
+
+    // Membership: `x in doc.members` (array field) or `x in ['a', 'b']`
+    // (literal list). Split like &&/|| — quote- and paren-aware — so a
+    // string literal containing " in " cannot mis-split the expression.
+    // A right side that is not an array answers false: fail closed.
+    if let Some((left, right)) = split_logical(expr, " in ") {
+        let needle = resolve_value(left.trim(), auth, doc, new_doc);
+        let haystack = resolve_value(right.trim(), auth, doc, new_doc);
+        return match haystack {
+            Value::Array(items) => items.iter().any(|item| values_equal(item, &needle)),
+            _ => false,
+        };
     }
 
     // Bare variable — truthy check (e.g., "auth" → is authenticated?)
     let val = resolve_value(expr, auth, doc, new_doc);
     is_truthy(&val)
+}
+
+/// Ordering for `<`/`<=`/`>`/`>=`: numbers numerically (the `values_equal`
+/// lesson — `serde_json` representation must never decide), strings
+/// lexicographically, anything else non-comparable (`None` → false).
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x.partial_cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
+        return Some(x.cmp(y));
+    }
+    None
+}
+
+/// Split the comma-separated items of a `[...]` list literal, respecting
+/// quoted strings (a comma inside 'a,b' is content, not a separator).
+fn split_list_items(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut items = Vec::new();
+    let (mut start, mut in_sq, mut in_dq) = (0usize, false, false);
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_dq => in_sq = !in_sq,
+            b'"' if !in_sq => in_dq = !in_dq,
+            b',' if !in_sq && !in_dq => {
+                items.push(inner[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = inner[start..].trim();
+    if !last.is_empty() || !items.is_empty() {
+        items.push(last);
+    }
+    items.retain(|s| !s.is_empty());
+    items
 }
 
 /// Split an expression on a logical operator, respecting parentheses.
@@ -697,6 +780,16 @@ fn resolve_value(
         || (token.starts_with('"') && token.ends_with('"'))
     {
         return Value::String(token[1..token.len() - 1].to_string());
+    }
+
+    // List literal — `['a', 'b', 3]`, the right side of `in`.
+    if token.starts_with('[') && token.ends_with(']') {
+        return Value::Array(
+            split_list_items(&token[1..token.len() - 1])
+                .into_iter()
+                .map(|item| resolve_value(item, auth, doc, new_doc))
+                .collect(),
+        );
     }
 
     // Numeric literal
@@ -1658,5 +1751,119 @@ mod tests {
 
         delete_rules(&db, "temp").unwrap();
         assert!(check_access(&db, "temp", Operation::Read, &anon(), None, None).is_ok());
+    }
+
+    fn named(u: &str) -> AuthContext {
+        AuthContext::from_claims(u, "readwrite")
+    }
+
+    /// Ordering comparisons: numbers numerically, strings lexicographically,
+    /// mixed types false in EVERY direction — a comparison that cannot be
+    /// made must fail closed, not coerce (the values_equal lesson applied
+    /// forward).
+    #[test]
+    fn ordering_comparisons_are_typed_and_fail_closed() {
+        let d = json!({ "age": 21, "score": 3.5, "name": "carol", "tags": ["a"] });
+        assert!(eval_rule_expr("doc.age >= 18", &anon(), Some(&d), None));
+        assert!(eval_rule_expr("doc.age > 20.5", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr("doc.age < 21", &anon(), Some(&d), None));
+        assert!(eval_rule_expr("doc.age <= 21", &anon(), Some(&d), None));
+        assert!(eval_rule_expr("doc.score < 4", &anon(), Some(&d), None));
+        // Strings compare lexicographically.
+        assert!(eval_rule_expr("doc.name < 'dave'", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr(
+            "doc.name > 'dave'",
+            &anon(),
+            Some(&d),
+            None
+        ));
+        // Mixed / non-comparable: BOTH directions false.
+        assert!(!eval_rule_expr("doc.name < 5", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr("doc.name > 5", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr("doc.tags > 0", &anon(), Some(&d), None));
+        // Missing field is null: never ordered against anything.
+        assert!(!eval_rule_expr("doc.absent < 1", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr("doc.absent > 1", &anon(), Some(&d), None));
+    }
+
+    /// `in` — the "only my followers see my location" rule, finally
+    /// expressible: membership of a value in a document array field or in
+    /// a literal list.
+    #[test]
+    fn in_operator_checks_array_membership() {
+        let d = json!({ "owner": "alice", "followers": ["bob", "carol"], "n": [1, 2, 3] });
+        // auth.username in doc.<array field>.
+        assert!(eval_rule_expr(
+            "auth.username in doc.followers",
+            &named("bob"),
+            Some(&d),
+            None
+        ));
+        assert!(!eval_rule_expr(
+            "auth.username in doc.followers",
+            &named("mallory"),
+            Some(&d),
+            None
+        ));
+        // Anonymous: auth.username is null, and null is not a member.
+        assert!(!eval_rule_expr(
+            "auth.username in doc.followers",
+            &anon(),
+            Some(&d),
+            None
+        ));
+        // Literal list, string and numeric members (by value, not repr).
+        assert!(eval_rule_expr(
+            "auth.role in ['admin', 'readwrite']",
+            &named("bob"),
+            Some(&d),
+            None
+        ));
+        assert!(eval_rule_expr("2 in doc.n", &anon(), Some(&d), None));
+        assert!(!eval_rule_expr("4 in doc.n", &anon(), Some(&d), None));
+        // Right side not an array: fail closed, both polarities.
+        assert!(!eval_rule_expr(
+            "auth.username in doc.owner",
+            &named("alice"),
+            Some(&d),
+            None
+        ));
+        assert!(eval_rule_expr(
+            "!(auth.username in doc.owner)",
+            &named("alice"),
+            Some(&d),
+            None
+        ));
+        // Combined with && — the realistic composite rule.
+        assert!(eval_rule_expr(
+            "doc.owner == auth.username || auth.username in doc.followers",
+            &named("carol"),
+            Some(&d),
+            None
+        ));
+        // A string literal containing " in " must not mis-split.
+        let s = json!({ "title": "logged in ok" });
+        assert!(eval_rule_expr(
+            "doc.title == 'logged in ok'",
+            &anon(),
+            Some(&s),
+            None
+        ));
+    }
+
+    #[test]
+    fn validator_accepts_the_new_operators_and_refuses_garbage() {
+        assert!(validate_rule_expr("doc.age >= 18").is_ok());
+        assert!(validate_rule_expr("doc.name < 'z'").is_ok());
+        assert!(validate_rule_expr("auth.username in doc.followers").is_ok());
+        assert!(validate_rule_expr("auth.role in ['admin', 'readwrite']").is_ok());
+        assert!(validate_rule_expr("2 in doc.n && doc.a > 1").is_ok());
+        // Empty list, bad member, dangling in: refused with a reason.
+        assert!(validate_rule_expr("auth.role in []").is_err());
+        assert!(validate_rule_expr("auth.role in [wat]").is_err());
+        assert!(validate_rule_expr("auth.role in").is_err());
+        assert!(validate_rule_expr("doc.a >=").is_err());
+        // A bare list is not an expression.
+        assert!(validate_rule_expr("['a', 'b']").is_err());
     }
 }

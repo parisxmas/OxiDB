@@ -1,8 +1,8 @@
 [package]
 name = "oxidb-server"
-version = "0.42.10"
+version = "0.42.11"
 edition = "2024"
-description = "TCP server for OxiDB — document, SQL, and time-series database engines"
+description = "TCP server for OxiDB — document, SQL, and time-series database engines, with S3-compatible object storage and an MQTT broker"
 license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
