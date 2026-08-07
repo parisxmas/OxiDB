@@ -155,7 +155,11 @@ fn near_sorts_nearest_first_and_respects_explicit_sort() {
                                       "$maxDistance": 5000.0, "$minDistance": 2000.0}}});
     let docs = find(&db, "places", q);
     assert!(!docs.is_empty());
-    assert!(docs.iter().map(dist).all(|d| (2000.0..=5000.0).contains(&d)));
+    assert!(
+        docs.iter()
+            .map(dist)
+            .all(|d| (2000.0..=5000.0).contains(&d))
+    );
 }
 
 #[test]
@@ -188,9 +192,18 @@ fn updates_deletes_and_reopen_keep_the_index_truthful() {
         db.delete("places", &json!({"name": "geojson"})).unwrap();
 
         let after = names(&find(&db, "places", within.clone()));
-        assert!(!after.contains(&"g0_0".to_string()), "moved-out doc still matches");
-        assert!(after.contains(&"toronto".to_string()), "moved-in doc missing");
-        assert!(!after.contains(&"geojson".to_string()), "deleted doc still matches");
+        assert!(
+            !after.contains(&"g0_0".to_string()),
+            "moved-out doc still matches"
+        );
+        assert!(
+            after.contains(&"toronto".to_string()),
+            "moved-in doc missing"
+        );
+        assert!(
+            !after.contains(&"geojson".to_string()),
+            "deleted doc still matches"
+        );
     }
 
     // Reopen: the definition persisted, the table rebuilt, answers identical
@@ -198,7 +211,9 @@ fn updates_deletes_and_reopen_keep_the_index_truthful() {
     let db = OxiDb::open(dir.path()).unwrap();
     let listed = db.list_indexes("places").unwrap();
     assert!(
-        listed.iter().any(|i| i.index_type == "geo" && i.fields == vec!["loc".to_string()]),
+        listed
+            .iter()
+            .any(|i| i.index_type == "geo" && i.fields == vec!["loc".to_string()]),
         "geo index definition lost across reopen: {listed:?}"
     );
     let within: Value = serde_json::from_str(WITHIN_2KM).unwrap();
@@ -206,7 +221,10 @@ fn updates_deletes_and_reopen_keep_the_index_truthful() {
     indexed.sort();
     db.drop_index("places", "_geo_loc").unwrap();
     assert!(
-        db.list_indexes("places").unwrap().iter().all(|i| i.index_type != "geo"),
+        db.list_indexes("places")
+            .unwrap()
+            .iter()
+            .all(|i| i.index_type != "geo"),
         "drop_index left the geo definition behind"
     );
     let mut scanned = names(&find(&db, "places", within));
@@ -233,4 +251,132 @@ fn unsupported_shapes_are_refused_not_ignored() {
             "should refuse: {q}"
         );
     }
+}
+
+#[test]
+fn compound_query_intersects_geo_with_field_indexes() {
+    // "active AND in this viewport" — the live-tracking shape. Before
+    // 0.42.10 any usable field index switched the geo index OFF: the plan
+    // examined every "east" row and verified each against the circle. The
+    // candidate sets must intersect instead, and explain (which reuses the
+    // real planner) is where that is observable.
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    seed(&db, "places"); // 441 grid points + extras; ~220 are "east"
+    db.create_index("places", "kind").unwrap();
+    db.create_geo_index("places", "loc").unwrap();
+
+    let q = json!({"kind": "east",
+        "loc": {"$geoWithin": {"$centerSphere": [[28.9784, 41.0082], 0.000313926]}}});
+
+    // Correctness first: same rows as the unindexed differential baseline.
+    let mut with_idx = names(&find(&db, "places", q.clone()));
+    let baseline: Vec<String> = find(&db, "places", json!({"kind": "east"}))
+        .iter()
+        .filter(|d| {
+            names(&find(
+                &db,
+                "places",
+                serde_json::from_str::<Value>(WITHIN_2KM).unwrap(),
+            ))
+            .contains(&d["name"].as_str().unwrap().to_string())
+        })
+        .map(|d| d["name"].as_str().unwrap().to_string())
+        .collect();
+    let mut baseline = baseline;
+    with_idx.sort();
+    baseline.sort();
+    assert_eq!(with_idx, baseline);
+    assert!(!with_idx.is_empty(), "the viewport must contain east rows");
+
+    // Plan: candidates must be far fewer than the ~220 "east" rows — the
+    // geo cover intersected the field-index set.
+    let plan = db
+        .explain_find("places", &q, &FindOptions::default())
+        .unwrap();
+    let candidates = plan["candidates"]
+        .as_u64()
+        .expect("INDEX_SCAN with candidates") as usize;
+    let east_rows = find(&db, "places", json!({"kind": "east"})).len();
+    assert!(
+        candidates < east_rows / 2,
+        "geo cover must shrink the field-index candidate set: {candidates} vs {east_rows} east rows (plan: {plan})"
+    );
+    assert_eq!(plan["strategy"], "INDEX_SCAN", "plan: {plan}");
+}
+
+#[test]
+fn unbounded_near_with_limit_uses_expanding_rings_and_matches_the_scan() {
+    // "The 10 nearest" with NO $maxDistance: before 0.42.10 the geo index
+    // had no circle to cover, so this always scanned the collection. The
+    // expanding-ring path must (a) be chosen — explain says GEO_KNN — and
+    // (b) answer exactly what the unindexed scan answers. Grid spacing is
+    // ~1.1 km and the ring starts at 500 m, so k=10 forces several
+    // expansions. Distances (not names) are compared per position: the
+    // grid is symmetric, so equal-distance ties may legally order
+    // differently between the two paths.
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    seed(&db, "idx");
+    seed(&db, "raw");
+    db.create_geo_index("idx", "loc").unwrap();
+
+    let q = json!({"loc": {"$near": {"$geometry": [CENTER.0, CENTER.1]}}});
+    let opts = FindOptions {
+        sort: None,
+        skip: None,
+        limit: Some(10),
+    };
+    let center = oxidb::geo::Point {
+        lon: CENTER.0,
+        lat: CENTER.1,
+    };
+    let dist_of = |d: &Value| {
+        oxidb::geo::point_of_value(&d["loc"])
+            .map(|p| oxidb::geo::haversine_m(center, p))
+            .unwrap()
+    };
+
+    let with_idx = db.find_with_options("idx", &q, &opts).unwrap();
+    let scanned = db.find_with_options("raw", &q, &opts).unwrap();
+    assert_eq!(with_idx.len(), 10);
+    let da: Vec<i64> = with_idx.iter().map(|d| dist_of(d).round() as i64).collect();
+    let db_: Vec<i64> = scanned.iter().map(|d| dist_of(d).round() as i64).collect();
+    assert_eq!(da, db_, "ring answer must equal the scan answer");
+
+    let plan = db.explain_find("idx", &q, &opts).unwrap();
+    assert_eq!(plan["strategy"], "GEO_KNN", "plan: {plan}");
+    // The unindexed collection keeps the scan plan.
+    let plan_raw = db.explain_find("raw", &q, &opts).unwrap();
+    assert_eq!(plan_raw["strategy"], "COLLSCAN", "plan: {plan_raw}");
+}
+
+#[test]
+fn unbounded_near_ring_respects_the_rest_of_the_query() {
+    // The ring counts only FULL-query matches: asking for the 5 nearest
+    // "west" docs from an east-side viewpoint must keep expanding past all
+    // the nearer east docs — stopping when 5 of ANY kind are in the ring
+    // would under-deliver. Differential against the unindexed scan.
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    seed(&db, "idx");
+    seed(&db, "raw");
+    db.create_geo_index("idx", "loc").unwrap();
+
+    // Viewpoint far on the east edge of the grid; "west" docs are ≥ ~11 km.
+    let east_edge = [CENTER.0 + 0.10, CENTER.1];
+    let q = json!({"kind": "west",
+        "loc": {"$near": {"$geometry": east_edge}}});
+    let opts = FindOptions {
+        sort: None,
+        skip: None,
+        limit: Some(5),
+    };
+    let with_idx = db.find_with_options("idx", &q, &opts).unwrap();
+    let scanned = db.find_with_options("raw", &q, &opts).unwrap();
+    assert_eq!(with_idx.len(), 5);
+    assert!(with_idx.iter().all(|d| d["kind"] == "west"));
+    let names_a = names(&with_idx);
+    let names_b = names(&scanned);
+    assert_eq!(names_a, names_b, "ring must match the scan");
 }

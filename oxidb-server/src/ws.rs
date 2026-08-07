@@ -37,7 +37,7 @@ use crate::auth;
 use crate::jwt;
 use crate::rules::{self, AuthContext, Operation, ReadAccess};
 use oxidb::OxiDb;
-use oxidb::change_stream::{WatchFilter, WatchHandle};
+use oxidb::change_stream::{ChangeEvent, WatchFilter, WatchHandle};
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -313,7 +313,12 @@ struct Subscription {
     handle: WatchHandle,
     #[allow(dead_code)]
     collection: Option<String>,
-    query: Option<Value>,
+    /// Subscription filter, parsed once at subscribe time — the FULL query
+    /// language ($gt/$in/$or/…, `$geoWithin`/`$near` included), not the
+    /// top-level-equality subset it was before 0.42.10. `None` = no filter.
+    /// Parsing up front also means a bad filter is refused at subscribe,
+    /// not stored as a filter that silently never matches.
+    query: Option<oxidb::query::Query>,
     /// Per-row read rule (RLS): an event's document must pass this expression
     /// for the subscriber's auth context, or the event is not delivered.
     /// Doc-less events (deletes) are dropped under a filter — delivering even
@@ -321,6 +326,36 @@ struct Subscription {
     read_filter: Option<String>,
     /// The engine this watch was registered on (its database).
     db: Arc<OxiDb>,
+}
+
+/// Should this event reach this subscriber? RLS first (a doc-less event is
+/// dropped under a read filter — even the id would leak row existence),
+/// then the subscription's own query filter. A doc-less event passes the
+/// query filter — there is nothing to test it against, and since 0.42.9
+/// only transactional deletes are doc-less.
+fn event_passes(
+    event: &ChangeEvent,
+    query: Option<&oxidb::query::Query>,
+    read_filter: Option<&String>,
+    auth_ctx: &AuthContext,
+) -> bool {
+    if let Some(rule) = read_filter {
+        match &event.document {
+            Some(doc) => {
+                if !rules::row_visible(rule, auth_ctx, doc) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    if let Some(q) = query
+        && let Some(ref doc) = event.document
+        && !oxidb::query::matches_value(q, doc)
+    {
+        return false;
+    }
+    true
 }
 
 /// Per-connection auth + database-pinning state.
@@ -473,29 +508,23 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
         // Push subscription events to client
         let mut dead_subs = Vec::new();
         for (sub_id, sub) in subscriptions.iter() {
+            // Channel first, then whatever backpressure coalesced — after
+            // the channel is drained the pending queue holds each lagging
+            // document's LAST state, and leaving it there would delay that
+            // state until the next unrelated write.
+            let mut events: Vec<_> = Vec::new();
             while let Ok(event) = sub.handle.rx.try_recv() {
-                // Per-row read rule (RLS): only doc-bearing events the caller
-                // may read are delivered; doc-less events are dropped entirely.
-                if let Some(rule) = &sub.read_filter {
-                    match &event.document {
-                        Some(doc) => {
-                            if !rules::row_visible(rule, &conn.auth_ctx, doc) {
-                                continue;
-                            }
-                        }
-                        None => continue,
-                    }
-                }
-                // If subscription has a query filter, check if the doc matches
-                if let Some(ref query) = sub.query
-                    && !query.as_object().is_none_or(|q| q.is_empty())
-                {
-                    // Only filter insert events that have a document
-                    if let Some(ref doc) = event.document
-                        && !doc_matches_query(doc, query)
-                    {
-                        continue;
-                    }
+                events.push(event);
+            }
+            events.extend(sub.handle.drain_pending());
+            for event in events {
+                if !event_passes(
+                    &event,
+                    sub.query.as_ref(),
+                    sub.read_filter.as_ref(),
+                    &conn.auth_ctx,
+                ) {
+                    continue;
                 }
 
                 let event_json = json!({
@@ -524,25 +553,6 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
     for (_, sub) in subscriptions {
         sub.db.unwatch(sub.handle.id);
     }
-}
-
-/// Simple top-level field matching for subscription query filters.
-fn doc_matches_query(doc: &Value, query: &Value) -> bool {
-    let q = match query.as_object() {
-        Some(o) => o,
-        None => return true,
-    };
-    let d = match doc.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-    for (key, expected) in q {
-        match d.get(key) {
-            Some(actual) if actual == expected => {}
-            _ => return false,
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +639,21 @@ fn handle_command(
                 .get("collection")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let query = cmd.get("query").cloned();
+            // Parse the filter with the engine's own query parser: the full
+            // language works ($geoWithin for a live map viewport included),
+            // and an unparseable filter is refused here rather than becoming
+            // a stored filter that silently never applies.
+            let query = match cmd.get("query") {
+                None => None,
+                Some(q) if q.as_object().is_some_and(|o| o.is_empty()) => None,
+                Some(q) => match oxidb::query::parse_query(q) {
+                    Ok(parsed) => Some(parsed),
+                    Err(e) => {
+                        return json!({"ok": false,
+                            "error": format!("invalid subscription query: {e}")});
+                    }
+                },
+            };
 
             // Security rules (RLS): resolve the caller's read access for the
             // collection once, at subscribe time. A non-admin token may not
@@ -986,5 +1010,101 @@ mod command_tests {
         );
         assert_eq!(out["ok"], false, "{out}");
         assert!(st.db.find_one("drivers", &json!({})).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use oxidb::change_stream::OperationType;
+
+    fn event(doc: Option<Value>) -> ChangeEvent {
+        ChangeEvent {
+            token: 1,
+            operation: OperationType::Update,
+            collection: "pings".to_string(),
+            doc_id: 7,
+            document: doc,
+            tx_id: None,
+        }
+    }
+
+    fn parsed(q: Value) -> oxidb::query::Query {
+        oxidb::query::parse_query(&q).unwrap()
+    }
+
+    #[test]
+    fn subscription_filter_speaks_the_full_query_language() {
+        // The old matcher was top-level equality only: an operator like
+        // {"speed": {"$gte": 10}} compared the doc value against the literal
+        // object and never matched anything.
+        let anon = AuthContext::anonymous();
+        let q = parsed(json!({"speed": {"$gte": 10}}));
+        assert!(event_passes(
+            &event(Some(json!({"speed": 25}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+        assert!(!event_passes(
+            &event(Some(json!({"speed": 3}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+    }
+
+    #[test]
+    fn geo_within_works_as_a_subscription_filter() {
+        // "Send me only what falls in this viewport" — the live-map filter.
+        let anon = AuthContext::anonymous();
+        let q = parsed(json!({"loc": {"$geoWithin": {"$box": [[28.5, 40.5], [29.5, 41.5]]}}}));
+        assert!(event_passes(
+            &event(Some(json!({"loc": {"lon": 29.0, "lat": 41.0}}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+        assert!(!event_passes(
+            &event(Some(json!({"loc": {"lon": 32.8, "lat": 39.9}}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+    }
+
+    #[test]
+    fn nested_and_or_filters_apply() {
+        let anon = AuthContext::anonymous();
+        let q = parsed(json!({"$or": [{"kind": "truck"}, {"speed": {"$lt": 5}}]}));
+        assert!(event_passes(
+            &event(Some(json!({"kind": "truck", "speed": 80}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+        assert!(event_passes(
+            &event(Some(json!({"kind": "car", "speed": 2}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+        assert!(!event_passes(
+            &event(Some(json!({"kind": "car", "speed": 80}))),
+            Some(&q),
+            None,
+            &anon
+        ));
+    }
+
+    #[test]
+    fn docless_event_is_dropped_under_rls_but_passes_a_query_filter() {
+        let anon = AuthContext::anonymous();
+        let q = parsed(json!({"kind": "truck"}));
+        // No read rule: a doc-less event has nothing to test — deliver.
+        assert!(event_passes(&event(None), Some(&q), None, &anon));
+        // Under a read rule: even the id would leak row existence — drop.
+        let rule = "auth != null".to_string();
+        assert!(!event_passes(&event(None), None, Some(&rule), &anon));
     }
 }

@@ -10,7 +10,7 @@
 //! - **No DocLocation** — doc_id is the key; B-tree finds it in O(log n)
 //! - **LRU doc cache** — decoded `Arc<Value>` cache avoids repeated deserialization
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -839,7 +839,7 @@ impl BTreeCollection {
             return None;
         }
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
         drop(ci);
         drop(fi);
 
@@ -1955,8 +1955,27 @@ impl BTreeCollection {
 
         let mut results = Vec::new();
 
+        // Unbounded `$near` + limit + no explicit sort: k-NN via expanding
+        // rings over the geo index. Before 0.42.10 "the 10 nearest" was
+        // only writable with a `$maxDistance` guess — without one the geo
+        // index had no circle to cover and every query scanned everything.
+        let mut ring_served = false;
+        if opts.sort.is_none()
+            && let Some(limit) = opts.limit
+            && let Some((field, near_q)) = &near
+            && near_q.max_distance_m.is_none()
+        {
+            let need = (opts.skip.unwrap_or(0) as usize)
+                .saturating_add(limit as usize)
+                .max(1);
+            if let Some(matches) = self.near_knn_matches(&query, field, near_q, need) {
+                results = matches;
+                ring_served = true;
+            }
+        }
+
         // Try lazy index iteration for limit queries
-        if let Some(limit) = early_limit {
+        if !ring_served && let Some(limit) = early_limit {
             let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
                 if let Some(arc) = self.load_doc_arc(id)
                     && (skip_post_filter || query::matches_value(&query, &arc))
@@ -1973,24 +1992,17 @@ impl BTreeCollection {
             }
         }
 
-        let ci = self.composite_indexes.read();
-        let mut candidate_ids = query::execute_indexed(&query, &fi, &ci);
-        drop(ci);
+        let candidate_ids = if ring_served {
+            None
+        } else {
+            let ci = self.composite_indexes.read();
+            self.indexed_candidates(&query, &fi, &ci)
+        };
 
-        // Geo index: the geohash cover nominates candidates; every one is
-        // verified against the exact predicate below (`matches_value`), so
-        // the cover may be generous but never wrong. Field indexes win when
-        // they already narrowed the query; geo carries the rest.
-        if candidate_ids.is_none()
-            && let Some((field, shape)) = query::geo_candidate_shape(&query)
-        {
-            let gi = self.geo_indexes.read();
-            if let Some(gidx) = gi.get(&field) {
-                candidate_ids = gidx.candidates(&shape);
-            }
-        }
-
-        if let Some(ref indexed_ids) = candidate_ids {
+        if ring_served {
+            // Matches are in hand; the nearest-first sort + skip/limit
+            // tail below finishes the job.
+        } else if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
                 if let Some(arc) = self.read_doc_arc(id)
                     && (skip_post_filter || query::matches_value(&query, &arc))
@@ -2139,6 +2151,95 @@ impl BTreeCollection {
     }
 
     /// Find a single document matching a query.
+    /// Expanding-ring k-NN over the geo index for an UNBOUNDED `$near`
+    /// with a limit ("the 10 nearest", no `$maxDistance`): start with a
+    /// small circle and grow it until `need` full-query matches lie WITHIN
+    /// the ring radius. The cover is a superset of the points inside the
+    /// circle, so anything not nominated is farther than the radius —
+    /// once `need` matches sit inside it, the true k nearest are all in
+    /// hand and the collection scan this query used to cost is skipped.
+    /// Returns the verified matches (a superset of the k nearest; the
+    /// caller's nearest-first sort + limit tail finishes the job), or
+    /// `None` when the geo index or a usable cover is missing (caller
+    /// falls back to the scan).
+    fn near_knn_matches(
+        &self,
+        query: &query::Query,
+        field: &str,
+        near: &crate::geo::GeoNear,
+        need: usize,
+    ) -> Option<Vec<Arc<Value>>> {
+        const INITIAL_RADIUS_M: f64 = 500.0;
+        /// Past half the earth's circumference the circle is the planet.
+        const MAX_RADIUS_M: f64 = 21_000_000.0;
+
+        let gi = self.geo_indexes.read();
+        let gidx = gi.get(field)?;
+        let mut radius_m = INITIAL_RADIUS_M;
+        loop {
+            let cand = gidx.candidates(&crate::geo::GeoShape::Circle {
+                center: near.center,
+                radius_m,
+            })?;
+            let mut matches: Vec<Arc<Value>> = Vec::new();
+            let mut within = 0usize;
+            for &id in &cand {
+                let Some(arc) = self.read_doc_arc(id) else {
+                    continue;
+                };
+                if !query::matches_value(query, &arc) {
+                    continue;
+                }
+                if let Some(p) = crate::collection::resolve_field_in_value(&arc, field)
+                    .and_then(crate::geo::point_of_value)
+                    && crate::geo::haversine_m(near.center, p) <= radius_m
+                {
+                    within += 1;
+                }
+                matches.push(arc);
+            }
+            if within >= need || radius_m >= MAX_RADIUS_M {
+                return Some(matches);
+            }
+            radius_m *= 4.0;
+        }
+    }
+
+    /// Candidate ids from EVERY index that can serve `query` — field and
+    /// composite indexes via `execute_indexed`, INTERSECTED with the geo
+    /// index's geohash cover when the query carries a geo predicate. The
+    /// cover nominates a superset and every candidate is verified against
+    /// the exact predicate by the caller's post-filter (geo ops force
+    /// `is_fully_indexed` to false), so the intersection can only shrink
+    /// the set, never lose a match. Before 0.42.10 any usable field index
+    /// switched the geo index off entirely, so the compound query live
+    /// tracking always asks — "active AND in this viewport" — scanned
+    /// every "active" row against the circle. An uncoverable shape (e.g.
+    /// `$near` without `$maxDistance`) keeps whatever the other indexes
+    /// narrowed to. Every `execute_indexed` caller in this file goes
+    /// through here so no path (find/count/update/delete/tx/explain) can
+    /// drift.
+    fn indexed_candidates(
+        &self,
+        query: &query::Query,
+        fi: &HashMap<String, PagedFieldIndex>,
+        ci: &[CompositeIndex],
+    ) -> Option<BTreeSet<DocumentId>> {
+        let mut candidate_ids = query::execute_indexed(query, fi, ci);
+        if let Some((field, shape)) = query::geo_candidate_shape(query) {
+            let gi = self.geo_indexes.read();
+            if let Some(gidx) = gi.get(&field)
+                && let Some(cover) = gidx.candidates(&shape)
+            {
+                candidate_ids = Some(match candidate_ids {
+                    Some(ids) => &ids & &cover,
+                    None => cover,
+                });
+            }
+        }
+        candidate_ids
+    }
+
     pub fn find_one(&self, query_json: &Value) -> Result<Option<Value>> {
         let query = query::parse_query(query_json)?;
 
@@ -2165,7 +2266,7 @@ impl BTreeCollection {
         // Fallback: index or cursor scan
         let candidate_ids = if !matches!(query, Query::All) {
             let ci = self.composite_indexes.read();
-            query::execute_indexed(&query, &fi, &ci)
+            self.indexed_candidates(&query, &fi, &ci)
         } else {
             None
         };
@@ -2482,7 +2583,7 @@ impl BTreeCollection {
 
             if !lazy_handled {
                 let ci = self.composite_indexes.read();
-                let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+                let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
                 drop(ci);
 
                 if let Some(ref indexed_ids) = candidate_ids {
@@ -2909,7 +3010,7 @@ impl BTreeCollection {
         // for_each_doc_arc_while never touch the index locks, so finding
         // (even by full scan) while holding them is deadlock-free.
         let mut found: Option<(DocumentId, Value)> = None;
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
                 if self.storage.contains_key(id)
@@ -3053,7 +3154,7 @@ impl BTreeCollection {
 
             if !lazy_handled {
                 let ci = self.composite_indexes.read();
-                let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+                let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
                 drop(ci);
 
                 if let Some(ref indexed_ids) = candidate_ids {
@@ -3190,7 +3291,7 @@ impl BTreeCollection {
 
         let match_all = matches!(query, query::Query::All);
         let fully_indexed = query::is_fully_indexed(&query, &fi);
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
 
         let sort_desc = match &opts.sort {
             None => "none",
@@ -3198,7 +3299,18 @@ impl BTreeCollection {
             Some(_) => "in-memory",
         };
 
-        let (strategy, examined) = if match_all && opts.sort.is_none() {
+        // Mirrors the find path's k-NN gate: unbounded `$near` + limit +
+        // no explicit sort + a geo index on the field → expanding rings.
+        let knn = opts.sort.is_none()
+            && opts.limit.is_some()
+            && query::near_component(&query)
+                .filter(|(_, n)| n.max_distance_m.is_none())
+                .is_some_and(|(field, _)| self.geo_indexes.read().contains_key(&field));
+
+        let (strategy, examined) = if knn {
+            // Ring growth is data-dependent; worst case examines everything.
+            ("GEO_KNN", total_docs)
+        } else if match_all && opts.sort.is_none() {
             ("FULL_SCAN_ALL", total_docs)
         } else if sort_desc == "index-backed" {
             // The index-sort path walks the sort index (early-terminating
@@ -3286,7 +3398,7 @@ impl BTreeCollection {
         }
 
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
         drop(ci);
 
         let skip_post_filter = query::is_fully_indexed(&query, &fi);
@@ -3950,7 +4062,7 @@ impl BTreeCollection {
                     // Try index-accelerated path
                     let fi = self.field_indexes.read();
                     let ci = self.composite_indexes.read();
-                    let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+                    let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
                     let skip_post_filter = query::is_fully_indexed(&query, &fi);
                     drop(ci);
 
@@ -4161,7 +4273,7 @@ impl BTreeCollection {
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
 
         let mut mutations = Vec::new();
 
@@ -4334,7 +4446,7 @@ impl BTreeCollection {
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        let candidate_ids = self.indexed_candidates(&query, &fi, &ci);
         drop(ci);
         drop(fi);
 
