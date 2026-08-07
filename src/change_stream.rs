@@ -28,7 +28,11 @@ pub struct ChangeEvent {
     pub operation: OperationType,
     pub collection: String,
     pub doc_id: DocumentId,
-    /// Present for insert operations; `None` for update/delete.
+    /// The document image: inserts (upserts included) carry the inserted
+    /// document, updates the post-image, deletes the pre-image — inside
+    /// and outside transactions (since 0.42.9; before that only inserts
+    /// carried one, and a transactional update was misreported as an
+    /// Insert event).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<Value>,
     /// Transaction ID if the mutation was part of a transaction.

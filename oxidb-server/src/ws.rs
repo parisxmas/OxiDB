@@ -10,8 +10,8 @@
 //! {"cmd": "subscribe", "id": "sub1", "collection": "users", "query": {"status": "online"}}
 //! {"cmd": "unsubscribe", "id": "sub1"}
 //! {"cmd": "insert", "collection": "users", "doc": {"name": "Alice"}}
-//! {"cmd": "find", "collection": "users", "query": {}}
-//! {"cmd": "update", "collection": "users", "query": {}, "update": {"$set": {"age": 31}}}
+//! {"cmd": "find", "collection": "users", "query": {}, "sort": {"age": -1}, "skip": 0, "limit": 50}
+//! {"cmd": "update", "collection": "users", "query": {}, "update": {"$set": {"age": 31}}, "upsert": false}
 //! {"cmd": "delete", "collection": "users", "query": {}}
 //! {"cmd": "sql", "query": "SELECT * FROM users"}
 //! ```
@@ -726,7 +726,15 @@ fn handle_command(
             };
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
-            match db.find(col, query) {
+            // `sort`/`skip`/`limit` — the same grammar as the native wire
+            // and REST, so a WS client is not forced onto a second channel
+            // to page a collection (before this the whole collection came
+            // back, whatever the caller asked).
+            let opts = match oxidb::query::parse_find_options(cmd) {
+                Ok(o) => o,
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            };
+            match db.find_with_options(col, query, &opts) {
                 Ok(docs) => match rules::read_access(&db, col, auth_ctx) {
                     ReadAccess::All => json!({"ok": true, "data": docs}),
                     ReadAccess::None => {
@@ -779,12 +787,33 @@ fn handle_command(
                 Some(u) => u,
                 None => return json!({"ok": false, "error": "missing 'update'"}),
             };
+            let upsert = cmd.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
             // Per-row rule check over the match set (REST parity).
-            if let Err(e) = check_write_rules(&db, col, Operation::Update, auth_ctx, query) {
-                return json!({"ok": false, "error": e});
+            let matched = match check_write_rules(&db, col, Operation::Update, auth_ctx, query) {
+                Ok(n) => n,
+                Err(e) => return json!({"ok": false, "error": e}),
+            };
+            if upsert && matched == 0 {
+                // The upsert will INSERT — a create, adjudicated by the
+                // CREATE rule against the document the engine would insert.
+                let preview = match OxiDb::upsert_preview(query, update) {
+                    Ok(p) => p,
+                    Err(e) => return json!({"ok": false, "error": e.to_string()}),
+                };
+                if let Err(e) =
+                    rules::check_access(&db, col, Operation::Create, auth_ctx, None, Some(&preview))
+                {
+                    return json!({"ok": false, "error": e.message});
+                }
             }
-            match db.update(col, query, update) {
-                Ok(n) => json!({"ok": true, "data": {"modified": n}}),
+            match db.update_with_upsert(col, query, update, true, upsert) {
+                Ok((_, n, upserted)) => {
+                    let mut data = json!({"modified": n});
+                    if let Some(id) = upserted {
+                        data["upserted"] = json!(id);
+                    }
+                    json!({"ok": true, "data": data})
+                }
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
@@ -851,11 +880,111 @@ fn check_write_rules(
     op: Operation,
     auth_ctx: &AuthContext,
     query: &Value,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let docs = db.find(col, query).map_err(|e| e.to_string())?;
     // Zero matches = zero writes; nothing to authorize (REST parity).
+    // The match count is returned so an upsert caller can tell "this
+    // will update" (adjudicated above) from "this will insert" (the
+    // CREATE rule's business, checked at the call site).
     for doc in &docs {
         rules::check_access(db, col, op, auth_ctx, Some(doc), None).map_err(|e| e.message)?;
     }
-    Ok(())
+    Ok(docs.len())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    fn state() -> WsState {
+        WsState {
+            db: Arc::new(OxiDb::open_in_memory().unwrap()),
+            active: AtomicUsize::new(0),
+            jwt_secret: None,
+            db_manager: None,
+        }
+    }
+
+    fn run(state: &WsState, cmd: Value) -> Value {
+        let mut subs = HashMap::new();
+        let mut conn = ConnState::open();
+        handle_command(&cmd, state, &mut subs, &mut conn)
+    }
+
+    #[test]
+    fn find_honours_sort_skip_limit() {
+        // Before 0.42.9 the WS find ignored all three and returned the whole
+        // collection — REST had them, WS did not, forcing clients onto two
+        // channels.
+        let st = state();
+        for i in 0..10 {
+            st.db.insert("nums", json!({"n": i})).unwrap();
+        }
+        let out = run(
+            &st,
+            json!({"cmd": "find", "collection": "nums",
+                   "sort": {"n": -1}, "skip": 1, "limit": 3}),
+        );
+        assert_eq!(out["ok"], true, "{out}");
+        let ns: Vec<i64> = out["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["n"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ns, vec![8, 7, 6]);
+    }
+
+    #[test]
+    fn update_with_upsert_inserts_and_reports_id() {
+        let st = state();
+        let out = run(
+            &st,
+            json!({"cmd": "update", "collection": "drivers",
+                   "query": {"driver": "u42"},
+                   "update": {"$set": {"lat": 41.0}}, "upsert": true}),
+        );
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["data"]["modified"], 0);
+        let id = out["data"]["upserted"].as_u64().expect("upserted id");
+        let doc = st
+            .db
+            .find_one("drivers", &json!({"driver": "u42"}))
+            .unwrap()
+            .expect("doc must exist");
+        assert_eq!(doc["_id"].as_u64().unwrap(), id);
+        assert_eq!(doc["lat"], 41.0);
+    }
+
+    #[test]
+    fn update_without_upsert_inserts_nothing() {
+        let st = state();
+        let out = run(
+            &st,
+            json!({"cmd": "update", "collection": "drivers",
+                   "query": {"driver": "u42"},
+                   "update": {"$set": {"lat": 41.0}}}),
+        );
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["data"]["modified"], 0);
+        assert!(out["data"].get("upserted").is_none());
+        assert!(st.db.find_one("drivers", &json!({})).unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_insert_is_adjudicated_by_the_create_rule() {
+        // An upsert that inserts is a create — the create rule must see it,
+        // and an anonymous caller under `auth != null` must be refused
+        // without anything being written.
+        let st = state();
+        rules::set_rules(&st.db, "drivers", &json!({"create": "auth != null"})).unwrap();
+        let out = run(
+            &st,
+            json!({"cmd": "update", "collection": "drivers",
+                   "query": {"driver": "u42"},
+                   "update": {"$set": {"lat": 41.0}}, "upsert": true}),
+        );
+        assert_eq!(out["ok"], false, "{out}");
+        assert!(st.db.find_one("drivers", &json!({})).unwrap().is_none());
+    }
 }

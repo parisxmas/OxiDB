@@ -25,12 +25,12 @@ use crate::codec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::collection::load_index_metadata;
 use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
-use crate::geo::GeoIndex;
 use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
+use crate::geo::GeoIndex;
 use crate::in_memory::WalBackend;
 use crate::index::CompositeIndex;
 #[cfg(not(target_arch = "wasm32"))]
@@ -110,6 +110,21 @@ fn wal_checkpoint_bytes() -> u64 {
 /// decorative. Zero (the default) is a single relaxed load on the write path.
 #[doc(hidden)]
 pub static STALL_BEFORE_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// What an update/upsert did, plus (when asked for) the written documents
+/// themselves — the change-stream post-image source.
+pub struct UpdateOutcome {
+    /// Documents the filter matched (incl. byte-identical no-op updates).
+    pub matched: u64,
+    /// Ids actually rewritten, in apply order.
+    pub updated: Vec<DocumentId>,
+    /// Id of the document an upsert inserted, when nothing matched.
+    pub upserted: Option<DocumentId>,
+    /// Post-images parallel to `updated`; empty unless `keep_docs`.
+    pub post_images: Vec<Arc<Value>>,
+    /// The document the upsert inserted; `None` unless `keep_docs`.
+    pub upserted_doc: Option<Arc<Value>>,
+}
 
 pub struct BTreeCollection {
     #[allow(dead_code)]
@@ -1931,11 +1946,12 @@ impl BTreeCollection {
         // Standard path: index-accelerated or full B-tree cursor scan
         let skip_post_filter = query::is_fully_indexed(&query, &fi);
 
-        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() && near.is_none() {
-            opts.limit.map(|l| l as usize)
-        } else {
-            None
-        };
+        let early_limit: Option<usize> =
+            if opts.sort.is_none() && opts.skip.is_none() && near.is_none() {
+                opts.limit.map(|l| l as usize)
+            } else {
+                None
+            };
 
         let mut results = Vec::new();
 
@@ -2313,6 +2329,36 @@ impl BTreeCollection {
         base
     }
 
+    /// The document an upsert inserts when nothing matches: the filter's
+    /// equality conditions with the update applied on top ($setOnInsert
+    /// folded in — it applies exactly when the upsert inserts). Public so
+    /// rule-checking surfaces can adjudicate the CREATE rule against the
+    /// very document the engine would insert (an upsert that inserts is a
+    /// create, not an update); the upsert path below uses this same
+    /// function, so the preview can never drift from reality.
+    pub fn synthesize_upsert_doc(query_json: &Value, update_json: &Value) -> Result<Value> {
+        let mut doc = Self::upsert_base_doc(query_json);
+        if update_json.is_array() {
+            crate::pipeline::apply_update_pipeline(&mut doc, update_json)?;
+            return Ok(doc);
+        }
+        let mut eff = update_json.as_object().cloned().unwrap_or_default();
+        if let Some(soi) = eff.remove("$setOnInsert") {
+            let set = eff
+                .entry("$set".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let (Some(sm), Some(soim)) = (set.as_object_mut(), soi.as_object()) {
+                for (k, v) in soim {
+                    sm.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if !eff.is_empty() {
+            crate::update::apply_update(&mut doc, &Value::Object(eff))?;
+        }
+        Ok(doc)
+    }
+
     /// `update` with MongoDB upsert semantics: when `upsert` is true and no
     /// document matches, insert one synthesized from the filter's equality
     /// conditions with the update applied on top ($setOnInsert applies here
@@ -2342,6 +2388,31 @@ impl BTreeCollection {
         upsert: bool,
         array_filters: Option<&Value>,
     ) -> Result<(u64, Vec<DocumentId>, Option<DocumentId>)> {
+        self.update_upsert_filtered_docs(
+            query_json,
+            update_json,
+            limit,
+            upsert,
+            array_filters,
+            false,
+        )
+        .map(|o| (o.matched, o.updated, o.upserted))
+    }
+
+    /// `update_upsert_filtered` that additionally hands back the written
+    /// documents when `keep_docs` is set — the change-stream post-image
+    /// source. The post-image `Arc` is the same one the doc cache keeps,
+    /// so the non-bulk path pays no extra clone; `keep_docs` false costs
+    /// nothing at all.
+    pub fn update_upsert_filtered_docs(
+        &self,
+        query_json: &Value,
+        update_json: &Value,
+        limit: Option<usize>,
+        upsert: bool,
+        array_filters: Option<&Value>,
+        keep_docs: bool,
+    ) -> Result<UpdateOutcome> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
         // An ARRAY update is a MongoDB pipeline-style update ($set/$unset/
@@ -2467,30 +2538,23 @@ impl BTreeCollection {
                 // read on the apply barrier, and a re-entrant read while a
                 // checkpoint waits for the write side would deadlock.
                 drop(_in_flight);
-                let mut doc = Self::upsert_base_doc(query_json);
-                if pipeline_mode {
-                    crate::pipeline::apply_update_pipeline(&mut doc, original_update)?;
-                    let id = self.insert(doc)?;
-                    return Ok((0, Vec::new(), Some(id)));
-                }
-                let mut eff = original_update.as_object().cloned().unwrap_or_default();
-                if let Some(soi) = eff.remove("$setOnInsert") {
-                    let set = eff
-                        .entry("$set".to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let (Some(sm), Some(soim)) = (set.as_object_mut(), soi.as_object()) {
-                        for (k, v) in soim {
-                            sm.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                if !eff.is_empty() {
-                    crate::update::apply_update(&mut doc, &Value::Object(eff))?;
-                }
+                let doc = Self::synthesize_upsert_doc(query_json, original_update)?;
                 let id = self.insert(doc)?;
-                return Ok((0, Vec::new(), Some(id)));
+                return Ok(UpdateOutcome {
+                    matched: 0,
+                    updated: Vec::new(),
+                    upserted: Some(id),
+                    post_images: Vec::new(),
+                    upserted_doc: keep_docs.then(|| self.load_doc_arc(id)).flatten(),
+                });
             }
-            return Ok((0, Vec::new(), None));
+            return Ok(UpdateOutcome {
+                matched: 0,
+                updated: Vec::new(),
+                upserted: None,
+                post_images: Vec::new(),
+                upserted_doc: None,
+            });
         }
 
         // WORM phase 2 gate: refuse the entire update batch if any
@@ -2615,7 +2679,13 @@ impl BTreeCollection {
             // upsert here: real matches forbid it semantically, and the
             // vanished-race would need the index write locks released first
             // — the pre-lock no-match path above owns the upsert.
-            return Ok((matched, Vec::new(), None));
+            return Ok(UpdateOutcome {
+                matched,
+                updated: Vec::new(),
+                upserted: None,
+                post_images: Vec::new(),
+                upserted_doc: None,
+            });
         }
 
         // Unique constraint check under write lock — against the index AND
@@ -2696,6 +2766,7 @@ impl BTreeCollection {
         };
 
         let mut updated_ids = Vec::with_capacity(ops.len());
+        let mut post_images = Vec::with_capacity(if keep_docs { ops.len() } else { 0 });
         let bulk = ops.len() > 64;
         for op in ops {
             // Update B-tree in-place (replace value)
@@ -2737,11 +2808,19 @@ impl BTreeCollection {
             self.invalidate_bytes_cache(op.id);
             // Small updates keep the cache warm (read-after-write); bulk
             // updates would just churn the LRU and evict genuinely hot
-            // entries, so they invalidate instead.
+            // entries, so they invalidate instead. The post-image Arc is
+            // shared with the cache — keeping it costs no extra clone.
             if bulk {
                 self.doc_cache.remove(op.id);
+                if keep_docs {
+                    post_images.push(Arc::new(op.new_data));
+                }
             } else {
-                self.doc_cache.put(op.id, Arc::new(op.new_data));
+                let arc = Arc::new(op.new_data);
+                if keep_docs {
+                    post_images.push(arc.clone());
+                }
+                self.doc_cache.put(op.id, arc);
             }
             updated_ids.push(op.id);
         }
@@ -2749,7 +2828,13 @@ impl BTreeCollection {
             self.dirty.store(true, Ordering::Release);
         }
 
-        Ok((matched, updated_ids, None))
+        Ok(UpdateOutcome {
+            matched,
+            updated: updated_ids,
+            upserted: None,
+            post_images,
+            upserted_doc: None,
+        })
     }
 
     /// Atomically find ONE document matching `query`, apply `update` to
@@ -2916,6 +3001,20 @@ impl BTreeCollection {
 
     /// Delete documents matching a query. Returns IDs of deleted documents.
     pub fn delete(&self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
+        self.delete_docs(query_json, limit, false)
+            .map(|(ids, _)| ids)
+    }
+
+    /// `delete` that additionally hands back each deleted document's
+    /// pre-image when `keep_docs` is set (parallel to the returned ids) —
+    /// the change-stream pre-image source. The delete path decodes every
+    /// target anyway, so keeping the image is a move, not a clone.
+    pub fn delete_docs(
+        &self,
+        query_json: &Value,
+        limit: Option<usize>,
+        keep_docs: bool,
+    ) -> Result<(Vec<DocumentId>, Vec<Value>)> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
         let query = query::parse_query(query_json)?;
@@ -2990,7 +3089,7 @@ impl BTreeCollection {
         } // fi read lock released (if not already dropped)
 
         if ops.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // WORM phase 2 gate: refuse the entire delete batch if any
@@ -3015,6 +3114,7 @@ impl BTreeCollection {
         let mut vi = self.vector_indexes.write();
 
         let mut deleted_ids = Vec::with_capacity(ops.len());
+        let mut pre_images = Vec::with_capacity(if keep_docs { ops.len() } else { 0 });
         for op in ops {
             // Remove from B-tree (no soft-delete — immediate reclaim)
             self.storage.remove(op.id);
@@ -3041,6 +3141,9 @@ impl BTreeCollection {
             }
 
             deleted_ids.push(op.id);
+            if keep_docs {
+                pre_images.push(op.data);
+            }
         }
         if !deleted_ids.is_empty() {
             // Compact empty entries from field indexes in one pass (avoids O(n) shift per delete)
@@ -3052,7 +3155,7 @@ impl BTreeCollection {
             self.dirty.store(true, Ordering::Release);
         }
 
-        Ok(deleted_ids)
+        Ok((deleted_ids, pre_images))
     }
 
     // -----------------------------------------------------------------------

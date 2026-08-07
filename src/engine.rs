@@ -2005,6 +2005,15 @@ impl OxiDb {
             .map(|(_, n, _)| n)
     }
 
+    /// The document an upsert would insert when nothing matches — the same
+    /// synthesis the engine's upsert path runs, exposed so a surface can
+    /// adjudicate its CREATE rule against the exact document before asking
+    /// for the upsert. No `_id`/`_version`: those exist only once the
+    /// insert happens.
+    pub fn upsert_preview(query: &Value, update: &Value) -> Result<Value> {
+        crate::btree_collection::BTreeCollection::synthesize_upsert_doc(query, update)
+    }
+
     /// `update` with MongoDB-style upsert: when nothing matches and `upsert`
     /// is set, insert a document synthesized from the filter's equality
     /// conditions with the update applied ($setOnInsert included). Returns
@@ -2037,52 +2046,56 @@ impl OxiDb {
         // bumps could be blindly overwritten by the commit's apply.
         let _occ_guard = self.commit_lock.read();
         let limit = if multi { None } else { Some(1) };
-        let (matched, ids, upserted) =
-            col.update_upsert_filtered(query, update, limit, upsert, array_filters)?;
-        if self.change_broker.has_subscribers() {
-            for &id in &ids {
+        let emit = self.change_broker.has_subscribers();
+        let outcome =
+            col.update_upsert_filtered_docs(query, update, limit, upsert, array_filters, emit)?;
+        if emit {
+            for (i, &id) in outcome.updated.iter().enumerate() {
                 self.change_broker.emit(ChangeEvent {
                     token: 0,
                     operation: OperationType::Update,
                     collection: collection.to_string(),
                     doc_id: id,
-                    document: None,
+                    document: outcome.post_images.get(i).map(|a| (**a).clone()),
+                    tx_id: None,
+                });
+            }
+            if let Some(id) = outcome.upserted {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Insert,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: outcome.upserted_doc.as_ref().map(|a| (**a).clone()),
                     tx_id: None,
                 });
             }
         }
-        if let Some(id) = upserted
-            && self.change_broker.has_subscribers()
-        {
-            self.change_broker.emit(ChangeEvent {
-                token: 0,
-                operation: OperationType::Insert,
-                collection: collection.to_string(),
-                doc_id: id,
-                document: None,
-                tx_id: None,
-            });
-        }
-        Ok((matched, ids.len() as u64, upserted))
+        Ok((
+            outcome.matched,
+            outcome.updated.len() as u64,
+            outcome.upserted,
+        ))
     }
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
         let _occ_guard = self.commit_lock.read(); // see update()
-        let ids = col.update(query, update, Some(1))?;
-        if self.change_broker.has_subscribers() {
-            for &id in &ids {
+        let emit = self.change_broker.has_subscribers();
+        let outcome = col.update_upsert_filtered_docs(query, update, Some(1), false, None, emit)?;
+        if emit {
+            for (i, &id) in outcome.updated.iter().enumerate() {
                 self.change_broker.emit(ChangeEvent {
                     token: 0,
                     operation: OperationType::Update,
                     collection: collection.to_string(),
                     doc_id: id,
-                    document: None,
+                    document: outcome.post_images.get(i).map(|a| (**a).clone()),
                     tx_id: None,
                 });
             }
         }
-        Ok(ids.len() as u64)
+        Ok(outcome.updated.len() as u64)
     }
 
     /// Atomically find one document, apply the update, and return the
@@ -2131,7 +2144,7 @@ impl OxiDb {
                 operation: OperationType::Update,
                 collection: collection.to_string(),
                 doc_id,
-                document: None,
+                document: Some(doc.clone()),
                 tx_id: None,
             });
         }
@@ -2139,41 +2152,36 @@ impl OxiDb {
     }
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
-        let col = self.get_or_create_collection(collection)?;
-        let _occ_guard = self.commit_lock.read(); // see update()
-        let ids = col.delete(query, None)?;
-        if self.change_broker.has_subscribers() {
-            for &id in &ids {
-                self.change_broker.emit(ChangeEvent {
-                    token: 0,
-                    operation: OperationType::Delete,
-                    collection: collection.to_string(),
-                    doc_id: id,
-                    document: None,
-                    tx_id: None,
-                });
-            }
-        }
-        Ok(ids.len() as u64)
+        self.delete_limited(collection, query, None)
     }
 
     pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
+        self.delete_limited(collection, query, Some(1))
+    }
+
+    fn delete_limited(&self, collection: &str, query: &Value, limit: Option<usize>) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
         let _occ_guard = self.commit_lock.read(); // see update()
-        let ids = col.delete(query, Some(1))?;
-        if self.change_broker.has_subscribers() {
+        let emit = self.change_broker.has_subscribers();
+        let (ids, pre_images) = col.delete_docs(query, limit, emit)?;
+        let deleted = ids.len() as u64;
+        if emit {
+            // Delete events carry the pre-image (the deleted document) —
+            // there is no post-image to carry, and a subscriber filtering
+            // by document content needs to know what left the result set.
+            let mut docs = pre_images.into_iter();
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
                     token: 0,
                     operation: OperationType::Delete,
                     collection: collection.to_string(),
                     doc_id: id,
-                    document: None,
+                    document: docs.next(),
                     tx_id: None,
                 });
             }
         }
-        Ok(ids.len() as u64)
+        Ok(deleted)
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
@@ -3126,16 +3134,21 @@ impl OxiDb {
                                     operation: OperationType::Delete,
                                     collection: col_name.clone(),
                                     doc_id: m.doc_id,
-                                    document: None,
+                                    document: m.old_data.clone(),
                                     tx_id: Some(tx_id),
                                 }
-                            } else if m.old_loc.is_some() {
+                            } else if m.old_data.is_some() || m.old_loc.is_some() {
+                                // A mutation of an existing document is an
+                                // update. `old_loc` is always None in B-tree
+                                // mode, so keying on it alone (as before
+                                // 0.42.9) reported every tx update as an
+                                // Insert event.
                                 ChangeEvent {
                                     token: 0,
                                     operation: OperationType::Update,
                                     collection: col_name.clone(),
                                     doc_id: m.doc_id,
-                                    document: None,
+                                    document: Some(m.new_data.clone()),
                                     tx_id: Some(tx_id),
                                 }
                             } else {
@@ -4762,7 +4775,13 @@ mod tests {
         assert_eq!(event.operation, OperationType::Update);
         assert_eq!(event.collection, "users");
         assert_eq!(event.doc_id, id);
-        assert!(event.document.is_none());
+        // Update events carry the post-image.
+        let doc = event
+            .document
+            .expect("update event must carry the post-image");
+        assert_eq!(doc["age"], 31);
+        assert_eq!(doc["name"], "Alice");
+        assert_eq!(doc["_version"], 2);
     }
 
     #[test]
@@ -4780,7 +4799,184 @@ mod tests {
         assert_eq!(event.operation, OperationType::Delete);
         assert_eq!(event.collection, "users");
         assert_eq!(event.doc_id, id);
-        assert!(event.document.is_none());
+        // Delete events carry the pre-image (the deleted document).
+        let doc = event
+            .document
+            .expect("delete event must carry the pre-image");
+        assert_eq!(doc["name"], "Alice");
+        assert_eq!(doc["_id"], id);
+    }
+
+    #[test]
+    fn watch_upsert_insert_carries_document() {
+        let db = temp_db();
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+
+        // Nothing matches — the upsert inserts. The Insert event's contract
+        // says the document is always present; before 0.42.9 this path sent
+        // None, a silent null-deref source for subscribers trusting it.
+        let (matched, _, upserted) = db
+            .update_with_upsert(
+                "drivers",
+                &json!({"driver": "u42"}),
+                &json!({"$set": {"lat": 41.0, "lon": 29.0}}),
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(matched, 0);
+        let id = upserted.expect("upsert must insert");
+
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.operation, OperationType::Insert);
+        assert_eq!(event.doc_id, id);
+        let doc = event
+            .document
+            .expect("upsert Insert event must carry the inserted document");
+        assert_eq!(doc["driver"], "u42");
+        assert_eq!(doc["lat"], 41.0);
+        assert_eq!(doc["_id"], id);
+    }
+
+    #[test]
+    fn watch_find_and_modify_carries_post_image() {
+        let db = temp_db();
+        let id = db
+            .insert("counters", json!({"name": "uidnext", "n": 7}))
+            .unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        db.find_and_modify(
+            "counters",
+            &json!({"name": "uidnext"}),
+            &json!({"$inc": {"n": 1}}),
+        )
+        .unwrap()
+        .expect("must match");
+
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.operation, OperationType::Update);
+        assert_eq!(event.doc_id, id);
+        let doc = event
+            .document
+            .expect("find_and_modify event must carry the post-image");
+        assert_eq!(doc["n"], 8);
+    }
+
+    #[test]
+    fn watch_update_one_carries_post_image() {
+        let db = temp_db();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        db.update_one(
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 44}}),
+        )
+        .unwrap();
+
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let doc = event
+            .document
+            .expect("update_one event must carry the post-image");
+        assert_eq!(doc["age"], 44);
+    }
+
+    #[test]
+    fn watch_bulk_update_carries_post_images() {
+        // The bulk path (>64 matched docs) invalidates the doc cache
+        // instead of warming it — the post-image must still ride the event.
+        let db = temp_db();
+        for i in 0..80 {
+            db.insert("fleet", json!({"kind": "truck", "i": i}))
+                .unwrap();
+        }
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        db.update(
+            "fleet",
+            &json!({"kind": "truck"}),
+            &json!({"$set": {"seen": true}}),
+        )
+        .unwrap();
+
+        for _ in 0..80 {
+            let event = handle
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(event.operation, OperationType::Update);
+            let doc = event
+                .document
+                .expect("bulk update event must carry the post-image");
+            assert_eq!(doc["seen"], true);
+            assert_eq!(doc["kind"], "truck");
+        }
+    }
+
+    #[test]
+    fn watch_tx_update_carries_post_image() {
+        let db = temp_db();
+        let id = db
+            .insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        let tx_id = db.begin_transaction();
+        db.tx_update(
+            tx_id,
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
+        db.commit_transaction(tx_id).unwrap();
+
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.operation, OperationType::Update);
+        assert_eq!(event.doc_id, id);
+        assert_eq!(event.tx_id, Some(tx_id));
+        let doc = event
+            .document
+            .expect("tx update event must carry the post-image");
+        assert_eq!(doc["age"], 31);
+    }
+
+    #[test]
+    fn watch_tx_delete_carries_pre_image() {
+        let db = temp_db();
+        let id = db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        let tx_id = db.begin_transaction();
+        db.tx_delete(tx_id, "users", &json!({"name": "Alice"}))
+            .unwrap();
+        db.commit_transaction(tx_id).unwrap();
+
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.operation, OperationType::Delete);
+        assert_eq!(event.doc_id, id);
+        let doc = event
+            .document
+            .expect("tx delete event must carry the pre-image");
+        assert_eq!(doc["name"], "Alice");
     }
 
     #[test]

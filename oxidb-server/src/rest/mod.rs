@@ -1183,11 +1183,20 @@ fn handle_create_index(
                 .map_err(db_err)?;
             Ok(json!({"created": format!("{field}_ttl"), "type": "ttl"}))
         }
-        _ => {
+        "geo" => {
+            let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
+            state.db.create_geo_index(col, field).map_err(db_err)?;
+            Ok(json!({"created": field, "type": "geo"}))
+        }
+        "field" => {
             let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
             state.db.create_index(col, field).map_err(db_err)?;
             Ok(json!({"created": field, "type": "field"}))
         }
+        // Refuse by name rather than silently building a field index — a
+        // caller asking for an index type this surface does not know must
+        // hear "no", not get a different index and a 200.
+        _ => Err((400, "unknown index type")),
     }
 }
 
@@ -1496,6 +1505,10 @@ fn handle_update_with_rules(
     let body = parse_json_body(req)?;
     let query = body.get("query").ok_or((400, "missing 'query'"))?;
     let update = body.get("update").ok_or((400, "missing 'update'"))?;
+    let upsert = body
+        .get("upsert")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Check rules against matching documents
     let docs = state.db.find(col, query).map_err(db_err)?;
@@ -1503,15 +1516,32 @@ fn handle_update_with_rules(
         rules::check_access(&state.db, col, Operation::Update, auth, Some(doc), None)
             .map_err(denied_status)?;
     }
+    if upsert && docs.is_empty() {
+        // Nothing matches, so the upsert will INSERT — that is a create,
+        // adjudicated by the CREATE rule against the exact document the
+        // engine would insert (same synthesis, so no drift).
+        let preview = OxiDb::upsert_preview(query, update).map_err(db_err)?;
+        rules::check_access(
+            &state.db,
+            col,
+            Operation::Create,
+            auth,
+            None,
+            Some(&preview),
+        )
+        .map_err(denied_status)?;
+    }
 
     let one = body.get("one").and_then(|v| v.as_bool()).unwrap_or(false);
-    if one {
-        let n = state.db.update_one(col, query, update).map_err(db_err)?;
-        Ok(json!({"modified": n}))
-    } else {
-        let n = state.db.update(col, query, update).map_err(db_err)?;
-        Ok(json!({"modified": n}))
+    let (_, n, upserted) = state
+        .db
+        .update_with_upsert(col, query, update, !one, upsert)
+        .map_err(db_err)?;
+    let mut out = json!({"modified": n});
+    if let Some(id) = upserted {
+        out["upserted"] = json!(id);
     }
+    Ok(out)
 }
 
 fn handle_delete_with_rules(
@@ -1983,6 +2013,180 @@ fn with_rest_cors(resp: HttpResponse) -> HttpResponse {
             "Content-Type, Authorization",
         )
         .with_header("Access-Control-Max-Age", "3600")
+}
+
+#[cfg(test)]
+mod index_creation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn state() -> RestState {
+        RestState {
+            db: Arc::new(oxidb::OxiDb::open_in_memory().unwrap()),
+            active: AtomicUsize::new(0),
+            jwt_secret: None,
+            db_manager: None,
+        }
+    }
+
+    fn post(body: Value) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/pings/indexes".to_string(),
+            query: String::new(),
+            headers: Default::default(),
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    #[test]
+    fn unknown_index_type_is_refused_not_silently_a_field_index() {
+        // {"type":"geospatial"} used to fall into the `_` arm, build a plain
+        // field index and answer 200 — the caller believed a different index
+        // existed. Unknown types must be refused by name.
+        let st = state();
+        let err = handle_create_index(
+            "pings",
+            &post(json!({"type": "geospatial", "field": "loc"})),
+            &st,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 400);
+        assert!(
+            st.db.list_indexes("pings").unwrap().is_empty(),
+            "a refused request must not leave an index behind"
+        );
+    }
+
+    #[test]
+    fn geo_type_builds_a_geo_index() {
+        let st = state();
+        let out = handle_create_index("pings", &post(json!({"type": "geo", "field": "loc"})), &st)
+            .unwrap();
+        assert_eq!(out["type"], "geo");
+        let idx = st.db.list_indexes("pings").unwrap();
+        assert!(
+            idx.iter().any(|i| i.index_type == "geo"),
+            "engine must report the geo index: {idx:?}"
+        );
+    }
+
+    #[test]
+    fn missing_type_still_defaults_to_a_field_index() {
+        let st = state();
+        let out = handle_create_index("pings", &post(json!({"field": "driver"})), &st).unwrap();
+        assert_eq!(out["type"], "field");
+        assert!(
+            st.db
+                .list_indexes("pings")
+                .unwrap()
+                .iter()
+                .any(|i| i.index_type == "field")
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_upsert_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn state() -> RestState {
+        RestState {
+            db: Arc::new(oxidb::OxiDb::open_in_memory().unwrap()),
+            active: AtomicUsize::new(0),
+            jwt_secret: None,
+            db_manager: None,
+        }
+    }
+
+    fn patch(body: Value) -> HttpRequest {
+        HttpRequest {
+            method: "PATCH".to_string(),
+            path: "/api/drivers/documents".to_string(),
+            query: String::new(),
+            headers: Default::default(),
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    #[test]
+    fn patch_upsert_inserts_and_reports_the_id() {
+        let st = state();
+        let auth = AuthContext::anonymous();
+        let out = handle_update_with_rules(
+            "drivers",
+            &patch(json!({"query": {"driver": "u42"},
+                          "update": {"$set": {"lat": 41.0}}, "upsert": true})),
+            &st,
+            &auth,
+        )
+        .unwrap();
+        assert_eq!(out["modified"], 0);
+        let id = out["upserted"].as_u64().expect("upserted id");
+        let doc = st
+            .db
+            .find_one("drivers", &json!({"driver": "u42"}))
+            .unwrap()
+            .expect("doc must exist");
+        assert_eq!(doc["_id"].as_u64().unwrap(), id);
+        assert_eq!(doc["lat"], 41.0);
+    }
+
+    #[test]
+    fn patch_upsert_that_matches_updates_without_inserting() {
+        let st = state();
+        let auth = AuthContext::anonymous();
+        st.db
+            .insert("drivers", json!({"driver": "u42", "lat": 40.0}))
+            .unwrap();
+        let out = handle_update_with_rules(
+            "drivers",
+            &patch(json!({"query": {"driver": "u42"},
+                          "update": {"$set": {"lat": 41.0}}, "upsert": true})),
+            &st,
+            &auth,
+        )
+        .unwrap();
+        assert_eq!(out["modified"], 1);
+        assert!(out.get("upserted").is_none());
+        assert_eq!(st.db.count("drivers", &json!({})).unwrap(), 1);
+    }
+
+    #[test]
+    fn patch_without_upsert_keeps_the_old_behaviour() {
+        let st = state();
+        let auth = AuthContext::anonymous();
+        let out = handle_update_with_rules(
+            "drivers",
+            &patch(json!({"query": {"driver": "u42"},
+                          "update": {"$set": {"lat": 41.0}}})),
+            &st,
+            &auth,
+        )
+        .unwrap();
+        assert_eq!(out["modified"], 0);
+        assert!(st.db.find_one("drivers", &json!({})).unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_insert_is_adjudicated_by_the_create_rule() {
+        // An upsert that inserts is a create: under `create: auth != null`
+        // an anonymous PATCH must be refused and must write nothing.
+        let st = state();
+        let auth = AuthContext::anonymous();
+        rules::set_rules(&st.db, "drivers", &json!({"create": "auth != null"})).unwrap();
+        let err = handle_update_with_rules(
+            "drivers",
+            &patch(json!({"query": {"driver": "u42"},
+                          "update": {"$set": {"lat": 41.0}}, "upsert": true})),
+            &st,
+            &auth,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(st.db.find_one("drivers", &json!({})).unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
