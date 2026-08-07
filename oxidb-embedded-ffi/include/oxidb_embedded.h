@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 /* Opaque database handle */
+#include <stddef.h>
+
 typedef void OxiDbHandle;
 
 /* Open a database at the given directory. Returns NULL on failure. */
@@ -17,6 +19,12 @@ OxiDbHandle* oxidb_open(const char* path);
    key_path points to a file containing a 32-byte key.
    Returns NULL on failure. */
 OxiDbHandle* oxidb_open_encrypted(const char* path, const char* key_path);
+
+/* Open a database with AES-256-GCM encryption, key as raw bytes.
+   key must point to exactly 32 bytes (key_len == 32) — sourced from the
+   OS keystore (iOS Keychain / Android Keystore), never a sandbox file.
+   Returns NULL on failure. */
+OxiDbHandle* oxidb_open_encrypted_bytes(const char* path, const unsigned char* key, size_t key_len);
 
 /* Close the database and free the handle. Safe to call with NULL. */
 void oxidb_close(OxiDbHandle* handle);

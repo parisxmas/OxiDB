@@ -41,7 +41,7 @@ Cargo workspace with three crates:
 - **`oxidb-server/`** — TCP server with SCRAM-SHA-256 auth, RBAC, TLS, audit logging
 - **`oxidb-client-ffi/`** — C-compatible FFI (`cdylib`) for language bindings
 
-Client libraries live under `clients/`: `clients/python/`, `clients/python-embedded/`, `clients/go/`, `clients/js/`, `clients/java/`, `clients/julia/`, `clients/dotnet/`, `clients/swift/`, `clients/android/`, `clients/oxibase-js/`, `clients/oxibase-dart/` (Dart/Flutter, see below). Apps/tools under `apps/` (`studio`, `vscode`, `oxibase-dashboard`), demos under `examples/`, deployment/monitoring under `infra/`, the website under `web/site/` (Next static export; rsync `web/site/out/` to the server).
+Client libraries live under `clients/`: `clients/python/`, `clients/python-embedded/`, `clients/go/`, `clients/js/`, `clients/java/`, `clients/julia/`, `clients/dotnet/`, `clients/swift/`, `clients/android/`, `clients/oxibase-js/`, `clients/oxibase-dart/` (Dart/Flutter, see below), `clients/oxidb-embedded-dart/` (package `oxidb_embedded`: the EMBEDDED engine for Flutter over dart:ffi — full surface incl. upsert, geo/TTL indexes, $geoNear, FTS, tx, blobs, SQL, AES-GCM with a 32-byte keystore key; `Preferences` sugar; 9 host tests against the real dylib, `OXIDB_FFI_LIB` overrides). Apps/tools under `apps/` (`studio`, `vscode`, `oxibase-dashboard`), demos under `examples/`, deployment/monitoring under `infra/`, the website under `web/site/` (Next static export; rsync `web/site/out/` to the server).
 
 ## Architecture
 

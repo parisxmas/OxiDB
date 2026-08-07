@@ -1,0 +1,18 @@
+name: oxidb_embedded
+description: >-
+  OxiDB embedded for Flutter/Dart — the full in-process document database
+  (queries, indexes incl. geo, aggregation, full-text search, transactions,
+  blob storage, SQL, AES-256-GCM encryption at rest) over dart:ffi.
+  A local database in the Hive/Isar weight class, with a server-grade engine.
+version: 0.1.0
+repository: https://github.com/parisxmas/OxiDB
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  ffi: ^2.1.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0

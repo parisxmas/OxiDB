@@ -603,6 +603,23 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
         return OxiDBDatabase(handle: OpaquePointer(raw))
     }
 
+    /// Open a database with AES-256-GCM encryption, key as raw bytes.
+    /// The mobile-idiomatic variant: keep the 32-byte key in the Keychain
+    /// (`kSecClassKey`), never in a file inside the app sandbox.
+    public static func open(path: String, encryptionKey: Data) throws -> OxiDBDatabase {
+        guard encryptionKey.count == 32 else {
+            throw OxiDBError.databaseOpenFailed
+        }
+        let raw = encryptionKey.withUnsafeBytes { buf -> UnsafeMutableRawPointer? in
+            oxidb_open_encrypted_bytes(
+                path, buf.bindMemory(to: UInt8.self).baseAddress, buf.count)
+        }
+        guard let raw else {
+            throw OxiDBError.databaseOpenFailed
+        }
+        return OxiDBDatabase(handle: OpaquePointer(raw))
+    }
+
     /// Close the database. Safe to call multiple times.
     public func close() {
         if let h = handle {
@@ -668,22 +685,33 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
         return result["data"] as? [String: Any]
     }
 
-    /// Update documents matching a query.
+    /// Update documents matching a query. With `upsert`, a query that
+    /// matches nothing inserts a document synthesized from the filter's
+    /// equality conditions with the update applied (MongoDB semantics);
+    /// the response then carries `"upserted": <id>`.
     @discardableResult
-    public func update(collection: String, query: [String: Any], update: [String: Any]) throws -> [String: Any] {
-        return try execute([
+    public func update(
+        collection: String, query: [String: Any], update: [String: Any], upsert: Bool = false
+    ) throws -> [String: Any] {
+        var cmd: [String: Any] = [
             "cmd": "update", "collection": collection,
             "query": query, "update": update
-        ])
+        ]
+        if upsert { cmd["upsert"] = true }
+        return try execute(cmd)
     }
 
-    /// Update a single document matching a query.
+    /// Update a single document matching a query (upsert as in `update`).
     @discardableResult
-    public func updateOne(collection: String, query: [String: Any], update: [String: Any]) throws -> [String: Any] {
-        return try execute([
+    public func updateOne(
+        collection: String, query: [String: Any], update: [String: Any], upsert: Bool = false
+    ) throws -> [String: Any] {
+        var cmd: [String: Any] = [
             "cmd": "update_one", "collection": collection,
             "query": query, "update": update
-        ])
+        ]
+        if upsert { cmd["upsert"] = true }
+        return try execute(cmd)
     }
 
     /// Delete documents matching a query.
@@ -1048,5 +1076,87 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
                 metadata: metadata
             )
         )
+    }
+}
+
+// MARK: - Preferences
+
+/// SharedPreferences/NSUserDefaults-shaped key-value store over an
+/// embedded collection: one document per key (`{k, v}`, unique index on
+/// `k`), writes are single upserts, reads are indexed point lookups.
+/// Values are anything JSON representable. Use it where you would reach
+/// for UserDefaults but want the data inside the (optionally encrypted)
+/// OxiDB store next to the rest of the app's documents.
+public final class OxiDBPreferences {
+    private let db: OxiDBDatabase
+    private let collection: String
+
+    /// `collection` defaults to `_prefs`; pass a name to keep several
+    /// independent preference namespaces in one database.
+    public init(db: OxiDBDatabase, collection: String = "_prefs") throws {
+        self.db = db
+        self.collection = collection
+        _ = try? db.createUniqueIndex(collection: collection, field: "k")
+    }
+
+    /// Insert-or-replace. One upsert: no read-modify-write race between
+    /// two threads setting the same key.
+    public func set(_ value: Any, forKey key: String) throws {
+        try db.updateOne(
+            collection: collection,
+            query: ["k": key],
+            update: ["$set": ["v": value]],
+            upsert: true
+        )
+    }
+
+    /// The stored value, or nil.
+    public func value(forKey key: String) throws -> Any? {
+        try db.findOne(collection: collection, query: ["k": key])?["v"]
+    }
+
+    public func string(forKey key: String) throws -> String? {
+        try value(forKey: key) as? String
+    }
+
+    public func int(forKey key: String) throws -> Int? {
+        switch try value(forKey: key) {
+        case let n as Int: return n
+        case let n as Double: return Int(exactly: n)
+        default: return nil
+        }
+    }
+
+    public func double(forKey key: String) throws -> Double? {
+        switch try value(forKey: key) {
+        case let n as Double: return n
+        case let n as Int: return Double(n)
+        default: return nil
+        }
+    }
+
+    public func bool(forKey key: String) throws -> Bool? {
+        try value(forKey: key) as? Bool
+    }
+
+    public func contains(_ key: String) throws -> Bool {
+        try db.findOne(collection: collection, query: ["k": key]) != nil
+    }
+
+    @discardableResult
+    public func remove(forKey key: String) throws -> Bool {
+        let result = try db.deleteOne(collection: collection, query: ["k": key])
+        let data = result["data"] as? [String: Any]
+        return (data?["deleted"] as? Int ?? 0) > 0
+    }
+
+    /// Every stored key.
+    public func keys() throws -> [String] {
+        try db.find(collection: collection).compactMap { $0["k"] as? String }
+    }
+
+    /// Remove every key in this namespace.
+    public func clear() throws {
+        _ = try db.delete(collection: collection, query: [:])
     }
 }

@@ -213,9 +213,29 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
                 Some(u) => u,
                 None => return err_bytes("missing 'update'"),
             };
+            let upsert = request
+                .get("upsert")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Some(tx_id) = *active_tx {
+                // A buffered transaction has no upsert primitive — refuse by
+                // name rather than silently running a plain update.
+                if upsert {
+                    return err_bytes("upsert is not supported inside a transaction");
+                }
                 match db.tx_update(tx_id, col, query, update) {
                     Ok(()) => ok_bytes(json!("buffered")),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else if upsert {
+                match db.update_with_upsert(col, query, update, true, true) {
+                    Ok((_, modified, upserted)) => {
+                        let mut out = json!({ "modified": modified });
+                        if let Some(id) = upserted {
+                            out["upserted"] = json!(id);
+                        }
+                        ok_bytes(out)
+                    }
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
@@ -239,9 +259,26 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
                 Some(u) => u,
                 None => return err_bytes("missing 'update'"),
             };
-            match db.update_one(col, query, update) {
-                Ok(count) => ok_bytes(json!({ "modified": count })),
-                Err(e) => err_bytes(&e.to_string()),
+            let upsert = request
+                .get("upsert")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if upsert {
+                match db.update_with_upsert(col, query, update, false, true) {
+                    Ok((_, modified, upserted)) => {
+                        let mut out = json!({ "modified": modified });
+                        if let Some(id) = upserted {
+                            out["upserted"] = json!(id);
+                        }
+                        ok_bytes(out)
+                    }
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else {
+                match db.update_one(col, query, update) {
+                    Ok(count) => ok_bytes(json!({ "modified": count })),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
             }
         }
 
@@ -366,6 +403,40 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
             };
             match db.create_text_index(col, fields) {
                 Ok(()) => ok_bytes(json!("text index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "create_geo_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            match db.create_geo_index(col, field) {
+                Ok(()) => ok_bytes(json!("geo index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "create_ttl_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            let expire = match request.get("expire_after_seconds").and_then(|v| v.as_u64()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'expire_after_seconds'"),
+            };
+            match db.create_ttl_index(col, field, expire) {
+                Ok(()) => ok_bytes(json!("ttl index created")),
                 Err(e) => err_bytes(&e.to_string()),
             }
         }
@@ -699,6 +770,46 @@ pub unsafe extern "C" fn oxidb_open_encrypted(
     }
 }
 
+/// Open with AES-256-GCM encryption, key passed as raw bytes (`key_len`
+/// must be 32). The mobile-idiomatic variant: the key lives in the OS
+/// keystore (iOS Keychain / Android Keystore), never in a file the app
+/// sandbox could leak — `oxidb_open_encrypted`'s key-file contract is for
+/// servers and desktops.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string; `key` must point to
+/// `key_len` readable bytes. Returns NULL on any failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_open_encrypted_bytes(
+    path: *const c_char,
+    key: *const u8,
+    key_len: usize,
+) -> *mut Handle {
+    let path_str = match unsafe { cstr_to_str(path) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    if key.is_null() || key_len != 32 {
+        return ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    let encryption_key = oxidb::EncryptionKey::from_bytes(&arr);
+    match OxiDb::open_with_options(Path::new(path_str), Some(encryption_key)) {
+        Ok(db) => {
+            let handle = Box::new(OxiDbHandle {
+                db: Arc::new(db),
+                active_tx: Mutex::new(None),
+                dir: PathBuf::from(path_str),
+                sql: OnceLock::new(),
+            });
+            Box::into_raw(handle) as *mut Handle
+        }
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 /// Close the database and free the handle. Safe to call with NULL.
 ///
 /// A close folds the SQL engine's WAL into a fresh generation
@@ -867,6 +978,29 @@ mod android_jni {
             Err(_) => return 0,
         };
         unsafe { oxidb_open_encrypted(c_path.as_ptr(), c_key.as_ptr()) as jlong }
+    }
+
+    /// Key as raw bytes (from Android Keystore), not a key file.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_oxidb_embedded_OxiDb_nativeOpenEncryptedBytes(
+        mut env: JNIEnv,
+        _class: JClass,
+        jpath: JString,
+        jkey: jni::objects::JByteArray,
+    ) -> jlong {
+        let path: String = match env.get_string(&jpath) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let key: Vec<u8> = match env.convert_byte_array(&jkey) {
+            Ok(b) => b,
+            Err(_) => return 0,
+        };
+        let c_path = match CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        unsafe { oxidb_open_encrypted_bytes(c_path.as_ptr(), key.as_ptr(), key.len()) as jlong }
     }
 
     #[unsafe(no_mangle)]
