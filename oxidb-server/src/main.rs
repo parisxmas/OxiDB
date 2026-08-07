@@ -1189,7 +1189,7 @@ CORE:
                            fastest-read mode; existing collections keep their
                            format either way)
     OXIDB_POOL_SIZE        worker threads           (default 4)
-    OXIDB_IDLE_TIMEOUT     idle disconnect secs     (default 30, 0 = never)
+    OXIDB_IDLE_TIMEOUT     idle disconnect secs     (default 0 = never)
 
 ENGINES (off unless set):
     OXIDB_DOC=0            disable the document engine (it is ON by default —
@@ -1287,7 +1287,7 @@ fn main() {
         .expect("OXIDB_POOL_SIZE must be a valid usize");
 
     let idle_timeout_secs: u64 = env::var("OXIDB_IDLE_TIMEOUT")
-        .unwrap_or_else(|_| "30".to_string())
+        .unwrap_or_else(|_| "0".to_string())
         .parse()
         .expect("OXIDB_IDLE_TIMEOUT must be a valid u64 (seconds)");
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
@@ -2154,7 +2154,7 @@ fn run_cluster_mode() {
         .expect("OXIDB_POOL_SIZE must be a valid usize");
 
     let idle_timeout_secs: u64 = env::var("OXIDB_IDLE_TIMEOUT")
-        .unwrap_or_else(|_| "30".to_string())
+        .unwrap_or_else(|_| "0".to_string())
         .parse()
         .expect("OXIDB_IDLE_TIMEOUT must be a valid u64 (seconds)");
     let idle_timeout = Duration::from_secs(idle_timeout_secs);

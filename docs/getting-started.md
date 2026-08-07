@@ -52,7 +52,7 @@ The server listens on `127.0.0.1:4444` by default and stores data in `./oxidb_da
 | `OXIDB_ADDR` | `127.0.0.1:4444` | TCP listen address |
 | `OXIDB_DATA` | `./oxidb_data` | Data directory |
 | `OXIDB_POOL_SIZE` | `4` | Worker thread count |
-| `OXIDB_IDLE_TIMEOUT` | `30` | Connection idle timeout in seconds (0 = no timeout) |
+| `OXIDB_IDLE_TIMEOUT` | `0` | Connection idle timeout in seconds (default 0 = no timeout) |
 
 Example with custom settings:
 
