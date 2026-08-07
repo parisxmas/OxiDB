@@ -728,8 +728,15 @@ pub unsafe extern "C" fn oxidb_open(path: *const c_char) -> *mut Handle {
     };
     match OxiDb::open(Path::new(path_str)) {
         Ok(db) => {
+            let db = Arc::new(db);
+            // The server starts this from main; embedded must too, or the
+            // WAL never checkpoints (unbounded growth) and disk-first
+            // indexes never persist — every reopen was paying a full
+            // rescan. Found live: a 2M-doc Flutter demo reopened in ~60 s
+            // with a ~200 MB WAL tail.
+            db.enable_periodic_snapshot(std::time::Duration::from_secs(1));
             let handle = Box::new(OxiDbHandle {
-                db: Arc::new(db),
+                db,
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
                 #[cfg(feature = "sql")]
@@ -765,8 +772,15 @@ pub unsafe extern "C" fn oxidb_open_encrypted(
     };
     match OxiDb::open_with_options(Path::new(path_str), Some(encryption_key)) {
         Ok(db) => {
+            let db = Arc::new(db);
+            // The server starts this from main; embedded must too, or the
+            // WAL never checkpoints (unbounded growth) and disk-first
+            // indexes never persist — every reopen was paying a full
+            // rescan. Found live: a 2M-doc Flutter demo reopened in ~60 s
+            // with a ~200 MB WAL tail.
+            db.enable_periodic_snapshot(std::time::Duration::from_secs(1));
             let handle = Box::new(OxiDbHandle {
-                db: Arc::new(db),
+                db,
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
                 #[cfg(feature = "sql")]
@@ -806,8 +820,15 @@ pub unsafe extern "C" fn oxidb_open_encrypted_bytes(
     let encryption_key = oxidb::EncryptionKey::from_bytes(&arr);
     match OxiDb::open_with_options(Path::new(path_str), Some(encryption_key)) {
         Ok(db) => {
+            let db = Arc::new(db);
+            // The server starts this from main; embedded must too, or the
+            // WAL never checkpoints (unbounded growth) and disk-first
+            // indexes never persist — every reopen was paying a full
+            // rescan. Found live: a 2M-doc Flutter demo reopened in ~60 s
+            // with a ~200 MB WAL tail.
+            db.enable_periodic_snapshot(std::time::Duration::from_secs(1));
             let handle = Box::new(OxiDbHandle {
-                db: Arc::new(db),
+                db,
                 active_tx: Mutex::new(None),
                 dir: PathBuf::from(path_str),
                 #[cfg(feature = "sql")]
