@@ -2,25 +2,21 @@
 // app, queried live, with the app's resident memory on screen — the
 // disk-first story made visible: documents stay in an mmap'd file, RSS
 // stays flat no matter how many records exist.
+//
+// The database runs in a background isolate (db_worker.dart): OxiDB calls
+// are synchronous FFI, so keeping them off the UI isolate is what keeps
+// the interface responsive even while the engine checkpoints in the
+// background. The UI here only sends commands and renders replies.
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:flutter/material.dart';
-import 'package:oxidb_embedded/oxidb_embedded.dart';
 import 'package:path_provider/path_provider.dart';
 
-const int kTarget = 2000000;
-const int kBatch = 5000;
-const cities = [
-  'Istanbul', 'Ankara', 'Izmir', 'Bursa', 'Antalya',
-  'Adana', 'Konya', 'Gaziantep', 'Mersin', 'Kayseri',
-];
+import 'db_worker.dart';
 
-void main() {
-  runApp(const DemoApp());
-}
+void main() => runApp(const DemoApp());
 
 class DemoApp extends StatelessWidget {
   const DemoApp({super.key});
@@ -39,7 +35,7 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  OxiDb? db;
+  DbWorker? worker;
   int total = 0;
   bool seeding = false;
   double seedProgress = 0;
@@ -50,26 +46,18 @@ class _HomePageState extends State<HomePage> {
   int anonMb = 0;
   int fileMb = 0;
   double dbSizeMb = 0;
-  String dbPath = '';
 
-  String queryResult = 'Henüz sorgu yok';
-  int queryMs = 0;
+  String queryResult = 'Başlatılıyor…';
   List<Map<String, dynamic>> rows = const [];
 
-  final rand = Random(42);
   Timer? memTimer;
   final searchCtrl = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    var tick = 0;
-    memTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+    memTimer = Timer.periodic(const Duration(milliseconds: 500), (t) {
       final rss = ProcessInfo.currentRss ~/ (1024 * 1024);
-      // The honest split: RssAnon is the binding heap; RssFile is mmap'd
-      // file pages (the database file the last scan touched) — clean,
-      // evictable page cache the kernel reclaims under pressure. Without
-      // this split, "RSS ≈ database size" reads as a leak when it is not.
       var anon = 0, file = 0;
       try {
         for (final line in File('/proc/self/status').readAsLinesSync()) {
@@ -80,9 +68,9 @@ class _HomePageState extends State<HomePage> {
           }
         }
       } catch (_) {}
-      // The on-disk size every 2 s — a directory walk, not free.
-      if (tick % 4 == 0) _updateDbSize();
-      tick++;
+      // Ask the worker for the on-disk size every 2 s (a directory walk —
+      // also off the UI isolate).
+      if (t.tick % 4 == 0) worker?.send({'op': 'dbsize'});
       setState(() {
         rssMb = rss;
         anonMb = anon;
@@ -90,169 +78,58 @@ class _HomePageState extends State<HomePage> {
         if (rss > peakRssMb) peakRssMb = rss;
       });
     });
-    _openDb();
+    _start();
   }
 
   @override
   void dispose() {
     memTimer?.cancel();
     searchCtrl.dispose();
-    db?.close();
     super.dispose();
   }
 
-  Future<void> _openDb() async {
+  Future<void> _start() async {
     final dir = await getApplicationDocumentsDirectory();
-    dbPath = '${dir.path}/oxidb_2m';
-    final d = OxiDb.open(dbPath);
-    _seedNotes(d);
-    // One-shot: the on-disk layout, into logcat (flutter's print lands
-    // there) — which file actually holds the bytes.
-    try {
-      final files = Directory(dbPath)
-          .listSync(recursive: true)
-          .whereType<File>()
-          .map((f) => MapEntry(f.path.replaceFirst('$dbPath/', ''), f.lengthSync()))
-          .toList()
-        ..sort((a, b) => b.value.compareTo(a.value));
-      for (final e in files.take(8)) {
-        // ignore: avoid_print
-        print('OXIDB-FILE ${(e.value / 1048576).toStringAsFixed(1)} MB  ${e.key}');
-      }
-    } catch (_) {}
-    setState(() {
-      db = d;
-      total = d.count('people');
-    });
-    if (total < kTarget) {
-      unawaited(_seed());
+    final w = await DbWorker.spawn('${dir.path}/oxidb_2m');
+    w.events.listen(_onWorkerMessage);
+    setState(() => worker = w);
+  }
+
+  void _onWorkerMessage(Map<String, Object?> m) {
+    switch (m['type']) {
+      case 'ready':
+        setState(() {
+          total = m['total'] as int;
+          queryResult = total > 0 ? 'Hazır' : 'Tohumlama başlıyor…';
+          if (total < kTarget) seeding = true;
+        });
+      case 'progress':
+        setState(() {
+          total = m['done'] as int;
+          seedProgress = total / kTarget;
+          seedRate = '${m['rate']} doc/s';
+          seeding = true;
+        });
+      case 'seed_done':
+        setState(() {
+          total = m['total'] as int;
+          seeding = false;
+        });
+      case 'result':
+        setState(() {
+          queryResult = m['label'] as String;
+          rows = (m['rows'] as List).cast<Map<String, dynamic>>();
+          if (m['total'] != null) total = m['total'] as int;
+        });
+      case 'dbsize':
+        setState(() => dbSizeMb = m['mb'] as double);
     }
-  }
-
-  /// Total bytes under the database directory — what 2M records actually
-  /// cost on flash.
-  void _updateDbSize() {
-    if (dbPath.isEmpty) return;
-    var bytes = 0;
-    try {
-      for (final f in Directory(dbPath).listSync(recursive: true)) {
-        if (f is File) bytes += f.lengthSync();
-      }
-    } catch (_) {}
-    dbSizeMb = bytes / (1024 * 1024);
-  }
-
-  /// A small notes collection with a BM25 text index — the FTS half of
-  /// the demo. Seeded once.
-  void _seedNotes(OxiDb d) {
-    if (d.count('notes') > 0) return;
-    for (final t in const [
-      'Pazartesi süt ve ekmek almayı unutma',
-      'Ankara toplantısı için sunum hazırla',
-      'Koşu antrenmanı: sahilde 5 km tempo',
-      'Yeni telefon için ekran koruyucu sipariş et',
-      'Annemi ara, doğum günü hediyesi konuş',
-      'Sunum dosyasını ekibe mail at',
-      'Süt kuzusuna masal kitabı al',
-      'Salı akşamı basketbol maçı — salon 2',
-    ]) {
-      d.insert('notes', {'text': t});
-    }
-    d.createTextIndex('notes', ['text']);
-  }
-
-  void _searchNotes() {
-    final d = db;
-    final q = searchCtrl.text.trim();
-    if (d == null || q.isEmpty) return;
-    final sw = Stopwatch()..start();
-    final hits = d.textSearch('notes', q);
-    sw.stop();
-    setState(() {
-      rows = hits
-          .map((h) => <String, dynamic>{
-                'name': h['text'],
-                'city': 'skor ${(h['_score'] as num?)?.toStringAsFixed(2)}',
-                'age': '-',
-                'score': '-',
-                '_id': h['_id'],
-              })
-          .toList();
-      queryResult = 'FTS "$q" → ${hits.length} sonuç, ${sw.elapsedMilliseconds} ms (BM25)';
-    });
-  }
-
-  /// Seed up to 2M documents in batches, yielding to the UI between
-  /// batches so the memory ticker and progress bar stay live.
-  Future<void> _seed() async {
-    final d = db!;
-    setState(() => seeding = true);
-    // Index BEFORE the data: writes maintain it incrementally.
-    d.createIndex('people', 'city');
-    d.createIndex('people', 'age');
-    final sw = Stopwatch()..start();
-    var done = total;
-    while (done < kTarget) {
-      final n = min(kBatch, kTarget - done);
-      final batch = List.generate(n, (i) {
-        final id = done + i;
-        return <String, Object?>{
-          'name': 'user_$id',
-          'city': cities[id % cities.length],
-          'age': 18 + (id * 7) % 62,
-          'score': (id * 13) % 1000,
-        };
-      });
-      d.insertMany('people', batch);
-      done += n;
-      final rate = done - total == 0
-          ? 0
-          : ((done - total) * 1000 / max(sw.elapsedMilliseconds, 1)).round();
-      setState(() {
-        seedProgress = done / kTarget;
-        seedRate = '$rate doc/s';
-        total = done;
-      });
-      // Let the frame render.
-      await Future<void>.delayed(Duration.zero);
-    }
-    setState(() => seeding = false);
-  }
-
-  void _run(String label, List<Map<String, dynamic>> Function(OxiDb) q) {
-    final d = db;
-    if (d == null) return;
-    final sw = Stopwatch()..start();
-    final out = q(d);
-    sw.stop();
-    setState(() {
-      rows = out.take(20).toList();
-      queryMs = sw.elapsedMilliseconds;
-      queryResult = '$label → ${out.length} satır, ${sw.elapsedMilliseconds} ms';
-    });
-  }
-
-  void _insertOne() {
-    final d = db;
-    if (d == null) return;
-    final sw = Stopwatch()..start();
-    final id = d.insert('people', {
-      'name': 'yeni_${DateTime.now().millisecondsSinceEpoch}',
-      'city': cities[rand.nextInt(cities.length)],
-      'age': 18 + rand.nextInt(62),
-      'score': rand.nextInt(1000),
-    });
-    sw.stop();
-    setState(() {
-      total = d.count('people');
-      queryResult = 'insert → id $id, ${sw.elapsedMilliseconds} ms (WAL-durable)';
-      rows = const [];
-    });
   }
 
   @override
   Widget build(BuildContext context) {
     final fmt = NumberFormatTr();
+    final ready = worker != null && !seeding;
     return Scaffold(
       appBar: AppBar(title: const Text('OxiDB — 2M kayıt, cihaz içinde')),
       body: Padding(
@@ -306,46 +183,22 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 8),
             Wrap(spacing: 8, runSpacing: 8, children: [
               FilledButton(
-                onPressed: seeding || db == null
-                    ? null
-                    : () => _run(
-                        'city=Izmir limit 20',
-                        (d) => d.find('people',
-                            query: {'city': 'Izmir'}, limit: 20)),
+                onPressed:
+                    ready ? () => worker!.send({'op': 'query', 'kind': 'izmir'}) : null,
                 child: const Text('Izmir (index)'),
               ),
               FilledButton(
-                onPressed: seeding || db == null
-                    ? null
-                    : () => _run(
-                        'city=Ankara ∧ age≥60',
-                        (d) => d.find('people',
-                            query: {
-                              'city': 'Ankara',
-                              'age': {r'$gte': 60}
-                            },
-                            limit: 20)),
+                onPressed:
+                    ready ? () => worker!.send({'op': 'query', 'kind': 'ankara'}) : null,
                 child: const Text('Ankara ∧ yaş≥60'),
               ),
               FilledButton.tonal(
-                onPressed: seeding || db == null
-                    ? null
-                    : () {
-                        final d = db!;
-                        final sw = Stopwatch()..start();
-                        final n = d.count('people', query: {'city': 'Istanbul'});
-                        sw.stop();
-                        setState(() {
-                          queryMs = sw.elapsedMilliseconds;
-                          queryResult =
-                              'count(city=Istanbul) → ${fmt.f(n)}, ${sw.elapsedMilliseconds} ms (index-only)';
-                          rows = const [];
-                        });
-                      },
+                onPressed:
+                    ready ? () => worker!.send({'op': 'query', 'kind': 'count'}) : null,
                 child: const Text('İstanbul say'),
               ),
               FilledButton.icon(
-                onPressed: seeding || db == null ? null : _insertOne,
+                onPressed: ready ? () => worker!.send({'op': 'insert'}) : null,
                 icon: const Icon(Icons.add),
                 label: const Text('Insert'),
               ),
@@ -360,12 +213,14 @@ class _HomePageState extends State<HomePage> {
                     border: OutlineInputBorder(),
                     hintText: 'Not ara (FTS/BM25)… ör: süt',
                   ),
-                  onSubmitted: (_) => _searchNotes(),
+                  onSubmitted: (q) => worker?.send({'op': 'fts', 'q': q}),
                 ),
               ),
               const SizedBox(width: 8),
               FilledButton(
-                onPressed: seeding || db == null ? null : _searchNotes,
+                onPressed: ready
+                    ? () => worker!.send({'op': 'fts', 'q': searchCtrl.text})
+                    : null,
                 child: const Text('Ara'),
               ),
             ]),
