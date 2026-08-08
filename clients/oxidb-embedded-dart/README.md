@@ -22,6 +22,27 @@ server-grade engine behind it:
 - **Durable writes**: WAL-backed; when a call returns, the write survives
   a crash
 
+## Sync vs. background (use background on a Flutter UI)
+
+OxiDB's FFI is synchronous. A call made on the UI isolate that contends
+with the engine's background checkpoint (the data file being rewritten
+during a WAL fold) blocks the frame — measured at 450 ms for one insert
+mid-fold, enough to ANR on a large database. **`OxiDb.background()`** runs
+the whole engine on a worker isolate and returns an `OxiDbAsync` whose
+methods mirror `OxiDb` one-for-one but return `Future`s the UI simply
+awaits, so the interface never blocks:
+
+```dart
+final db = await OxiDb.background('${appDir.path}/oxidb');
+await db.insert('rides', {'driver': 'u42', 'fare': 120});
+final recent = await db.find('rides', query: {'fare': {r'$gte': 100}});
+await db.close();
+```
+
+Use the synchronous `OxiDb.open` (below) off the UI isolate — in a CLI,
+a server, tests, or your own isolate. The `example/` app is built on
+`OxiDb.background()` and stays responsive while seeding 2,000,000 rows.
+
 ```dart
 import 'package:oxidb_embedded/oxidb_embedded.dart';
 

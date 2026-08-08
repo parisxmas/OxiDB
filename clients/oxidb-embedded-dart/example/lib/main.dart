@@ -3,18 +3,27 @@
 // disk-first story made visible: documents stay in an mmap'd file, RSS
 // stays flat no matter how many records exist.
 //
-// The database runs in a background isolate (db_worker.dart): OxiDB calls
-// are synchronous FFI, so keeping them off the UI isolate is what keeps
-// the interface responsive even while the engine checkpoints in the
-// background. The UI here only sends commands and renders replies.
+// The database is opened with OxiDb.background(), which runs the whole
+// engine on a worker isolate. OxiDB's FFI is synchronous, so a call made
+// on the UI isolate that contends with the background checkpoint can jank
+// a frame or ANR on a large database — background() makes every call a
+// Future the UI simply awaits, so the interface never blocks.
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:oxidb_embedded/oxidb_embedded.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'db_worker.dart';
+const int kTarget = 2000000;
+const int kBatch = 5000;
+const cities = [
+  'Istanbul', 'Ankara', 'Izmir', 'Bursa', 'Antalya',
+  'Adana', 'Konya', 'Gaziantep', 'Mersin', 'Kayseri',
+];
 
 void main() => runApp(const DemoApp());
 
@@ -35,9 +44,11 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  DbWorker? worker;
+  OxiDbAsync? db;
+  String dbPath = '';
   int total = 0;
   bool seeding = false;
+  bool busy = false;
   double seedProgress = 0;
   String seedRate = '';
 
@@ -50,6 +61,7 @@ class _HomePageState extends State<HomePage> {
   String queryResult = 'Başlatılıyor…';
   List<Map<String, dynamic>> rows = const [];
 
+  final rand = Random(42);
   Timer? memTimer;
   final searchCtrl = TextEditingController();
 
@@ -68,9 +80,7 @@ class _HomePageState extends State<HomePage> {
           }
         }
       } catch (_) {}
-      // Ask the worker for the on-disk size every 2 s (a directory walk —
-      // also off the UI isolate).
-      if (t.tick % 4 == 0) worker?.send({'op': 'dbsize'});
+      if (t.tick % 4 == 0) _updateDbSize();
       setState(() {
         rssMb = rss;
         anonMb = anon;
@@ -85,51 +95,149 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     memTimer?.cancel();
     searchCtrl.dispose();
+    db?.close();
     super.dispose();
   }
 
   Future<void> _start() async {
     final dir = await getApplicationDocumentsDirectory();
-    final w = await DbWorker.spawn('${dir.path}/oxidb_2m');
-    w.events.listen(_onWorkerMessage);
-    setState(() => worker = w);
+    dbPath = '${dir.path}/oxidb_2m';
+    final d = await OxiDb.background(dbPath);
+    await _seedNotes(d);
+    final n = await d.count('people');
+    setState(() {
+      db = d;
+      total = n;
+      queryResult = n > 0 ? 'Hazır' : 'Tohumlama başlıyor…';
+    });
+    if (n < kTarget) unawaited(_seed(d));
   }
 
-  void _onWorkerMessage(Map<String, Object?> m) {
-    switch (m['type']) {
-      case 'ready':
-        setState(() {
-          total = m['total'] as int;
-          queryResult = total > 0 ? 'Hazır' : 'Tohumlama başlıyor…';
-          if (total < kTarget) seeding = true;
-        });
-      case 'progress':
-        setState(() {
-          total = m['done'] as int;
-          seedProgress = total / kTarget;
-          seedRate = '${m['rate']} doc/s';
-          seeding = true;
-        });
-      case 'seed_done':
-        setState(() {
-          total = m['total'] as int;
-          seeding = false;
-        });
-      case 'result':
-        setState(() {
-          queryResult = m['label'] as String;
-          rows = (m['rows'] as List).cast<Map<String, dynamic>>();
-          if (m['total'] != null) total = m['total'] as int;
-        });
-      case 'dbsize':
-        setState(() => dbSizeMb = m['mb'] as double);
+  Future<void> _seedNotes(OxiDbAsync d) async {
+    if (await d.count('notes') > 0) return;
+    for (final t in const [
+      'Pazartesi süt ve ekmek almayı unutma',
+      'Ankara toplantısı için sunum hazırla',
+      'Koşu antrenmanı: sahilde 5 km tempo',
+      'Yeni telefon için ekran koruyucu sipariş et',
+      'Annemi ara, doğum günü hediyesi konuş',
+      'Sunum dosyasını ekibe mail at',
+      'Süt kuzusuna masal kitabı al',
+      'Salı akşamı basketbol maçı — salon 2',
+    ]) {
+      await d.insert('notes', {'text': t});
     }
+    await d.createTextIndex('notes', ['text']);
+  }
+
+  Future<void> _seed(OxiDbAsync d) async {
+    setState(() => seeding = true);
+    await d.createIndex('people', 'city');
+    await d.createIndex('people', 'age');
+    final sw = Stopwatch()..start();
+    var done = total;
+    final start = done;
+    while (done < kTarget) {
+      final n = min(kBatch, kTarget - done);
+      final batch = List.generate(n, (i) {
+        final id = done + i;
+        return <String, Object?>{
+          'name': 'user_$id',
+          'city': cities[id % cities.length],
+          'age': 18 + (id * 7) % 62,
+          'score': (id * 13) % 1000,
+        };
+      });
+      // Each await hands the frame back to the UI — the work runs on the
+      // worker isolate, so seeding 2M rows never freezes the interface.
+      await d.insertMany('people', batch);
+      done += n;
+      final rate = ((done - start) * 1000 / max(sw.elapsedMilliseconds, 1)).round();
+      setState(() {
+        total = done;
+        seedProgress = done / kTarget;
+        seedRate = '$rate doc/s';
+      });
+    }
+    setState(() => seeding = false);
+  }
+
+  /// The on-disk size — a directory walk, off the UI isolate.
+  Future<void> _updateDbSize() async {
+    if (dbPath.isEmpty) return;
+    final path = dbPath;
+    final mb = await Isolate.run(() {
+      var bytes = 0;
+      try {
+        for (final f in Directory(path).listSync(recursive: true)) {
+          if (f is File) bytes += f.lengthSync();
+        }
+      } catch (_) {}
+      return bytes / (1024 * 1024);
+    });
+    if (mounted) setState(() => dbSizeMb = mb);
+  }
+
+  Future<void> _run(
+      String label, Future<List<Map<String, dynamic>>> Function(OxiDbAsync) q) async {
+    final d = db;
+    if (d == null || busy) return;
+    setState(() => busy = true);
+    final sw = Stopwatch()..start();
+    final out = await q(d);
+    setState(() {
+      busy = false;
+      rows = out.take(20).toList();
+      queryResult = '$label → ${out.length} satır, ${sw.elapsedMilliseconds} ms';
+    });
+  }
+
+  Future<void> _insertOne() async {
+    final d = db;
+    if (d == null || busy) return;
+    setState(() => busy = true);
+    final sw = Stopwatch()..start();
+    final id = await d.insert('people', {
+      'name': 'yeni_${DateTime.now().millisecondsSinceEpoch}',
+      'city': cities[rand.nextInt(cities.length)],
+      'age': 18 + rand.nextInt(62),
+      'score': rand.nextInt(1000),
+    });
+    final n = await d.count('people');
+    setState(() {
+      busy = false;
+      total = n;
+      queryResult = 'insert → id $id, ${sw.elapsedMilliseconds} ms (WAL-durable)';
+      rows = const [];
+    });
+  }
+
+  Future<void> _search() async {
+    final d = db;
+    final q = searchCtrl.text.trim();
+    if (d == null || busy || q.isEmpty) return;
+    setState(() => busy = true);
+    final sw = Stopwatch()..start();
+    final hits = await d.textSearch('notes', q);
+    setState(() {
+      busy = false;
+      rows = hits
+          .map((h) => <String, dynamic>{
+                'name': h['text'],
+                'city': 'skor ${(h['_score'] as num?)?.toStringAsFixed(2)}',
+                'age': '-',
+                'score': '-',
+                '_id': h['_id'],
+              })
+          .toList();
+      queryResult = 'FTS "$q" → ${hits.length} sonuç, ${sw.elapsedMilliseconds} ms (BM25)';
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final fmt = NumberFormatTr();
-    final ready = worker != null && !seeding;
+    final ready = db != null && !seeding && !busy;
     return Scaffold(
       appBar: AppBar(title: const Text('OxiDB — 2M kayıt, cihaz içinde')),
       body: Padding(
@@ -156,16 +264,11 @@ class _HomePageState extends State<HomePage> {
                     ),
                     Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                       Text('RSS: $rssMb MB',
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleMedium
-                              ?.copyWith(
-                                  color: Colors.deepOrange,
-                                  fontWeight: FontWeight.bold)),
+                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              color: Colors.deepOrange, fontWeight: FontWeight.bold)),
                       Text('heap $anonMb + dosya $fileMb',
                           style: const TextStyle(fontSize: 12)),
-                      Text('tepe: $peakRssMb MB',
-                          style: const TextStyle(fontSize: 12)),
+                      Text('tepe: $peakRssMb MB', style: const TextStyle(fontSize: 12)),
                     ]),
                   ],
                 ),
@@ -183,22 +286,44 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 8),
             Wrap(spacing: 8, runSpacing: 8, children: [
               FilledButton(
-                onPressed:
-                    ready ? () => worker!.send({'op': 'query', 'kind': 'izmir'}) : null,
+                onPressed: ready
+                    ? () => _run('city=Izmir limit 20',
+                        (d) => d.find('people', query: {'city': 'Izmir'}, limit: 20))
+                    : null,
                 child: const Text('Izmir (index)'),
               ),
               FilledButton(
-                onPressed:
-                    ready ? () => worker!.send({'op': 'query', 'kind': 'ankara'}) : null,
+                onPressed: ready
+                    ? () => _run(
+                        'city=Ankara ∧ age≥60',
+                        (d) => d.find('people',
+                            query: {
+                              'city': 'Ankara',
+                              'age': {r'$gte': 60}
+                            },
+                            limit: 20))
+                    : null,
                 child: const Text('Ankara ∧ yaş≥60'),
               ),
               FilledButton.tonal(
-                onPressed:
-                    ready ? () => worker!.send({'op': 'query', 'kind': 'count'}) : null,
+                onPressed: ready
+                    ? () async {
+                        final d = db!;
+                        setState(() => busy = true);
+                        final sw = Stopwatch()..start();
+                        final n = await d.count('people', query: {'city': 'Istanbul'});
+                        setState(() {
+                          busy = false;
+                          queryResult =
+                              'count(city=Istanbul) → ${fmt.f(n)}, ${sw.elapsedMilliseconds} ms (index-only)';
+                          rows = const [];
+                        });
+                      }
+                    : null,
                 child: const Text('İstanbul say'),
               ),
               FilledButton.icon(
-                onPressed: ready ? () => worker!.send({'op': 'insert'}) : null,
+                onPressed: ready ? _insertOne : null,
                 icon: const Icon(Icons.add),
                 label: const Text('Insert'),
               ),
@@ -213,16 +338,11 @@ class _HomePageState extends State<HomePage> {
                     border: OutlineInputBorder(),
                     hintText: 'Not ara (FTS/BM25)… ör: süt',
                   ),
-                  onSubmitted: (q) => worker?.send({'op': 'fts', 'q': q}),
+                  onSubmitted: (_) => _search(),
                 ),
               ),
               const SizedBox(width: 8),
-              FilledButton(
-                onPressed: ready
-                    ? () => worker!.send({'op': 'fts', 'q': searchCtrl.text})
-                    : null,
-                child: const Text('Ara'),
-              ),
+              FilledButton(onPressed: ready ? _search : null, child: const Text('Ara')),
             ]),
             const SizedBox(height: 8),
             Text(queryResult, style: Theme.of(context).textTheme.bodyLarge),

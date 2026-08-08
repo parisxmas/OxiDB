@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import 'background.dart';
 import 'bindings.dart';
 
 /// Thrown when the engine refuses a command.
@@ -41,6 +42,20 @@ class OxiDb {
   /// [encryptionKey] — exactly 32 bytes — turns on transparent AES-256-GCM
   /// at the storage layer (data files and WAL both). Keep the key in the
   /// platform keystore (Keychain / Android Keystore), hand it here at open.
+  /// Open on a dedicated background isolate: same API as [OxiDb] but every
+  /// call returns a `Future` and never blocks the calling isolate. This is
+  /// the right choice for a Flutter UI — OxiDB's FFI is synchronous, so a
+  /// call made on the UI isolate that contends with the engine's background
+  /// checkpoint can jank a frame or (on a large database) ANR. See
+  /// [OxiDbAsync].
+  ///
+  /// ```dart
+  /// final db = await OxiDb.background('${dir.path}/oxidb');
+  /// await db.insert('users', {'name': 'Alice'});
+  /// ```
+  static Future<OxiDbAsync> background(String path, {Uint8List? encryptionKey}) =>
+      OxiDbAsync.spawn(path, encryptionKey);
+
   static OxiDb open(String path, {Uint8List? encryptionKey}) {
     final b = Bindings.instance();
     final cPath = path.toNativeUtf8();

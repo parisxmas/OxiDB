@@ -1,3 +1,6 @@
+// The resolved-binding fields expose FFI function typedefs, which are
+// private by convention; that is exactly the shape dart:ffi bindings take.
+// ignore_for_file: library_private_types_in_public_api
 import 'dart:ffi';
 import 'dart:io';
 
