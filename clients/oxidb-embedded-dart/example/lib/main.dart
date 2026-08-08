@@ -10,8 +10,8 @@
 // Future the UI simply awaits, so the interface never blocks.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -162,20 +162,17 @@ class _HomePageState extends State<HomePage> {
     setState(() => seeding = false);
   }
 
-  /// The on-disk size — a directory walk, off the UI isolate.
-  Future<void> _updateDbSize() async {
+  /// The on-disk size — a directory walk (a handful of files; `lengthSync`
+  /// is a stat, so this is microseconds even for the 460 MB .bdat).
+  void _updateDbSize() {
     if (dbPath.isEmpty) return;
-    final path = dbPath;
-    final mb = await Isolate.run(() {
-      var bytes = 0;
-      try {
-        for (final f in Directory(path).listSync(recursive: true)) {
-          if (f is File) bytes += f.lengthSync();
-        }
-      } catch (_) {}
-      return bytes / (1024 * 1024);
-    });
-    if (mounted) setState(() => dbSizeMb = mb);
+    var bytes = 0;
+    try {
+      for (final f in Directory(dbPath).listSync(recursive: true)) {
+        if (f is File) bytes += f.lengthSync();
+      }
+    } catch (_) {}
+    if (mounted) setState(() => dbSizeMb = bytes / (1024 * 1024));
   }
 
   Future<void> _run(
@@ -232,6 +229,27 @@ class _HomePageState extends State<HomePage> {
           .toList();
       queryResult = 'FTS "$q" → ${hits.length} sonuç, ${sw.elapsedMilliseconds} ms (BM25)';
     });
+  }
+
+  /// The whole document as stored, pretty-printed.
+  void _showDoc(Map<String, dynamic> doc) {
+    final json = const JsonEncoder.withIndent('  ').convert(doc);
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('Kayıt #${doc['_id']}'),
+        content: SingleChildScrollView(
+          child: SelectableText(json,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 13)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Kapat'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -357,6 +375,9 @@ class _HomePageState extends State<HomePage> {
                     title: Text('${r['name']}  —  ${r['city']}'),
                     subtitle: Text('yaş ${r['age']}, skor ${r['score']}'),
                     trailing: Text('#${r['_id']}'),
+                    // Tap a row to see the full document (every field,
+                    // including _id and _version) as stored.
+                    onTap: () => _showDoc(r),
                   );
                 },
               ),
