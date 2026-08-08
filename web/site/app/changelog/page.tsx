@@ -11,12 +11,69 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.42.12 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.42.12</h3>
+        <span class="version-date">2026-08-08</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; realtime subscriptions that filter, and events that carry the document</h4>
+        <ul>
+          <li><strong>A change event now carries the document.</strong> Updates deliver the post-image, deletes the pre-image, and an upsert that inserts delivers the inserted document &mdash; previously an insert event born of an upsert sent no document at all, breaking its own contract. A subscriber no longer has to issue a read per event to learn what changed. Post-images ride the same reference the document cache already holds, so with no subscribers there is no cost. <strong>Found while building this:</strong> every update inside a transaction was reported as an <em>insert</em>, because the commit path discriminated on a field that is always empty in the default storage mode.</li>
+          <li><strong>WebSocket subscription filters speak the full query language.</strong> The old matcher compared top-level fields for equality only, so <em>every</em> operator filter silently matched nothing. Filters are now parsed once at subscribe time with the engine&rsquo;s own parser and evaluated by the engine&rsquo;s own matcher: <code>$gt</code>, <code>$in</code>, <code>$or</code> and &mdash; for a live map viewport &mdash; <code>$geoWithin</code> and <code>$near</code> all work. An unparseable filter is <strong>refused at subscribe time</strong> rather than stored as one that never fires.</li>
+          <li><strong>Backpressure coalesces instead of dropping.</strong> A subscriber that falls behind used to lose events outright. The newest event per document is now deferred in a per-subscriber queue and flushed when the channel drains, so a slow client converges on every document&rsquo;s latest state rather than missing it. The dropped-event counter now counts only genuinely lost events. Replay buffer size is configurable with <code>OXIDB_CHANGE_REPLAY_EVENTS</code> (default 4096).</li>
+          <li><strong>Upsert over REST and WebSocket.</strong> <code>PATCH</code> on a collection and the WebSocket update both accept <code>"upsert": true</code>. An upsert that inserts <em>is</em> a create, so the CREATE rule is adjudicated against the exact document the engine would insert &mdash; the same synthesis the upsert path itself runs, so the preview cannot drift from the write. WebSocket <code>find</code> now honours <code>sort</code>/<code>skip</code>/<code>limit</code> (it returned the whole collection before, whatever was asked), and creating an index over REST with an unknown type is refused with 400 instead of quietly building a field index and answering 200.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; geospatial: polygons, geofences, and <code>$geoNear</code></h4>
+        <ul>
+          <li><strong>Polygons.</strong> <code>$geoWithin</code> with a GeoJSON <code>Polygon</code> (exterior ring plus holes) and <code>$geoIntersects</code>. Geofences &mdash; &ldquo;is this vehicle inside the delivery zone&rdquo; &mdash; are finally expressible. A polygon spanning more than 180&deg; of longitude is refused as ambiguous rather than answered on a guess.</li>
+          <li><strong><code>$geoNear</code> aggregation stage</strong> writes the distance in meters into a field of your choosing and orders nearest-first, so clients stop re-deriving haversine distances themselves. It parses into a synthesized leading <code>$match</code>, which means the geo index, candidate intersection and predicate pushdown serve it for free.</li>
+          <li><strong>Nearest-<em>k</em> without inventing a radius.</strong> <code>$near</code> with a limit and no <code>$maxDistance</code> is served by an expanding-ring search over the geo index: grow the circle until enough full-query matches lie inside it, at which point everything not nominated is provably farther. &ldquo;The 10 nearest&rdquo; no longer requires guessing a distance, and no longer scans the collection. <code>explain</code> reports it as <code>GEO_KNN</code>.</li>
+          <li><strong>A geo query can now use your other indexes too.</strong> Geo candidates intersect with field and composite index results; previously any usable field index switched the geo index <em>off</em>, so a query like &ldquo;active vehicles near me&rdquo; scanned every active row. This runs through the single entry point every find/count/update/delete/transaction/explain path already shares, so plans cannot drift apart.</li>
+          <li><strong>The geo index is disk-backed</strong> (<code>.geoidx</code>), merged at the same persist tick as the other on-disk indexes. A clean start opens instantly with no document scan; a crash rebuilds; a corrupt file is refused and rebuilt rather than trusted. As with the other index bases it is a <em>hint</em> &mdash; geo predicates always verify against the live document, so a stale entry self-corrects instead of returning a wrong answer.</li>
+          <li><strong>Security rules can express location policy.</strong> The rules language gains ordering comparisons (<code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code> &mdash; numbers numerically, strings lexicographically, mixed types never comparable so the rule fails closed) and <code>in</code> against a document array field or a literal list. &ldquo;Only my followers can see my location&rdquo; is now writable.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; geo across the other surfaces</h4>
+        <ul>
+          <li><strong>Redis-compatible GEO commands:</strong> <code>GEOADD</code>, <code>GEOPOS</code>, <code>GEODIST</code>, <code>GEOHASH</code>, <code>GEOSEARCH</code> (by member or coordinates, by radius or box, with <code>COUNT</code> and the <code>WITH*</code> modifiers). Redis&rsquo;s own design is reproduced rather than approximated &mdash; a GEO key <em>is</em> a sorted set scored by the interleaved geohash &mdash; so persistence, <code>WATCH</code> and <code>ZREM</code> work on GEO keys with no extra machinery.</li>
+          <li><strong>MQTT &rarr; collection bridge</strong> (<code>OXIDB_MQTT_INGEST</code>): declarative <code>topic-filter:collection</code> routes with MQTT wildcards, so a published message becomes a queryable document before the QoS acknowledgement &mdash; write-before-ack, like the broker itself. A malformed route specification refuses startup rather than dropping messages silently.</li>
+          <li><strong>Time-series tracks:</strong> a <code>distance</code> operation returns path length in meters per group or bucket (consecutive-fix haversine, computed per tag set so grouped vehicles never chain into one another), and <code>track</code> returns the fix list, Douglas-Peucker simplified to a tolerance in meters so a day-long track need not ship 20,000 points.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type changed">Changed &mdash; idle connections are no longer dropped by default</h4>
+        <ul>
+          <li><strong><code>OXIDB_IDLE_TIMEOUT</code> now defaults to <code>0</code> (never).</strong> The old 30-second default disconnected long-lived connections &mdash; connection pools, subscriptions, keep-alive wire clients &mdash; unless a deployment remembered to turn it off. Idle disconnect is now opt-in: set a positive number of seconds to enable it. <strong>The abandoned-transaction backstop is unaffected</strong>: <code>OXIDB_TX_MAX_IDLE_SECS</code> (default 300) still rolls back a transaction whose owner goes quiet, whether or not the connection stays open. The hardening checklist still recommends a non-zero idle timeout for an exposed deployment.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; the embedded engine never started its maintenance thread</h4>
+        <ul>
+          <li><strong>Only the server ever started periodic maintenance</strong>, so an <em>embedded</em> database (FFI, mobile, any in-process use) ran with no WAL checkpointing, no on-disk index persistence, and a full rescan on any reopen after a non-clean exit. Found on a real device: a 2-million-document database took about 60 seconds to reopen, dragging an unfolded write-ahead log behind it. Every embedded open now starts the maintenance thread &mdash; the same database reopens in about 2 seconds and the log folds at its threshold.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; OxiDB embedded for Flutter and Dart</h4>
+        <ul>
+          <li><strong>A new package puts the whole engine in a mobile app</strong>, in-process, with no server: CRUD with the full query language, upsert, every index type (field, unique, composite, text, geo, TTL), aggregation including <code>$geoNear</code>, BM25 full-text search, ACID transactions, blob buckets, the SQL engine, and AES-256-GCM at rest with a 32-byte key taken from the platform keystore &mdash; never from a file in the sandbox. A <code>Preferences</code> view gives the familiar key-value shape on top of it.</li>
+          <li><strong>Off the UI thread, by construction.</strong> Opening with <code>OxiDb.background()</code> runs the engine on a worker isolate and returns an API that mirrors the synchronous one call-for-call, but in Futures. This matters because the bindings are synchronous: a call that contends with a background checkpoint was measured at 450&nbsp;ms mid-fold, long enough for Android to kill the frame. The UI isolate now only ever awaits.</li>
+          <li><strong>A lite build for mobile</strong> drops the SQL engine and the PDF/DOCX/XLSX text extractors: <strong>4.8&nbsp;MB on disk, about 2&nbsp;MB compressed</strong> per ABI, down from 9.8&nbsp;MB. On a lite build the SQL commands answer an error that names the build rather than failing obscurely. Every other consumer &mdash; server, WebAssembly, pool &mdash; is byte-for-byte unaffected.</li>
+          <li><strong>Two things that were already broken are fixed:</strong> the Android Java client had never compiled (unhandled checked exceptions in every method) and read response fields that do not exist, and the Swift package&rsquo;s header symlink had dangled since the repository reorganisation. Both are rebuilt and verified against a compiler.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.42.8 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.42.8</h3>
         <span class="version-date">2026-08-05</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type fixed">Security &mdash; two holes in the read path (upgrade if you use security rules)</h4>
