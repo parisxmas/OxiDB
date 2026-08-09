@@ -258,3 +258,104 @@ fn bad_requests_are_refused_with_names() {
     let r = rec(g.port, serde_json::json!({ "op": "yok" }));
     assert!(r["error"].as_str().unwrap().contains("yok"), "{r}");
 }
+
+// ─── COBRA extension methods (ADR-0025 Phase 4) ─────────────────────────
+
+fn cobra_payload(name: &str) -> String {
+    use base64::Engine as _;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../oxidb-sql/tests/data/cobra")
+        .join(format!("{name}.cobrac"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path:?}: {e}"));
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn sql(port: u16, stmt: &str) -> serde_json::Value {
+    call(
+        port,
+        &serde_json::json!({ "engine": "sql", "cmd": "sql", "sql": stmt }),
+    )
+}
+
+/// A stored procedure crosses into the rec engine: track over the wire,
+/// CALL a COBRA proc whose body asks db.rec_related, get the same answer a
+/// wire client gets — one dispatch, two front doors.
+#[test]
+fn a_cobra_procedure_reaches_the_rec_engine() {
+    let g = spawn_with(&[("OXIDB_SQL", "1")]);
+    for i in 0..20u64 {
+        rec(
+            g.port,
+            serde_json::json!({
+                "op": "track", "model": "purchase", "basket_id": i,
+                "items": ["kahve", "süt"], "ts": 1_700_000_000u64
+            }),
+        );
+    }
+    rec(
+        g.port,
+        serde_json::json!({
+            "op": "track", "model": "purchase", "basket_id": 99,
+            "items": ["kahve", "filtre"], "ts": 1_700_000_000u64
+        }),
+    );
+
+    let r = sql(
+        g.port,
+        &format!(
+            "CREATE PROCEDURE rec_related(item TEXT) LANGUAGE COBRA AS '{}'",
+            cobra_payload("rec_related")
+        ),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+
+    let r = sql(g.port, "CALL rec_related('kahve')");
+    assert_eq!(r["ok"], true, "{r}");
+    // execute_json returns one result object per statement.
+    let result = &r["data"][0];
+    let rows = result["rows"].as_array().unwrap_or_else(|| panic!("{r}"));
+    let cols = result["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{r}"));
+    let item_at = cols.iter().position(|c| c == "item").unwrap();
+    assert_eq!(rows[0][item_at], "süt");
+    assert_eq!(rows[1][item_at], "filtre");
+}
+
+/// And into the DOCUMENT engine's vector index — the cross-engine hop.
+#[test]
+fn a_cobra_procedure_reaches_vector_search() {
+    let g = spawn_with(&[("OXIDB_SQL", "1")]);
+    // Two 2-d vectors; the query [1,0] must rank "yakın" first.
+    call(
+        g.port,
+        &serde_json::json!({ "cmd": "create_vector_index", "collection": "embed",
+            "field": "v", "dimension": 2, "metric": "euclidean" }),
+    );
+    call(
+        g.port,
+        &serde_json::json!({ "cmd": "insert", "collection": "embed",
+            "doc": {"name": "yakın", "v": [0.9, 0.1]} }),
+    );
+    call(
+        g.port,
+        &serde_json::json!({ "cmd": "insert", "collection": "embed",
+            "doc": {"name": "uzak", "v": [-1.0, 0.5]} }),
+    );
+
+    let r = sql(
+        g.port,
+        &format!(
+            "CREATE PROCEDURE vector_probe() LANGUAGE COBRA AS '{}'",
+            cobra_payload("vector_probe")
+        ),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+
+    let r = sql(g.port, "CALL vector_probe()");
+    assert_eq!(r["ok"], true, "{r}");
+    let rows = r["data"][0]["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(rows[0][0], "yakın", "{r}");
+}

@@ -13,6 +13,24 @@ use crate::types::{Value, ValueRef};
 /// A set of rows as `(row_id, cells)` pairs.
 pub(crate) type Rows = Vec<(u64, Vec<Value>)>;
 
+/// Host-installed extension methods for COBRA procedures (ADR-0025 Phase 4).
+///
+/// A stored procedure's `db` handle speaks SQL; the OTHER engines (rec,
+/// vector search) live behind the server, which this crate cannot depend on.
+/// The server installs an implementation per engine instance
+/// (`SqlEngine::set_native_ext`), and the COBRA handle forwards `rec_*` /
+/// `vector_*` method calls to it as JSON — the same boundary the wire uses,
+/// so the server-side dispatch is shared with the bridge, not re-derived.
+pub trait NativeExt: Send + Sync {
+    /// `method` is the full name as called (`rec_related`); `args` is the
+    /// call's arguments as a JSON array.
+    fn call(
+        &self,
+        method: &str,
+        args: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String>;
+}
+
 /// One end of a single-column index range.
 ///
 /// Deliberately not `std::ops::Bound<Value>`: the open end has to survive being
@@ -261,6 +279,13 @@ pub(crate) trait Store {
     /// "this walked the table" distinguishable from outside, including in
     /// tests. Default: ignored.
     fn note_dml_examined(&self, _rows: u64) {}
+
+    /// The host's COBRA extension methods, if any were installed. A
+    /// transaction delegates to its engine's, so `db.rec_*` works the same
+    /// inside and outside BEGIN.
+    fn native_ext(&self) -> Option<std::sync::Arc<dyn NativeExt>> {
+        None
+    }
 
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64>;
     /// Insert many rows as one durable unit (a single WAL fsync where the

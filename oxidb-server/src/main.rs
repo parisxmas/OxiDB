@@ -1388,6 +1388,12 @@ fn main() {
         );
     }
     let db_manager = Arc::new(db_manager);
+    // Wire the document engine into COBRA extension methods (db.vector_*,
+    // ADR-0025 Phase 4) — the SQL crate reaches it only through this hook.
+    if doc_enabled {
+        let mgr = Arc::clone(&db_manager);
+        oxidb_server::native_ext::set_doc_resolver(move |name| mgr.get_database(name).ok());
+    }
     // The scheduler runs document-defined jobs, so it has nothing to do here.
     if doc_enabled {
         db_manager

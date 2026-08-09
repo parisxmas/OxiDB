@@ -190,10 +190,26 @@ pub fn handle_rec(cmd: &str, request: &Value, readonly: bool, db_name: &str) -> 
     let Some(op) = request.get("op").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'op' (track, related, for_basket, stats, checkpoint)");
     };
-    let engine = match engine_for(db_name) {
-        Ok(e) => e,
-        Err(msg) => return err_bytes(&msg),
-    };
+    match dispatch(op, request, readonly, db_name) {
+        Ok(v) => ok_bytes(v),
+        Err(m) => err_bytes(&m),
+    }
+}
+
+/// The op dispatch behind both surfaces: the wire (`handle_rec`) and the
+/// COBRA extension methods (`db.rec_*`, ADR-0025 Phase 4) — one
+/// implementation, one validation.
+pub fn native_call(
+    op: &str,
+    request: &Value,
+    readonly: bool,
+    db_name: &str,
+) -> Result<Value, String> {
+    dispatch(op, request, readonly, db_name)
+}
+
+fn dispatch(op: &str, request: &Value, readonly: bool, db_name: &str) -> Result<Value, String> {
+    let engine = engine_for(db_name)?;
     let ts = request
         .get("ts")
         .and_then(|v| v.as_u64())
@@ -203,75 +219,62 @@ pub fn handle_rec(cmd: &str, request: &Value, readonly: bool, db_name: &str) -> 
     match op {
         "track" => {
             if readonly {
-                return err_bytes("permission denied: track requires write access");
+                return Err("permission denied: track requires write access".into());
             }
-            let Some(model) = model else {
-                return err_bytes("missing 'model'");
-            };
-            let Some(basket_id) = request.get("basket_id").and_then(|v| v.as_u64()) else {
-                return err_bytes("missing 'basket_id'");
-            };
-            let items = match str_list(request, "items") {
-                Ok(i) if !i.is_empty() => i,
-                Ok(_) => return err_bytes("missing 'items'"),
-                Err(m) => return err_bytes(&m),
-            };
+            let model = model.ok_or("missing 'model'")?;
+            let basket_id = request
+                .get("basket_id")
+                .and_then(|v| v.as_u64())
+                .ok_or("missing 'basket_id'")?;
+            let items = str_list(request, "items")?;
+            if items.is_empty() {
+                return Err("missing 'items'".into());
+            }
             let counted = engine.lock().unwrap().track(model, basket_id, &items, ts);
-            ok_bytes(json!({ "counted": counted }))
+            Ok(json!({ "counted": counted }))
         }
         "related" => {
-            let Some(model) = model else {
-                return err_bytes("missing 'model'");
-            };
-            let Some(item) = request.get("item").and_then(|v| v.as_str()) else {
-                return err_bytes("missing 'item'");
-            };
-            let q = match parse_query(request) {
-                Ok(q) => q,
-                Err(m) => return err_bytes(&m),
-            };
-            match engine.lock().unwrap().related(model, item, ts, &q) {
-                Ok(recs) => ok_bytes(json!({ "recommendations": recs })),
-                Err(e) => err_bytes(&e.to_string()),
-            }
+            let model = model.ok_or("missing 'model'")?;
+            let item = request
+                .get("item")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'item'")?;
+            let q = parse_query(request)?;
+            let recs = engine
+                .lock()
+                .unwrap()
+                .related(model, item, ts, &q)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "recommendations": recs }))
         }
         "for_basket" => {
-            let Some(model) = model else {
-                return err_bytes("missing 'model'");
-            };
-            let items = match str_list(request, "items") {
-                Ok(i) if !i.is_empty() => i,
-                Ok(_) => return err_bytes("missing 'items'"),
-                Err(m) => return err_bytes(&m),
-            };
-            let exclude = match str_list(request, "exclude") {
-                Ok(x) => x,
-                Err(m) => return err_bytes(&m),
-            };
-            let q = match parse_query(request) {
-                Ok(q) => q,
-                Err(m) => return err_bytes(&m),
-            };
-            match engine
+            let model = model.ok_or("missing 'model'")?;
+            let items = str_list(request, "items")?;
+            if items.is_empty() {
+                return Err("missing 'items'".into());
+            }
+            let exclude = str_list(request, "exclude")?;
+            let q = parse_query(request)?;
+            let recs = engine
                 .lock()
                 .unwrap()
                 .for_basket(model, &items, &exclude, ts, &q)
-            {
-                Ok(recs) => ok_bytes(json!({ "recommendations": recs })),
-                Err(e) => err_bytes(&e.to_string()),
-            }
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "recommendations": recs }))
         }
-        "stats" => ok_bytes(engine.lock().unwrap().stats()),
+        "stats" => Ok(engine.lock().unwrap().stats()),
         "checkpoint" => {
             if readonly {
-                return err_bytes("permission denied: checkpoint requires write access");
+                return Err("permission denied: checkpoint requires write access".into());
             }
-            match engine.lock().unwrap().checkpoint(ts) {
-                Ok(()) => ok_bytes(json!({ "ok": true })),
-                Err(e) => err_bytes(&e.to_string()),
-            }
+            engine
+                .lock()
+                .unwrap()
+                .checkpoint(ts)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
         }
-        other => err_bytes(&format!(
+        other => Err(format!(
             "unknown rec op: {other:?} (track, related, for_basket, stats, checkpoint)"
         )),
     }

@@ -333,3 +333,75 @@ fn cobra_call_joins_open_transaction() {
         .unwrap();
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM people"), vec![vec![i(3)]]);
 }
+
+// ─── Extension methods (ADR-0025 Phase 4) ────────────────────────────────
+
+/// Without a host-installed extension, `db.rec_*` refuses by name — the
+/// standalone SQL engine has no rec surface, and the error must say so
+/// rather than pretend the method does not exist.
+#[test]
+fn rec_methods_without_an_extension_refuse_by_name() {
+    let (_d, db) = open();
+    create_cobra(&db, "rec_related(item TEXT)", "rec_related");
+    let err = db.execute("CALL rec_related('kahve')").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("rec_related") && msg.contains("extension"),
+        "the refusal must name the method and the reason: {msg}"
+    );
+}
+
+/// With an extension installed, the call crosses the JSON boundary intact:
+/// the dict argument arrives as the wire-shaped request, the JSON answer
+/// comes back as COBRA values, and the procedure's own code consumes it.
+#[test]
+fn an_installed_extension_serves_rec_methods() {
+    struct Fake;
+    impl oxidb_sql::NativeExt for Fake {
+        fn call(
+            &self,
+            method: &str,
+            args: &serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            assert_eq!(method, "rec_related");
+            let req = &args[0];
+            assert_eq!(req["model"], "purchase");
+            assert_eq!(req["item"], "kahve");
+            assert_eq!(req["scoring"], "count");
+            Ok(serde_json::json!({
+                "recommendations": [
+                    {"item": "süt", "score": 20.0},
+                    {"item": "filtre", "score": 5.0},
+                ]
+            }))
+        }
+    }
+
+    let (_d, db) = open();
+    db.set_native_ext(std::sync::Arc::new(Fake));
+    create_cobra(&db, "rec_related(item TEXT)", "rec_related");
+    let (cols, rws) = cols_rows(&db, "CALL rec_related('kahve')");
+    // The procedure returns the recommendations list; each dict becomes a row.
+    assert_eq!(cols, vec!["item", "score"]);
+    assert_eq!(
+        rws,
+        vec![vec![t("süt"), d(20.0)], vec![t("filtre"), d(5.0)]]
+    );
+}
+
+/// An extension error surfaces as a catchable procedure error, and the
+/// method name that failed is in it.
+#[test]
+fn an_extension_error_names_its_method() {
+    struct Failing;
+    impl oxidb_sql::NativeExt for Failing {
+        fn call(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+            Err("rec engine is not enabled (set OXIDB_REC=1)".into())
+        }
+    }
+    let (_d, db) = open();
+    db.set_native_ext(std::sync::Arc::new(Failing));
+    create_cobra(&db, "rec_related(item TEXT)", "rec_related");
+    let err = db.execute("CALL rec_related('x')").unwrap_err();
+    assert!(format!("{err}").contains("OXIDB_REC"), "{err}");
+}

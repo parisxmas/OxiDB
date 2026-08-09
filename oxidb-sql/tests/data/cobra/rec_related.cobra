@@ -1,0 +1,8 @@
+# CREATE PROCEDURE rec_related(item TEXT) LANGUAGE COBRA
+# ADR-0025 Phase 4: a procedure asking the rec engine what goes with `item`.
+# The extension takes one dict mirroring the wire request and returns its
+# `data` object; scoring "count" keeps the test's expectations exact.
+def run(db, item)
+    let out = db.rec_related({"model": "purchase", "item": item, "scoring": "count", "ts": 1700000000})
+    return out["recommendations"]
+end

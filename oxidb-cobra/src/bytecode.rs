@@ -6,8 +6,15 @@
 //! `code.Make`). The format version byte is a cross-repo ABI: reject what we
 //! don't know.
 
-/// Magic + version: `COBRAP\0` then 0x01.
+/// Magic prefix: `COBRAP\0`; the trailing byte is the format version.
+/// v1 is the original layout; v2 (compiler 0.13+) appends one section —
+/// `exported` names (u32 count + strings) — which this VM reads and
+/// discards: procedures are invoked by symbol lookup, not module import,
+/// so the export list carries nothing it needs.
 pub const MAGIC: &[u8; 8] = b"COBRAP\x00\x01";
+const MAGIC_PREFIX: &[u8; 7] = b"COBRAP\x00";
+const VERSION_MIN: u8 = 1;
+const VERSION_MAX: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
@@ -54,8 +61,15 @@ pub struct Bytecode {
 
 /// Decode a portable compiled Cobra file (`cobra build --portable`).
 pub fn decode(data: &[u8]) -> Result<Bytecode, String> {
-    if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
+    if data.len() < MAGIC.len() || &data[..MAGIC_PREFIX.len()] != MAGIC_PREFIX {
         return Err("not a portable compiled Cobra file (bad magic or version)".into());
+    }
+    let version = data[MAGIC_PREFIX.len()];
+    if !(VERSION_MIN..=VERSION_MAX).contains(&version) {
+        return Err(format!(
+            "not a portable compiled Cobra file (bad magic or version): \
+             format v{version}, this VM reads v{VERSION_MIN}..v{VERSION_MAX}"
+        ));
     }
     let mut r = Reader {
         data,
@@ -108,6 +122,15 @@ pub fn decode(data: &[u8]) -> Result<Bytecode, String> {
     let n_globals = r.u32()? as usize;
     for _ in 0..n_globals {
         b.global_names.push(r.string()?);
+    }
+
+    // v2: the exported-names section. Read (so the trailing-bytes check
+    // stays exact) and discard (see MAGIC docs).
+    if version >= 2 {
+        let n_exported = r.u32()? as usize;
+        for _ in 0..n_exported {
+            let _ = r.string()?;
+        }
     }
 
     if r.pos != data.len() {
@@ -324,6 +347,51 @@ mod tests {
             vec![Constant::Int(42), Constant::Str("hi".into())]
         );
         assert_eq!(b.global_names, vec!["x"]);
+    }
+
+    #[test]
+    /// Format v2 (compiler 0.13+) appends an exported-names section; the VM
+    /// reads it to keep the trailing-bytes check exact and discards it.
+    /// Found the hard way: `cobra build --portable` moved to v2 and every
+    /// freshly-compiled procedure was refused with "bad magic or version".
+    #[test]
+    fn decode_accepts_format_v2_and_ignores_exports() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"COBRAP\x00\x02");
+        f.extend_from_slice(&2u32.to_le_bytes());
+        f.push(Op::True as u8);
+        f.push(Op::Halt as u8);
+        f.extend_from_slice(&0u32.to_le_bytes()); // lines
+        f.extend_from_slice(&0u32.to_le_bytes()); // constants
+        f.extend_from_slice(&0u32.to_le_bytes()); // bundle
+        f.extend_from_slice(&1u32.to_le_bytes()); // globals: "x"
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(b"x");
+        // v2: exported = ["run"]
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(&3u32.to_le_bytes());
+        f.extend_from_slice(b"run");
+
+        let b = decode(&f).unwrap();
+        assert_eq!(b.global_names, vec!["x"]);
+
+        // The same bytes WITHOUT the exported section must fail the
+        // trailing/length accounting rather than decode by luck.
+        let mut torn = f.clone();
+        torn.truncate(f.len() - 3);
+        assert!(decode(&torn).is_err());
+    }
+
+    /// An unknown future version is refused, and the error names the range
+    /// this VM reads — the operator's fix is a VM upgrade, and the message
+    /// should say so.
+    #[test]
+    fn decode_refuses_future_versions_by_range() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"COBRAP\x00\x03");
+        f.extend_from_slice(&0u32.to_le_bytes());
+        let err = decode(&f).unwrap_err();
+        assert!(err.contains("v3") && err.contains("v1..v2"), "{err}");
     }
 
     #[test]

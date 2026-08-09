@@ -164,6 +164,8 @@ fn engine_for(db_name: &str) -> Result<Arc<SqlEngine>, String> {
         return Ok(Arc::clone(existing));
     }
     let arc = Arc::new(engine);
+    // COBRA extension methods (db.rec_*, db.vector_*) — ADR-0025 Phase 4.
+    crate::native_ext::install(&arc, name);
     engines.insert(name.to_string(), Arc::clone(&arc));
     Ok(arc)
 }

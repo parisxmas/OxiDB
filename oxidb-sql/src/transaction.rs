@@ -380,6 +380,12 @@ impl<'a> Transaction<'a> {
 }
 
 impl Store for Transaction<'_> {
+    fn native_ext(&self) -> Option<std::sync::Arc<dyn crate::store::NativeExt>> {
+        // Same extension methods inside a transaction — the ext itself is
+        // engine-independent dispatch, nothing transactional to buffer.
+        self.engine.native_ext_arc()
+    }
+
     fn table_def(&self, name: &str) -> Option<Table> {
         self.visible_def(name)
     }

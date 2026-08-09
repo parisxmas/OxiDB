@@ -48,6 +48,7 @@ pub use types::{decode_row_into, decode_row_masked, encode_row};
 
 use catalog::Catalog;
 use rows::RowStore;
+pub use store::NativeExt;
 use store::{RangeBound, Store};
 use transaction::Transaction;
 use types::IndexKey;
@@ -979,6 +980,9 @@ pub struct SqlEngine {
     /// outside to tell "an index served this" from "this walked the table",
     /// which is exactly what the streaming DML tests assert.
     dml_examined: std::sync::atomic::AtomicU64,
+    /// COBRA extension methods installed by the host (ADR-0025 Phase 4);
+    /// `db.rec_*` / `db.vector_*` route here.
+    native_ext: std::sync::RwLock<Option<std::sync::Arc<dyn store::NativeExt>>>,
     /// Parsed-statement cache: SQL text -> AST. Applications loop over a
     /// small set of parameterized texts, and parsing costs more than an AST
     /// clone; execution works on a clone, so the cached AST is never touched.
@@ -1287,6 +1291,7 @@ impl SqlEngine {
             txn_max_idle_ms: std::sync::atomic::AtomicU64::new(txn_max_idle_ms_from_env()),
             expired_txns: Mutex::new(std::collections::BTreeSet::new()),
             dml_examined: std::sync::atomic::AtomicU64::new(0),
+            native_ext: std::sync::RwLock::new(None),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             row_locks: row_locks::RowLocks::default(),
             lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
@@ -2314,6 +2319,16 @@ impl SqlEngine {
             }
         }
         Ok(Some(()))
+    }
+
+    /// Install (or replace) the host's COBRA extension methods — the server
+    /// does this once per engine, right after opening it.
+    pub fn set_native_ext(&self, ext: std::sync::Arc<dyn store::NativeExt>) {
+        *self.native_ext.write().unwrap() = Some(ext);
+    }
+
+    pub(crate) fn native_ext_arc(&self) -> Option<std::sync::Arc<dyn store::NativeExt>> {
+        self.native_ext.read().unwrap().clone()
     }
 
     /// Rows the most recent DML statement examined while looking for its
@@ -4166,6 +4181,9 @@ impl Store for SqlEngine {
     fn note_dml_examined(&self, rows: u64) {
         self.dml_examined
             .store(rows, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn native_ext(&self) -> Option<std::sync::Arc<dyn store::NativeExt>> {
+        self.native_ext_arc()
     }
     fn scan_visit_refs(
         &self,

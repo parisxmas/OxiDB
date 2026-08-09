@@ -1,0 +1,11 @@
+# CREATE PROCEDURE vector_probe() LANGUAGE COBRA
+# db.vector_search reaches the DOCUMENT engine's HNSW index from inside a
+# SQL-hosted procedure — the cross-engine hop Phase 4 exists for.
+def run(db)
+    let hits = db.vector_search({"collection": "embed", "field": "v", "vector": [1.0, 0.0], "limit": 2})
+    let names = []
+    for h in hits
+        push(names, h["name"])
+    end
+    return names
+end

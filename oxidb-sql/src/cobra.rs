@@ -127,6 +127,22 @@ struct DbHandle<'a, S: Store> {
 impl<S: Store> DbHandle<'_, S> {
     /// Parse the common `(sql [, params])` argument shape and require the
     /// SQL to be exactly one statement.
+    /// Forward a `rec_*` / `vector_*` call to the host-installed extension.
+    fn ext_call(&self, method: &str, args: &[CValue]) -> std::result::Result<CValue, NativeError> {
+        let Some(ext) = self.store.native_ext() else {
+            return Err(NativeError::new(format!(
+                "db.{method} is not available: no extension methods installed                  (the engine hosting this procedure has no rec/vector surface)"
+            )));
+        };
+        let json_args = serde_json::Value::Array(
+            args.iter()
+                .map(cobra_to_json)
+                .collect::<std::result::Result<_, _>>()?,
+        );
+        let out = ext.call(method, &json_args).map_err(NativeError::new)?;
+        Ok(json_to_cobra(&out))
+    }
+
     fn one_statement(
         &self,
         method: &str,
@@ -288,6 +304,70 @@ fn query_result_to_cobra(result: QueryResult) -> CValue {
     }
 }
 
+/// One COBRA value → JSON, for the extension boundary. Native handles and
+/// other non-data values are refused by name — an extension method takes
+/// data, not capabilities.
+fn cobra_to_json(v: &CValue) -> std::result::Result<serde_json::Value, NativeError> {
+    Ok(match v {
+        CValue::Null => serde_json::Value::Null,
+        CValue::Bool(b) => serde_json::Value::Bool(*b),
+        CValue::Int(i) => serde_json::json!(i),
+        CValue::Float(f) => serde_json::json!(f),
+        CValue::Str(s) => serde_json::Value::String(s.to_string()),
+        CValue::List(l) => serde_json::Value::Array(
+            l.borrow()
+                .iter()
+                .map(cobra_to_json)
+                .collect::<std::result::Result<_, _>>()?,
+        ),
+        CValue::Dict(d) => {
+            let mut map = serde_json::Map::new();
+            let d = d.borrow();
+            for (k, val) in d.in_order() {
+                let CValue::Str(key) = k else {
+                    return Err(NativeError::new("extension dict keys must be strings"));
+                };
+                map.insert(key.to_string(), cobra_to_json(val)?);
+            }
+            serde_json::Value::Object(map)
+        }
+        other => {
+            return Err(NativeError::new(format!(
+                "cannot pass {} to an extension method",
+                other.type_name()
+            )));
+        }
+    })
+}
+
+/// JSON → COBRA value, for extension results.
+fn json_to_cobra(v: &serde_json::Value) -> CValue {
+    match v {
+        serde_json::Value::Null => CValue::Null,
+        serde_json::Value::Bool(b) => CValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                CValue::Int(i)
+            } else {
+                CValue::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => CValue::Str(Rc::from(s.as_str())),
+        serde_json::Value::Array(a) => {
+            CValue::List(Rc::new(RefCell::new(a.iter().map(json_to_cobra).collect())))
+        }
+        serde_json::Value::Object(o) => {
+            let mut dict = Dict::new();
+            for (k, val) in o {
+                let key = CValue::Str(Rc::from(k.as_str()));
+                let hk = hash_key(&key).expect("strings are hashable");
+                dict.set(hk, key, json_to_cobra(val));
+            }
+            CValue::Dict(Rc::new(RefCell::new(dict)))
+        }
+    }
+}
+
 impl<S: Store> NativeObject for DbHandle<'_, S> {
     fn type_name(&self) -> &str {
         "db"
@@ -297,6 +377,9 @@ impl<S: Store> NativeObject for DbHandle<'_, S> {
         match name {
             "query" => self.query(args),
             "execute" => self.execute(args),
+            // Host extension methods (ADR-0025 Phase 4): other engines'
+            // surfaces, reached over the same JSON boundary the wire uses.
+            n if n.starts_with("rec_") || n.starts_with("vector_") => self.ext_call(n, args),
             // Savepoints let a procedure undo part of its own work (past a
             // named point) without aborting the whole CALL — the deterministic
             // building block for nested error recovery.
