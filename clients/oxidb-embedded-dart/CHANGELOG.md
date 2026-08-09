@@ -1,3 +1,9 @@
+## 0.43.0
+
+Version aligned with the OxiDB engine release line — this package wraps the
+engine itself, so its version now states which engine it is. No API changes
+from 0.1.0.
+
 ## 0.1.0
 
 Initial release: the OxiDB engine in-process for Flutter and Dart over

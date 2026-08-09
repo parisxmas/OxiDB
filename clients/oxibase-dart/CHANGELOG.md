@@ -1,3 +1,8 @@
+## 0.43.0
+
+Version aligned with the OxiDB engine release line — the client tracks the
+server it speaks to. No API changes from 0.1.0.
+
 ## 0.1.0
 
 First release. Documents with the PostgREST grammar, SQL, time-series, BM25 full
