@@ -1226,7 +1226,13 @@ PROTOCOLS (off unless set):
     OXIDB_PG_PORT          PostgreSQL wire protocol listener (psql, psycopg);
                            serves the SQL engine, so it needs OXIDB_SQL=1.
                            Uses the same accounts and SCRAM-SHA-256 verifiers
-                           as the native port, and TLS when OXIDB_TLS_CERT is set
+                           as the native port, and TLS when OXIDB_TLS_CERT is set.
+                           'auto' binds a kernel-assigned port, reported via
+                           OXIDB_READY_FILE
+    OXIDB_READY_FILE       write this file (atomically) once every listener is
+                           bound; lines are 'name=addr-or-port' with the ACTUAL
+                           bound addresses, so ':0'/'auto' ports can be
+                           discovered without probing. Standalone mode only
     OXIDB_S3_PORT          S3-compatible HTTP listener
     OXIDB_HTTP_PORT        REST listener (also serves GET /metrics)
     OXIDB_WS_PORT          WebSocket listener
@@ -1599,6 +1605,18 @@ fn main() {
     }
 
     let listener = TcpListener::bind(&addr).expect("failed to bind TCP listener");
+    // What OXIDB_READY_FILE will report: each listener pushes its *actual*
+    // bound address as it binds (an `:0` bind is kernel-assigned, so the
+    // configured value is not the answer). Written once, after every
+    // standalone listener is up — postmaster.pid's job in PostgreSQL.
+    let mut ready_entries: Vec<(&str, String)> = Vec::new();
+    ready_entries.push((
+        "addr",
+        listener
+            .local_addr()
+            .expect("TCP listener has a local addr")
+            .to_string(),
+    ));
     server_log!(
         state,
         GelfLevel::Notice,
@@ -1891,14 +1909,35 @@ fn main() {
 
     // PostgreSQL wire protocol listener (optional, enabled via OXIDB_PG_PORT).
     // Serves the SQL engine to unmodified PostgreSQL clients; the OxiWire port
-    // is untouched by it.
-    let pg_port: u16 = env::var("OXIDB_PG_PORT")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .expect("OXIDB_PG_PORT must be a valid u16");
-    if pg_port > 0 {
+    // is untouched by it. `auto` binds a kernel-assigned port — useless without
+    // OXIDB_READY_FILE to learn which one, which is exactly what test harnesses
+    // use it for: a chosen-then-released "free" port can be taken by another
+    // process in the gap, and this listener's bind failure is fatal.
+    let pg_env = env::var("OXIDB_PG_PORT").unwrap_or_else(|_| "0".to_string());
+    let pg_auto = pg_env == "auto";
+    let pg_port: u16 = if pg_auto {
+        0
+    } else {
+        pg_env.parse().expect("OXIDB_PG_PORT must be a valid u16")
+    };
+    if pg_port > 0 || pg_auto {
         let pg_addr = format!("0.0.0.0:{pg_port}");
         let pg_listener = TcpListener::bind(&pg_addr).expect("failed to bind PostgreSQL listener");
+        let pg_addr = format!(
+            "0.0.0.0:{}",
+            pg_listener
+                .local_addr()
+                .expect("PostgreSQL listener has a local addr")
+                .port()
+        );
+        ready_entries.push((
+            "pg",
+            pg_listener
+                .local_addr()
+                .expect("PostgreSQL listener has a local addr")
+                .port()
+                .to_string(),
+        ));
         let pg_cfg = oxidb_server::pg::PgConfig {
             user_store: state.user_store.clone(),
             auth_enabled: state.auth_enabled,
@@ -2102,6 +2141,25 @@ fn main() {
             GelfLevel::Notice,
             format!("MessagePack ingestion listening on {mpack_addr} → '{mpack_collection}'")
         );
+    }
+
+    // Every standalone listener is bound above this line; announce readiness.
+    // Written to a temp name and renamed so a waiting reader never observes a
+    // half-written file: the file EXISTING is the ready signal, its lines
+    // (`name=value`) are where each listener actually bound. The point is that
+    // a spawner does not have to probe ports — probing cannot distinguish "my
+    // server is up" from "another process owns that port", which is how a test
+    // harness ends up talking to somebody else's server.
+    if let Ok(path) = env::var("OXIDB_READY_FILE")
+        && !path.is_empty()
+    {
+        let body: String = ready_entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect();
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, body).expect("failed to write OXIDB_READY_FILE");
+        std::fs::rename(&tmp, &path).expect("failed to publish OXIDB_READY_FILE");
     }
 
     // MQTT-only mode: skip the main OxiDB TCP listener

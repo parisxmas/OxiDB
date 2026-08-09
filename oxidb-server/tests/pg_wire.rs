@@ -7,17 +7,9 @@
 //! pins the other claim — that a real driver, unmodified, is happy with them.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct Guard {
     child: Child,
@@ -63,33 +55,61 @@ impl Drop for BootPermit {
     }
 }
 
+/// Ports are kernel-assigned (`OXIDB_ADDR=127.0.0.1:0`, `OXIDB_PG_PORT=auto`)
+/// and read back from `OXIDB_READY_FILE` — never chosen here. The old
+/// pick-a-free-port-then-release scheme raced every parallel server spawn on
+/// this machine for the same ports: the loser died at bind, and the
+/// connect-poll "readiness" check could not tell that from success — it
+/// happily connected to *another test's* server on the stolen port, which then
+/// went away mid-test when that test finished ("connection reset by peer"),
+/// or spun its full deadline against a dead child ("pg port never opened").
+/// Waiting for our own child's ready file makes both impossible: the file
+/// existing means OUR server bound everything it was asked to.
 fn spawn_with(envs: &[(&str, &str)]) -> Guard {
     let _permit = BootPermit::acquire();
     let dir = tempfile::tempdir().unwrap();
-    let doc = free_port();
-    let pg = free_port();
+    let ready = dir.path().join("ready");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oxidb-server"));
-    cmd.env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
-        .env("OXIDB_PG_PORT", pg.to_string())
+    cmd.env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_PG_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .env("OXIDB_SQL", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let child = cmd.spawn().unwrap();
-    let g = Guard {
+    let mut child = cmd.spawn().unwrap();
+    let port = wait_ready(&mut child, &ready);
+    Guard {
         child,
         _dir: dir,
-        port: pg,
-    };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
-        assert!(Instant::now() < deadline, "pg port never opened");
-        std::thread::sleep(Duration::from_millis(100));
+        port,
     }
-    g
+}
+
+/// Block until `child`'s ready file appears and return the pg port it names.
+fn wait_ready(child: &mut Child, ready: &std::path::Path) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(body) = std::fs::read_to_string(ready) {
+            return body
+                .lines()
+                .find_map(|l| l.strip_prefix("pg="))
+                .expect("ready file names the pg port")
+                .parse()
+                .expect("pg port is a u16");
+        }
+        // A dead child will never become ready — fail with its status now
+        // rather than after the deadline. With kernel-assigned ports this is
+        // a real bug in the server, not a port collision.
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn spawn() -> Guard {
@@ -358,23 +378,19 @@ fn ssl_is_declined_when_no_certificate_is_configured() {
 #[test]
 fn the_pg_port_needs_the_sql_engine() {
     let dir = tempfile::tempdir().unwrap();
-    let doc = free_port();
-    let pg = free_port();
+    let ready = dir.path().join("ready");
     let _permit = BootPermit::acquire();
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
-        .env("OXIDB_PG_PORT", pg.to_string())
+        .env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_PG_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .env_remove("OXIDB_SQL") // the engine is off
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", pg)).is_err() {
-        assert!(Instant::now() < deadline, "pg port never opened");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let pg = wait_ready(&mut child, &ready);
     let mut c = Client::connect(pg, &[("user", "admin")]);
     let m = c.read_msg();
     assert_eq!(m.tag, b'E');
@@ -1371,10 +1387,11 @@ fn scram_is_offered_and_a_wrong_password_is_refused() {
     // The account is created through the server's own `UserStore`, so the
     // SCRAM verifier is exactly the one the native port would check against.
     let dir = tempfile::tempdir().unwrap();
-    let doc = free_port();
-    let pg = free_port();
+    let data = dir.path().join("data");
+    let ready = dir.path().join("ready");
+    std::fs::create_dir_all(&data).unwrap();
     {
-        let mut store = oxidb_server::auth::UserStore::open(dir.path()).unwrap();
+        let mut store = oxidb_server::auth::UserStore::open(&data).unwrap();
         store
             .create_user(
                 "alice",
@@ -1386,20 +1403,17 @@ fn scram_is_offered_and_a_wrong_password_is_refused() {
 
     let _permit = BootPermit::acquire();
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
-        .env("OXIDB_PG_PORT", pg.to_string())
+        .env("OXIDB_DATA", &data)
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_PG_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .env("OXIDB_SQL", "1")
         .env("OXIDB_AUTH", "true")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", pg)).is_err() {
-        assert!(Instant::now() < deadline, "pg port never opened");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let pg = wait_ready(&mut child, &ready);
 
     let mut c = Client::connect(pg, &[("user", "alice"), ("database", "oxidb")]);
     let m = c.read_msg();
@@ -1497,30 +1511,28 @@ fn scram_login(c: &mut Client, user: &str, password: &str) {
 
 fn spawn_authenticated(users: &[(&str, &str, oxidb_server::auth::Role)]) -> (Child, u16) {
     let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let ready = dir.path().join("ready");
+    std::fs::create_dir_all(&data).unwrap();
     {
-        let mut store = oxidb_server::auth::UserStore::open(dir.path()).unwrap();
+        let mut store = oxidb_server::auth::UserStore::open(&data).unwrap();
         for (name, pw, role) in users {
             store.create_user(name, pw, *role).unwrap();
         }
     }
-    let doc = free_port();
-    let pg = free_port();
     let _permit = BootPermit::acquire();
-    let child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
-        .env("OXIDB_PG_PORT", pg.to_string())
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
+        .env("OXIDB_DATA", &data)
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_PG_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .env("OXIDB_SQL", "1")
         .env("OXIDB_AUTH", "true")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", pg)).is_err() {
-        assert!(Instant::now() < deadline, "pg port never opened");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let pg = wait_ready(&mut child, &ready);
     // The tempdir has to outlive the server; leak it deliberately rather than
     // have the server lose its data directory mid-test.
     std::mem::forget(dir);

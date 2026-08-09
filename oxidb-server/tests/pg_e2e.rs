@@ -11,7 +11,6 @@
 //! `import psycopg` and reads the exit code, which is meaningful for an import
 //! (unlike a `--help` exit code — the have_mosquitto lesson, applied).
 
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -56,12 +55,6 @@ fn py(port: u16, script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-fn test_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    26000 + (std::process::id() % 89) as u16 * 12 + NEXT.fetch_add(2, Ordering::SeqCst)
-}
-
 /// A server that dies with its guard — a panic that leaked the process would
 /// leave it squatting the port band for every later run.
 struct ServerGuard(Child);
@@ -73,27 +66,41 @@ impl Drop for ServerGuard {
     }
 }
 
-fn start(port: u16, data: &Path) -> ServerGuard {
+/// Ports are kernel-assigned and read back from `OXIDB_READY_FILE`; see
+/// `pg_wire.rs` for why probing a chosen port is not a readiness check.
+fn start(data: &Path) -> (ServerGuard, u16) {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join("server.log")).expect("create log");
+    let ready = data.join("ready");
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
     let child = Command::new(bin)
-        .env("OXIDB_PG_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_DATA", data)
+        .env("OXIDB_PG_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", data.join("data"))
         .env("OXIDB_SQL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
+    let mut guard = ServerGuard(child);
     for _ in 0..600 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return ServerGuard(child);
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            let port = body
+                .lines()
+                .find_map(|l| l.strip_prefix("pg="))
+                .expect("ready file names the pg port")
+                .parse()
+                .expect("pg port is a u16");
+            return (guard, port);
+        }
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status} (see server.log)");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("PostgreSQL listener never came up on {port}");
+    panic!("server never became ready");
 }
 
 /// The connection line every snippet opens with.
@@ -110,8 +117,7 @@ fn psycopg_round_trips_crud() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let _g = start(port, dir.path());
+    let (_g, port) = start(dir.path());
 
     let out = py(
         port,
@@ -148,8 +154,7 @@ fn psycopg_binds_parameters_server_side() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let _g = start(port, dir.path());
+    let (_g, port) = start(dir.path());
 
     let out = py(
         port,
@@ -185,8 +190,7 @@ fn psycopg_maps_errors_to_typed_exceptions() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let _g = start(port, dir.path());
+    let (_g, port) = start(dir.path());
 
     let out = py(
         port,
@@ -222,8 +226,7 @@ fn psycopg_transactions_commit_and_roll_back() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let _g = start(port, dir.path());
+    let (_g, port) = start(dir.path());
 
     let out = py(
         port,
@@ -271,8 +274,7 @@ fn psycopg_reads_the_server_it_connected_to() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let _g = start(port, dir.path());
+    let (_g, port) = start(dir.path());
 
     let out = py(
         port,
