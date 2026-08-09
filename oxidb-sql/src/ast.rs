@@ -102,7 +102,12 @@ pub enum Statement {
         /// unspecified (as it is in MySQL without `ORDER BY`): they arrive in
         /// storage order. A caller that needs a specific set narrows the
         /// `WHERE`.
-        limit: Option<u64>,
+        ///
+        /// A [`LimitExpr`], not a count: a purge loop computes its batch size
+        /// at runtime, so `LIMIT ?` must bind like every other value — a
+        /// literal-only limit forces the one number in the statement into the
+        /// SQL text.
+        limit: Option<LimitExpr>,
     },
     /// Transaction control. Within one `execute()` call these are
     /// batch-scoped; through `execute_params_in_session` they span calls

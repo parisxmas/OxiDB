@@ -110,6 +110,54 @@ fn delete_limit_zero_deletes_nothing() {
 }
 
 #[test]
+fn delete_limit_binds_as_a_parameter() {
+    // The purge-loop shape: the batch size is computed at runtime, so it must
+    // bind like every other value — before this, `LIMIT ?` was refused and the
+    // one number in the statement had to be pasted into the SQL text.
+    let (_d, db) = open();
+    seed(&db, 50);
+    assert_eq!(
+        affected_p(&db, "DELETE FROM t WHERE ts > 0 LIMIT ?", &[Value::Int(10)]),
+        10
+    );
+    assert_eq!(count(&db), 40);
+    // And $N spelling, as everywhere else params are accepted.
+    assert_eq!(
+        affected_p(&db, "DELETE FROM t WHERE ts > 0 LIMIT $1", &[Value::Int(5)]),
+        5
+    );
+    assert_eq!(count(&db), 35);
+    // A bound zero deletes nothing — same contract as the literal.
+    assert_eq!(
+        affected_p(&db, "DELETE FROM t WHERE ts > 0 LIMIT ?", &[Value::Int(0)]),
+        0
+    );
+    assert_eq!(count(&db), 35);
+}
+
+#[test]
+fn a_bad_delete_limit_parameter_is_a_clean_error_not_a_delete() {
+    let (_d, db) = open();
+    seed(&db, 20);
+    for params in [
+        vec![Value::Int(-1)],            // negative
+        vec![Value::Text("all".into())], // wrong type
+        vec![],                          // unbound
+    ] {
+        let err = db
+            .execute_params("DELETE FROM t WHERE ts > 0 LIMIT ?", &params)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LIMIT"),
+            "the error should name the LIMIT: {msg}"
+        );
+    }
+    // Nothing was deleted by any of the refused statements.
+    assert_eq!(count(&db), 20);
+}
+
+#[test]
 fn delete_limit_is_rejected_where_it_would_promise_an_order() {
     let (_d, db) = open();
     seed(&db, 10);

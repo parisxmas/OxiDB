@@ -195,7 +195,7 @@ pub(crate) trait Store {
     ///
     /// Rows are handed over **borrowed under the store's lock**, so the visitor
     /// MUST NOT call back into the store. The executor only streams predicates
-    /// it has proven free of subqueries and correlation (`expr_is_streamable`).
+    /// it has proven free of subqueries and correlation (`calls_store`).
     ///
     /// `want` names the columns the visitor reads (as in `scan_visit_cols`);
     /// `None` decodes everything.

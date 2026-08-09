@@ -1119,17 +1119,28 @@ fn dml_candidates<S: Store>(
 /// Note this is deliberately *not* `has_volatile`: `NOW()` is evaluated per row
 /// on the materializing path too, so it is not a reason to refuse streaming —
 /// only re-entrancy is.
+///
+/// **No catch-all arm, on purpose.** Getting a variant wrong here fails in the
+/// worst possible direction: "false" means "safe to stream", and a node that
+/// does re-enter the store then deadlocks under the store's lock at runtime.
+/// The exhaustive match turns "someone added an `Expr` variant" into a compile
+/// error on this function, which is the only place the safe/unsafe call is
+/// made.
 fn calls_store(e: &Expr) -> bool {
     match e {
         Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::CorrScalar { .. }
         | Expr::CorrIn { .. } => true,
+        // Leaves: answered from the row, the schema and the params alone.
+        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => false,
         Expr::Binary { left, right, .. } => calls_store(left) || calls_store(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => calls_store(expr),
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(calls_store),
         Expr::Func { args, .. } => args.iter().any(calls_store),
         Expr::In { expr, list, .. } => calls_store(expr) || list.iter().any(calls_store),
+        // The set is already materialized — the subquery that built it ran
+        // during resolution, before any streaming began.
         Expr::InSet { expr, .. } => calls_store(expr),
         Expr::Window {
             func,
@@ -1140,7 +1151,6 @@ fn calls_store(e: &Expr) -> bool {
                 || order_by.iter().any(|(e, _)| calls_store(e))
                 || matches!(func, WindowFunc::Agg(_, Some(a)) if calls_store(a))
         }
-        _ => false,
     }
 }
 
@@ -1449,9 +1459,13 @@ fn exec_delete<S: Store>(
     alias: Option<&str>,
     filter: Option<Expr>,
     returning: Option<Vec<SelectItem>>,
-    limit: Option<u64>,
+    limit: Option<LimitExpr>,
     params: &[Value],
 ) -> Result<QueryResult> {
+    // Bound now, like SELECT's LIMIT: a purge loop computes its batch size at
+    // runtime, and `LIMIT ?` is the difference between binding it and pasting
+    // it into the SQL text.
+    let limit = resolve_limit(limit, params, "DELETE LIMIT")?.map(|n| n as u64);
     let def = store
         .table_def(table)
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;

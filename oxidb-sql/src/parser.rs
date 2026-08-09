@@ -1323,12 +1323,8 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
     }
     let limit = del
         .limit
-        .map(|e| match translate_expr(e, p)? {
-            Expr::Literal(Value::Int(n)) if n >= 0 => Ok(n as u64),
-            _ => Err(SqlError::Unsupported(
-                "DELETE ... LIMIT must be a non-negative integer literal".into(),
-            )),
-        })
+        .as_ref()
+        .map(|e| limit_operand(e, p))
         .transpose()?;
     Ok(Statement::Delete {
         table,
