@@ -9,7 +9,6 @@
 //! the exit code — which is meaningful for an import, unlike `--help` exit
 //! codes (the have_mosquitto lesson, applied rather than repeated).
 
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -55,13 +54,6 @@ fn py(port: u16, script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// Every test gets its own port pair; see s3_etag.rs for why pid-only fails.
-fn test_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    24000 + (std::process::id() % 97) as u16 * 14 + NEXT.fetch_add(2, Ordering::SeqCst)
-}
-
 /// A broker that dies with its guard. Assertions in these tests run while the
 /// broker is alive, and a panic that leaks the process leaves it squatting the
 /// port band for every later run — the first versions of this file leaked
@@ -75,54 +67,69 @@ impl Drop for BrokerGuard {
     }
 }
 
-fn start(port: u16, data: &Path, log: &str) -> BrokerGuard {
+/// Wait for the child's ready file and return the port named `key`.
+/// See pg_wire.rs for why probing a chosen port is not a readiness check.
+fn wait_ready(child: &mut Child, ready: &Path, key: &str) -> u16 {
+    for _ in 0..600 {
+        if let Ok(body) = std::fs::read_to_string(ready) {
+            return body
+                .lines()
+                .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+                .unwrap_or_else(|| panic!("ready file names the {key} port"))
+                .parse()
+                .expect("port is a u16");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("broker exited before becoming ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("broker never became ready");
+}
+
+fn start(data: &Path, log: &str) -> (BrokerGuard, u16) {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    // A restart writes a fresh ready file (fresh kernel-assigned port).
+    let ready = data.join("ready");
+    let _ = std::fs::remove_file(&ready);
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
-        .env("OXIDB_AMQP_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_DATA", data)
+    let mut child = Command::new(bin)
+        .env("OXIDB_AMQP_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", data.join("data"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return BrokerGuard(child);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("AMQP listener never came up on {port}");
+    let port = wait_ready(&mut child, &ready, "amqp");
+    (BrokerGuard(child), port)
 }
 
 /// Like `start`, but with the MQTT listener up too — for the ADR-0016
-/// Phase 3 bridge tests. `mqtt_port` comes from a second `test_port()` slot
-/// so no other test's band is touched.
-fn start_with_mqtt(port: u16, mqtt_port: u16, data: &Path, log: &str) -> BrokerGuard {
+/// Phase 3 bridge tests. Returns (guard, amqp_port, mqtt_port).
+fn start_with_mqtt(data: &Path, log: &str) -> (BrokerGuard, u16, u16) {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    let ready = data.join("ready");
+    let _ = std::fs::remove_file(&ready);
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
-        .env("OXIDB_AMQP_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_MQTT_PORT", mqtt_port.to_string())
-        .env("OXIDB_DATA", data)
+    let mut child = Command::new(bin)
+        .env("OXIDB_AMQP_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_MQTT_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", data.join("data"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && TcpStream::connect(("127.0.0.1", mqtt_port)).is_ok()
-        {
-            return BrokerGuard(child);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("AMQP/MQTT listeners never came up on {port}/{mqtt_port}");
+    let amqp = wait_ready(&mut child, &ready, "amqp");
+    let mqtt = wait_ready(&mut child, &ready, "mqtt");
+    (BrokerGuard(child), amqp, mqtt)
 }
 
 const PRELUDE: &str = "
@@ -140,8 +147,7 @@ fn pika_publishes_and_consumes_with_confirms() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -176,8 +182,7 @@ fn competing_consumers_each_message_delivered_exactly_once() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -228,8 +233,7 @@ fn durable_persistent_messages_survive_sigkill() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let mut broker = start(port, dir.path(), "b1.log");
+    let (mut broker, port) = start(dir.path(), "b1.log");
 
     // Publisher confirms on a durable queue: when basic_publish returns, the
     // broker has confirmed, and the confirm promises the message is on disk.
@@ -254,7 +258,7 @@ conn.close()
     // No graceful shutdown: the confirm is the only durability promise made.
     broker.0.kill().expect("SIGKILL");
     broker.0.wait().ok();
-    let broker2 = start(port, dir.path(), "b2.log");
+    let (broker2, port) = start(dir.path(), "b2.log");
 
     let out = py(
         port,
@@ -293,8 +297,7 @@ fn an_unacked_delivery_requeues_when_its_connection_dies() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -333,8 +336,7 @@ fn direct_exchange_routes_by_key_and_headers_is_refused_by_name() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -384,8 +386,7 @@ fn topic_exchange_matches_wildcards_and_fanout_copies_to_all() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -437,8 +438,7 @@ fn prefetch_caps_a_slow_consumer_and_the_rest_flows_to_the_other() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -487,9 +487,7 @@ fn the_mqtt_amqp_bridge_carries_both_directions() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let mqtt_port = test_port();
-    let broker = start_with_mqtt(port, mqtt_port, dir.path(), "b.log");
+    let (broker, port, mqtt_port) = start_with_mqtt(dir.path(), "b.log");
 
     // One script, both protocols: a raw-bytes MQTT 3.1.1 client (CONNECT,
     // SUBSCRIBE, PUBLISH — small enough to handroll) plus pika. The thesis
@@ -573,8 +571,7 @@ fn a_mandatory_unroutable_publish_comes_back_as_basic_return() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let broker = start(port, dir.path(), "b.log");
+    let (broker, port) = start(dir.path(), "b.log");
 
     let out = py(
         port,
@@ -616,8 +613,7 @@ fn an_acked_durable_message_does_not_resurrect_after_sigkill() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port();
-    let mut broker = start(port, dir.path(), "b1.log");
+    let (mut broker, port) = start(dir.path(), "b1.log");
 
     let out = py(
         port,
@@ -641,7 +637,7 @@ conn.close()
     // at-least-once queue must not become at-least-twice-after-every-crash.
     broker.0.kill().expect("SIGKILL");
     drop(broker);
-    let broker2 = start(port, dir.path(), "b2.log");
+    let (broker2, port) = start(dir.path(), "b2.log");
 
     let out = py(
         port,

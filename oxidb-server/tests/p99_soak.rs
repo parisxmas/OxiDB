@@ -46,7 +46,7 @@
 //!   SOAK_P99_MS          hard read-p99 ceiling in ms, 0=off(default 0)
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -169,14 +169,6 @@ fn sample_fd(pid: u32) -> Option<u64> {
 
 // ---- server lifecycle + wire ----------------------------------------------
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 struct Guard {
     child: Child,
     _dir: tempfile::TempDir,
@@ -190,12 +182,14 @@ impl Drop for Guard {
     }
 }
 
+/// Port kernel-assigned, read back from `OXIDB_READY_FILE` — see pg_wire.rs.
 fn spawn(pool: u64) -> Guard {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{port}"))
+    let ready = dir.path().join("ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
+        .env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
         .env("OXIDB_POOL_SIZE", pool.to_string())
         .env("OXIDB_IDLE_TIMEOUT", "0") // never drop an idle soak connection
         .stdout(std::process::Stdio::null())
@@ -203,18 +197,28 @@ fn spawn(pool: u64) -> Guard {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let g = Guard {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let port: u16 = loop {
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            break body
+                .lines()
+                .find_map(|l| l.strip_prefix("addr="))
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| p.parse().ok())
+                .expect("ready file names the main listener");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Guard {
         child,
         _dir: dir,
         port,
         pid,
-    };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
-        assert!(Instant::now() < deadline, "server port never opened");
-        std::thread::sleep(Duration::from_millis(50));
     }
-    g
 }
 
 fn connect(port: u16) -> TcpStream {

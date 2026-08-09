@@ -1604,6 +1604,21 @@ fn main() {
             .expect("failed to spawn shutdown watcher thread");
     }
 
+    /// An optional listener's port env: `0`/unset = off, `auto` = bind a
+    /// kernel-assigned port (discoverable via OXIDB_READY_FILE), else the port.
+    fn port_or_auto(var: &str) -> (u16, bool) {
+        let v = env::var(var).unwrap_or_else(|_| "0".to_string());
+        if v == "auto" {
+            (0, true)
+        } else {
+            (
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{var} must be a valid u16 or 'auto'")),
+                false,
+            )
+        }
+    }
+
     let listener = TcpListener::bind(&addr).expect("failed to bind TCP listener");
     // What OXIDB_READY_FILE will report: each listener pushes its *actual*
     // bound address as it binds (an `:0` bind is kernel-assigned, so the
@@ -1645,15 +1660,26 @@ fn main() {
     };
 
     // OxiMem RESP listener (optional, enabled via OXIDB_OXIMEM_PORT)
-    let oximem_port: u16 = env::var("OXIDB_OXIMEM_PORT")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .expect("OXIDB_OXIMEM_PORT must be a valid u16");
+    let (oximem_port, oximem_auto) = port_or_auto("OXIDB_OXIMEM_PORT");
 
-    if oximem_port > 0 {
-        let oximem_addr = format!("0.0.0.0:{oximem_port}");
-        let oximem_listener =
-            TcpListener::bind(&oximem_addr).expect("failed to bind OxiMem RESP listener");
+    if oximem_port > 0 || oximem_auto {
+        let oximem_listener = TcpListener::bind(format!("0.0.0.0:{oximem_port}"))
+            .expect("failed to bind OxiMem RESP listener");
+        let oximem_addr = format!(
+            "0.0.0.0:{}",
+            oximem_listener
+                .local_addr()
+                .expect("OxiMem local addr")
+                .port()
+        );
+        ready_entries.push((
+            "oximem",
+            oximem_listener
+                .local_addr()
+                .expect("OxiMem local addr")
+                .port()
+                .to_string(),
+        ));
 
         let mode_label = if oximem_sql {
             "SQL mirroring"
@@ -1762,14 +1788,23 @@ fn main() {
     }
 
     // MQTT listener (optional, enabled via OXIDB_MQTT_PORT)
-    let mqtt_port: u16 = env::var("OXIDB_MQTT_PORT")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .expect("OXIDB_MQTT_PORT must be a valid u16");
+    let (mqtt_port, mqtt_auto) = port_or_auto("OXIDB_MQTT_PORT");
 
-    if mqtt_port > 0 {
+    if mqtt_port > 0 || mqtt_auto {
         let mqtt_addr = format!("0.0.0.0:{mqtt_port}");
         let mqtt_listener = TcpListener::bind(&mqtt_addr).expect("failed to bind MQTT listener");
+        let mqtt_addr = format!(
+            "0.0.0.0:{}",
+            mqtt_listener.local_addr().expect("MQTT local addr").port()
+        );
+        ready_entries.push((
+            "mqtt",
+            mqtt_listener
+                .local_addr()
+                .expect("MQTT local addr")
+                .port()
+                .to_string(),
+        ));
         server_log!(
             state,
             GelfLevel::Notice,
@@ -1854,13 +1889,22 @@ fn main() {
     }
 
     // AMQP 0-9-1 listener (optional, enabled via OXIDB_AMQP_PORT). ADR-0016.
-    let amqp_port: u16 = env::var("OXIDB_AMQP_PORT")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .expect("OXIDB_AMQP_PORT must be a valid u16");
-    if amqp_port > 0 {
+    let (amqp_port, amqp_auto) = port_or_auto("OXIDB_AMQP_PORT");
+    if amqp_port > 0 || amqp_auto {
         let amqp_addr = format!("0.0.0.0:{amqp_port}");
         let amqp_listener = TcpListener::bind(&amqp_addr).expect("failed to bind AMQP listener");
+        let amqp_addr = format!(
+            "0.0.0.0:{}",
+            amqp_listener.local_addr().expect("AMQP local addr").port()
+        );
+        ready_entries.push((
+            "amqp",
+            amqp_listener
+                .local_addr()
+                .expect("AMQP local addr")
+                .port()
+                .to_string(),
+        ));
 
         // Durability follows the protocol (durable queues + delivery_mode=2),
         // not an env var, so the doc engine is attached unconditionally and
@@ -1983,15 +2027,25 @@ fn main() {
     // S3-compatible HTTP API (optional, enabled via OXIDB_S3_PORT)
     #[cfg(feature = "s3")]
     {
-        let s3_port: u16 = env::var("OXIDB_S3_PORT")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .expect("OXIDB_S3_PORT must be a valid u16");
+        let (s3_port, s3_auto) = port_or_auto("OXIDB_S3_PORT");
 
-        if s3_port > 0 {
-            let s3_addr = format!("0.0.0.0:{s3_port}");
+        if s3_port > 0 || s3_auto {
+            let s3_listener = TcpListener::bind(format!("0.0.0.0:{s3_port}"))
+                .expect("failed to bind S3 HTTP listener");
+            let s3_addr = format!(
+                "0.0.0.0:{}",
+                s3_listener.local_addr().expect("S3 local addr").port()
+            );
+            ready_entries.push((
+                "s3",
+                s3_listener
+                    .local_addr()
+                    .expect("S3 local addr")
+                    .port()
+                    .to_string(),
+            ));
             let s3_db = Arc::clone(&state.db);
-            oxidb_server::s3::start_s3_listener(&s3_addr, s3_db);
+            oxidb_server::s3::start_s3_listener_bound(s3_listener, s3_db);
             server_log!(
                 state,
                 GelfLevel::Notice,

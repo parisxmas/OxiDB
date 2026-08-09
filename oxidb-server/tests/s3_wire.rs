@@ -4,7 +4,7 @@
 #![cfg(feature = "s3")]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -13,14 +13,6 @@ use sha2::{Digest, Sha256};
 
 const AK: &str = "testkey";
 const SK: &str = "testsecret";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct Guard {
     child: Child,
@@ -34,31 +26,47 @@ impl Drop for Guard {
     }
 }
 
+/// Wait for the child's ready file and return the s3 port it names.
+/// See pg_wire.rs for why probing a chosen port is not a readiness check.
+fn wait_ready(child: &mut Child, ready: &std::path::Path) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(body) = std::fs::read_to_string(ready) {
+            return body
+                .lines()
+                .find_map(|l| l.strip_prefix("s3="))
+                .expect("ready file names the s3 port")
+                .parse()
+                .expect("s3 port is a u16");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn spawn() -> Guard {
     let dir = tempfile::tempdir().unwrap();
-    let doc = free_port();
-    let s3 = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc}"))
-        .env("OXIDB_S3_PORT", s3.to_string())
+    let ready = dir.path().join("ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
+        .env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_S3_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .env("OXIDB_S3_ACCESS_KEY", AK)
         .env("OXIDB_S3_SECRET_KEY", SK)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let g = Guard {
+    let port = wait_ready(&mut child, &ready);
+    Guard {
         child,
         _dir: dir,
-        port: s3,
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
-        assert!(Instant::now() < deadline, "s3 port never opened");
-        std::thread::sleep(Duration::from_millis(100));
+        port,
     }
-    g
 }
 
 fn sha256_hex(b: &[u8]) -> String {

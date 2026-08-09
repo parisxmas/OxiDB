@@ -165,39 +165,47 @@ fn drain_completing_handshakes(s: &mut TcpStream) -> Vec<Rx> {
 
 // ── The broker under test ───────────────────────────────────────────────
 
-/// Every test gets its own port pair (port, port+1). Deriving from the pid
-/// alone gives every test in the binary the SAME port: under the default
-/// parallel runner the extra brokers fail to bind and the tests silently talk
-/// to whichever broker won — the exact bug s3_etag.rs already documents. The
-/// bands (21xxx/22xxx/23xxx per file) stay clear of the other suites' ranges.
-fn test_port(base: u16, span_per_pid: u16) -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    base + (std::process::id() % 97) as u16 * span_per_pid + NEXT.fetch_add(2, Ordering::SeqCst)
+/// Wait for the child's ready file and return the mqtt port it names.
+/// See pg_wire.rs for why probing a chosen port is not a readiness check.
+fn wait_ready(child: &mut Child, ready: &Path) -> u16 {
+    for _ in 0..600 {
+        if let Ok(body) = std::fs::read_to_string(ready) {
+            return body
+                .lines()
+                .find_map(|l| l.strip_prefix("mqtt="))
+                .expect("ready file names the mqtt port")
+                .parse()
+                .expect("mqtt port is a u16");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("broker exited before becoming ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("broker never became ready");
 }
 
-fn start(port: u16, data: &Path, persist: bool, log: &str) -> Child {
+fn start(data: &Path, persist: bool, log: &str) -> (Child, u16) {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create log");
+    // A restart writes a fresh ready file (fresh kernel-assigned port), so
+    // remove the previous one or the wait below would read it.
+    let ready = data.join("ready");
+    let _ = std::fs::remove_file(&ready);
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .env("OXIDB_MQTT_PERSIST", if persist { "1" } else { "0" })
-        .env("OXIDB_MQTT_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_DATA", data)
+        .env("OXIDB_MQTT_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", data.join("data"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {
-        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return child;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("broker never came up on {port}");
+    let port = wait_ready(&mut child, &ready);
+    (child, port)
 }
 
 fn settle() {
@@ -209,8 +217,7 @@ fn settle() {
 #[test]
 fn a_duplicate_qos2_publish_is_delivered_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(23000, 6);
-    let mut broker = start(port, dir.path(), false, "b.log");
+    let (mut broker, port) = start(dir.path(), false, "b.log");
 
     let (mut sub, _) = connect(port, "q2-sub", true);
     subscribe(&mut sub, "eo/t", 2);
@@ -259,8 +266,7 @@ fn a_duplicate_qos2_publish_is_delivered_exactly_once() {
 #[test]
 fn a_pubrel_owed_at_crash_time_is_owed_after_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(23000, 6);
-    let mut broker = start(port, dir.path(), true, "b1.log");
+    let (mut broker, port) = start(dir.path(), true, "b1.log");
 
     let (mut sub, _) = connect(port, "rel-sub", false);
     subscribe(&mut sub, "rel/t", 2);
@@ -294,7 +300,7 @@ fn a_pubrel_owed_at_crash_time_is_owed_after_restart() {
     // the PUBREL debt is on disk.
     broker.kill().expect("SIGKILL");
     broker.wait().ok();
-    let mut broker2 = start(port, dir.path(), true, "b2.log");
+    let (mut broker2, port) = start(dir.path(), true, "b2.log");
 
     // Reconnect: the debt is honoured — PUBREL for the SAME id, and crucially
     // no duplicate PUBLISH (that would be delivering the message twice).
@@ -338,8 +344,7 @@ fn a_pubrel_owed_at_crash_time_is_owed_after_restart() {
 #[test]
 fn a_qos2_message_for_an_offline_subscriber_survives_sigkill() {
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(23000, 6);
-    let mut broker = start(port, dir.path(), true, "b1.log");
+    let (mut broker, port) = start(dir.path(), true, "b1.log");
 
     // A durable subscriber registers a QoS-2 subscription and leaves cleanly.
     let (mut sub, _) = connect(port, "off-sub", false);
@@ -364,7 +369,7 @@ fn a_qos2_message_for_an_offline_subscriber_survives_sigkill() {
 
     broker.kill().expect("SIGKILL");
     broker.wait().ok();
-    let mut broker2 = start(port, dir.path(), true, "b2.log");
+    let (mut broker2, port) = start(dir.path(), true, "b2.log");
 
     // The subscriber returns and must get the message — at QoS 2, exactly once,
     // through the full handshake, from a broker that just lost its memory.

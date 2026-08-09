@@ -99,7 +99,15 @@ struct S3State {
 
 pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind S3 HTTP listener");
+    start_s3_listener_bound(listener, db)
+}
 
+/// [`start_s3_listener`] on a listener the caller already bound — so the
+/// caller can bind `:0` and report the kernel-assigned port (OXIDB_READY_FILE).
+pub fn start_s3_listener_bound(
+    listener: TcpListener,
+    db: Arc<OxiDb>,
+) -> std::thread::JoinHandle<()> {
     let auth = match S3Auth::from_env() {
         Some(a) => {
             eprintln!(

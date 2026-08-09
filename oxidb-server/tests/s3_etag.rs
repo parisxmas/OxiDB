@@ -15,7 +15,6 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU16, Ordering};
 
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
@@ -38,36 +37,44 @@ impl Drop for Server {
     }
 }
 
+/// Ports are kernel-assigned and read back from `OXIDB_READY_FILE` — the
+/// port-band scheme this replaces is documented in git history: pid-derived
+/// ports had all three tests quietly talking to whichever server won the
+/// bind. See pg_wire.rs for why probing a chosen port is no readiness check.
 fn start() -> Server {
     let dir = tempfile::tempdir().unwrap();
-    // Every test gets its own port AND its own data dir. Deriving the port from
-    // the pid alone gave all three tests in this binary the same one: two
-    // servers failed to bind, and the tests quietly talked to whichever won.
-    // They passed — while sharing one server and asserting on each other's
-    // objects. A test that passes by accident proves nothing.
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let port = 15000 + (std::process::id() % 400) as u16 * 10 + NEXT.fetch_add(1, Ordering::SeqCst);
+    let ready = dir.path().join("ready");
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1000))
-        .env("OXIDB_S3_PORT", port.to_string())
-        .env("OXIDB_DATA", dir.path())
+    let mut child = Command::new(bin)
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_S3_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", dir.path().join("data"))
         .spawn()
         .expect("start oxidb-server");
 
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+    for _ in 0..200 {
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            let port = body
+                .lines()
+                .find_map(|l| l.strip_prefix("s3="))
+                .expect("ready file names the s3 port")
+                .parse()
+                .expect("s3 port is a u16");
             return Server {
                 child,
                 port,
                 _dir: dir,
             };
         }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    panic!("the S3 listener never came up");
+    panic!("server never became ready");
 }
 
 /// Minimal HTTP/1.1 — the point is to see the raw ETag header, so no SDK.

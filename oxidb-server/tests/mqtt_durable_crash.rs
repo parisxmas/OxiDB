@@ -9,7 +9,6 @@
 //!
 //! Needs mosquitto's clients; skips with a printed reason otherwise.
 
-use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -27,43 +26,51 @@ fn have_mosquitto() -> bool {
         .is_ok()
 }
 
-/// Every test gets its own port pair (port, port+1). Deriving from the pid
-/// alone gives every test in the binary the SAME port: under the default
-/// parallel runner the extra brokers fail to bind and the tests silently talk
-/// to whichever broker won — the exact bug s3_etag.rs already documents. The
-/// bands (21xxx/22xxx/23xxx per file) stay clear of the other suites' ranges.
-fn test_port(base: u16, span_per_pid: u16) -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    base + (std::process::id() % 97) as u16 * span_per_pid + NEXT.fetch_add(2, Ordering::SeqCst)
-}
-
 /// Start a broker, teeing its stderr into `log` inside the data dir. When an
 /// assertion fails, the broker's own recovery line ("recovered N sessions, M
 /// pending") is the diagnosis — a crash test that cannot say what the broker
 /// recovered can only say "lost", which is not a diagnosis.
-fn start(port: u16, data: &Path, log: &str) -> Child {
+/// Wait for the child's ready file and return the mqtt port it names.
+/// See pg_wire.rs for why probing a chosen port is not a readiness check.
+fn wait_ready(child: &mut Child, ready: &Path) -> u16 {
+    for _ in 0..600 {
+        if let Ok(body) = std::fs::read_to_string(ready) {
+            return body
+                .lines()
+                .find_map(|l| l.strip_prefix("mqtt="))
+                .expect("ready file names the mqtt port")
+                .parse()
+                .expect("mqtt port is a u16");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("broker exited before becoming ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("broker never became ready");
+}
+
+fn start(data: &Path, log: &str) -> (Child, u16) {
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let logfile = std::fs::File::create(data.join(log)).expect("create broker log");
+    // A restart writes a fresh ready file (and gets a fresh kernel-assigned
+    // port), so remove the previous one or the wait below would read it.
+    let ready = data.join("ready");
+    let _ = std::fs::remove_file(&ready);
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .env("OXIDB_MQTT_PERSIST", "1")
-        .env("OXIDB_MQTT_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_DATA", data)
+        .env("OXIDB_MQTT_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", data.join("data"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
         .expect("start oxidb-server");
-    for _ in 0..600 {
-        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return child;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("broker never came up on {port}");
+    let port = wait_ready(&mut child, &ready);
+    (child, port)
 }
 
 fn read_log(data: &Path, log: &str) -> String {
@@ -142,10 +149,9 @@ fn an_acked_qos1_message_survives_sigkill() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(22000, 4);
 
     // 1. A durable subscriber registers its subscription, then leaves.
-    let mut broker = start(port, dir.path(), "broker1.log");
+    let (mut broker, port) = start(dir.path(), "broker1.log");
     subscribe_and_leave(port, "crash-sub", "crash/topic");
     std::thread::sleep(Duration::from_millis(400));
 
@@ -161,7 +167,7 @@ fn an_acked_qos1_message_survives_sigkill() {
 
     // 4. Restart on the SAME data dir. A brand-new process — anything it
     //    delivers came off disk.
-    let mut broker2 = start(port, dir.path(), "broker2.log");
+    let (mut broker2, port) = start(dir.path(), "broker2.log");
 
     // 5. The durable subscriber reconnects and must receive the message.
     let got = sub_once(port, "crash-sub", "crash/topic", 3);
@@ -187,9 +193,8 @@ fn a_delivered_and_acked_message_is_not_redelivered_after_a_crash() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(22000, 4);
 
-    let mut broker = start(port, dir.path(), "broker1.log");
+    let (mut broker, port) = start(dir.path(), "broker1.log");
     subscribe_and_leave(port, "ack-sub", "ack/topic");
     std::thread::sleep(Duration::from_millis(400));
     publish_q1(port, "ack/topic", "consume-me");
@@ -207,7 +212,7 @@ fn a_delivered_and_acked_message_is_not_redelivered_after_a_crash() {
     // broker that becomes at-least-twice-forever after every crash is a bug.
     broker.kill().expect("SIGKILL");
     broker.wait().ok();
-    let mut broker2 = start(port, dir.path(), "broker2.log");
+    let (mut broker2, port) = start(dir.path(), "broker2.log");
 
     let again = sub_once(port, "ack-sub", "ack/topic", 2);
     broker2.kill().ok();

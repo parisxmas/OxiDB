@@ -4,17 +4,9 @@
 //! path) is exercised end to end — not just the lib-level dispatcher.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// Server process killed on drop, so a failing test can't leak it.
 struct ServerGuard {
@@ -30,39 +22,54 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Ports are kernel-assigned and read back from `OXIDB_READY_FILE`; see
+/// pg_wire.rs for why probing a chosen port is not a readiness check.
 fn spawn_server() -> ServerGuard {
     let dir = tempfile::tempdir().unwrap();
-    let doc_port = free_port();
-    let oximem_port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{doc_port}"))
-        .env("OXIDB_OXIMEM_PORT", oximem_port.to_string())
+    let ready = dir.path().join("ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidb-server"))
+        .env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_OXIMEM_PORT", "auto")
+        .env("OXIDB_READY_FILE", &ready)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn oxidb-server");
-    let guard = ServerGuard {
-        child,
-        _dir: dir,
-        oximem_port,
-    };
-    // Wait for the OxiMem listener to come up.
     // 60s, not 15: the full suite starts dozens of fsync-every-commit servers
     // concurrently, and under that disk load a cold engine open can genuinely
     // take tens of seconds. A readiness deadline is not a performance
     // assertion; a tight one just converts contention into flakes.
     let deadline = Instant::now() + Duration::from_secs(60);
+    let oximem_port: u16 = loop {
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            break body
+                .lines()
+                .find_map(|l| l.strip_prefix("oximem="))
+                .expect("ready file names the oximem port")
+                .parse()
+                .expect("oximem port is a u16");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let guard = ServerGuard {
+        child,
+        _dir: dir,
+        oximem_port,
+    };
+    // Belt and braces: one completed PING/PONG before handing the server to
+    // the test — the historical flake this file documents was a connection
+    // accepted by a listener that could not serve yet.
     loop {
-        // A completed PING/PONG, not merely a successful connect. The listener
-        // accepts before it can serve, so "the port answers" let the test open
-        // its real connection into a half-ready server and occasionally get it
-        // reset — a flake that looked like a protocol bug and was not one.
         if ping_ok(guard.oximem_port) {
             return guard;
         }
         assert!(Instant::now() < deadline, "oximem port never answered PING");
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

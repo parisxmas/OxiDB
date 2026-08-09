@@ -12,7 +12,6 @@
 //! test — so it prints why it skipped.
 
 use std::io::Read;
-use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -42,44 +41,44 @@ impl Drop for Broker {
     }
 }
 
-/// Every test gets its own port pair (port, port+1). Deriving from the pid
-/// alone gives every test in the binary the SAME port: under the default
-/// parallel runner the extra brokers fail to bind and the tests silently talk
-/// to whichever broker won — the exact bug s3_etag.rs already documents. The
-/// bands (21xxx/22xxx/23xxx per file) stay clear of the other suites' ranges.
-fn test_port(base: u16, span_per_pid: u16) -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    base + (std::process::id() % 97) as u16 * span_per_pid + NEXT.fetch_add(2, Ordering::SeqCst)
-}
-
+/// Ports are kernel-assigned and read back from `OXIDB_READY_FILE`; see
+/// pg_wire.rs for why probing a chosen port is not a readiness check.
 fn start_broker() -> Broker {
     let dir = tempfile::tempdir().unwrap();
-    let port = test_port(21000, 8);
+    let ready = dir.path().join("ready");
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     // The child is owned by a guard that kills and waits on Drop.
     #[allow(clippy::zombie_processes)]
-    let child = Command::new(bin)
-        .env("OXIDB_MQTT_PORT", port.to_string())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{}", port + 1))
-        .env("OXIDB_DATA", dir.path())
+    let mut child = Command::new(bin)
+        .env("OXIDB_MQTT_PORT", "auto")
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
+        .env("OXIDB_DATA", dir.path().join("data"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("start oxidb-server");
 
     for _ in 0..600 {
-        // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            let port = body
+                .lines()
+                .find_map(|l| l.strip_prefix("mqtt="))
+                .expect("ready file names the mqtt port")
+                .parse()
+                .expect("mqtt port is a u16");
             return Broker {
                 child,
                 port,
                 _dir: dir,
             };
         }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("broker exited before becoming ready: {status}");
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("MQTT broker never came up on port {port}");
+    panic!("broker never became ready");
 }
 
 /// A subscriber that connects, subscribes, and exits when it has one message or

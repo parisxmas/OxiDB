@@ -10,7 +10,7 @@
 //! database are verified against it.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -20,14 +20,6 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 const NWORKERS: usize = 10;
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct Guard {
     child: Child,
@@ -46,11 +38,12 @@ impl Drop for Guard {
 /// backup for verification).
 fn spawn_sql(sql_data: Option<&Path>) -> Guard {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let ready = dir.path().join("ready");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oxidb-server"));
     cmd.env("OXIDB_SQL", "1")
-        .env("OXIDB_DATA", dir.path())
-        .env("OXIDB_ADDR", format!("127.0.0.1:{port}"))
+        .env("OXIDB_DATA", dir.path().join("data"))
+        .env("OXIDB_ADDR", "127.0.0.1:0")
+        .env("OXIDB_READY_FILE", &ready)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     match sql_data {
@@ -61,18 +54,33 @@ fn spawn_sql(sql_data: Option<&Path>) -> Guard {
             cmd.env_remove("OXIDB_SQL_DATA");
         }
     }
-    let child = cmd.spawn().unwrap();
-    let g = Guard {
+    let mut child = cmd.spawn().unwrap();
+    // Read the kernel-assigned OxiWire port back from the ready file — see
+    // pg_wire.rs for why probing a chosen port is not a readiness check.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let port: u16 = loop {
+        if let Ok(body) = std::fs::read_to_string(&ready) {
+            let addr = body
+                .lines()
+                .find_map(|l| l.strip_prefix("addr="))
+                .expect("ready file names the main listener");
+            break addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .expect("addr ends in a port");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Guard {
         child,
         _dir: dir,
         port,
-    };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", g.port)).is_err() {
-        assert!(Instant::now() < deadline, "sql port never opened");
-        std::thread::sleep(Duration::from_millis(50));
     }
-    g
 }
 
 fn connect(port: u16) -> TcpStream {
