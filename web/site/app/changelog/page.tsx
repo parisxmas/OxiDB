@@ -11,12 +11,58 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.43.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.43.0</h3>
+        <span class="version-date">2026-08-10</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; a fourth engine: recommendations (<code>oxidb-rec</code>)</h4>
+        <ul>
+          <li><strong>&ldquo;Customers who bought this also bought&rdquo;, current the instant an order is written.</strong> No nightly batch, no Spark, no embeddings, no training &mdash; the capability is reachable by any application that can already write an order. Off by default (<code>OXIDB_REC=1</code>), per-database, wire-routed like SQL and TSDB (<code>engine: "rec"</code>).</li>
+          <li><strong><code>track</code> / <code>related</code> / <code>for_basket</code>.</strong> Baskets ingest as pair-count increments independent of catalogue size (idempotent on basket id; oversized baskets skipped <em>and counted</em>); <code>related</code> is one sparse row lookup; <code>for_basket</code> scores the whole cart and never recommends what is already in it. Cold start returns empty &mdash; no evidence is not a recommendation.</li>
+          <li><strong>Scoring is a query parameter, never a rebuild:</strong> <code>llr</code> (default &mdash; Dunning&rsquo;s log-likelihood), <code>cosine</code>, <code>jaccard</code>, <code>lift</code>, <code>count</code>. The default was frozen on evidence: validated against 541k real retail orders, raw counts crown the shop&rsquo;s global bestseller on a co-occurrence of <em>two</em>, and cosine medals one-off coincidences exactly where the theory predicts.</li>
+          <li><strong>Time is built in:</strong> eight rolling buckets with lazy per-row shifts (no global sweep exists anywhere) and an exponential half-life query parameter &mdash; &ldquo;rising together right now&rdquo; is a query, not a pipeline. Durable via MANIFEST + snapshot + WAL, crash-consistent, auto-checkpointing.</li>
+          <li><strong>COBRA stored procedures reach it</strong> &mdash; <code>db.rec_related({...})</code>, <code>db.rec_track</code>, and, crossing into the document engine, <code>db.vector_search</code>: one JSON boundary with the same validation as the wire.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type changed">Changed &mdash; full-text search stops being a memory liability</h4>
+        <ul>
+          <li><strong>The text index moved to disk</strong> (<code>.mtidx</code>, both the collection and blob engines): a 1M-document FTS collection went from <strong>1&nbsp;GB resident to zero</strong> &mdash; 38&nbsp;MB total, the documents themselves &mdash; and opening it no longer rescans the collection. The legacy <code>_fts/index.json</code> is migrated automatically on first open and removed.</li>
+          <li><strong>A search&rsquo;s memory no longer grows with the corpus.</strong> Query terms are processed rarest-first under a scoring cap (<code>OXIDB_FTS_SCORE_CAP</code>): 7.3&nbsp;MB flat where a common term used to cost 25&ndash;51&nbsp;MB per query, multiplied by concurrency.</li>
+          <li><strong>Uploads can&rsquo;t weaponize extraction:</strong> DOCX/XLSX readers stop <em>pulling</em> at a cap (<code>OXIDB_FTS_MAX_EXTRACT_BYTES</code>, default 4&nbsp;MiB) so a decompression bomb is never inflated; highlighting scans a bounded window (<code>OXIDB_FTS_MAX_HIGHLIGHT_BYTES</code>, 256&nbsp;KiB); indexing jobs no longer carry the uploaded bytes through the queue. Equal-scored results now tie-break deterministically &mdash; pagination over ties was quietly broken.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type changed">Changed &mdash; bulk DML costs what it touches</h4>
+        <ul>
+          <li><strong>A bulk SQL <code>DELETE</code>/<code>UPDATE</code> no longer materializes the table</strong> &mdash; rows stream past the predicate, range predicates reach the index, and a match without <code>RETURNING</code> costs 8 bytes, not a row. <strong><code>DELETE ... LIMIT n</code></strong> (bindable as <code>?</code>) makes a purge loop expressible against a table far larger than memory. A row-lock protocol hole around LIMIT &mdash; a concurrently-committed lower-id match could displace a locked row &mdash; was found and closed before release.</li>
+          <li><strong>Unindexed document scans hold a window, not the collection:</strong> peak transient memory per scan dropped 12.6&times;, and a scan that stops at its first match is 5&ndash;7&times; faster.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; index builds: concurrency-safe, then non-blocking</h4>
+        <ul>
+          <li><strong>Building a document index while writes were in flight corrupted it</strong> &mdash; concurrently inserted documents were permanently unreachable, updates answered under stale values, and a UNIQUE index accepted duplicates written during its own build. Fixed, then made non-blocking: <code>create_index</code> is now the <code>CREATE INDEX CONCURRENTLY</code> shape &mdash; writers stall ~25&nbsp;ms at 1M documents instead of 916&nbsp;ms. UNIQUE builds stay blocking on purpose. <strong>Upgrade note:</strong> an index built under concurrent writes on &le;&nbsp;0.42.12 may be missing documents; <code>drop_index</code> + re-create repairs it &mdash; re-running <code>create_index</code> does not.</li>
+          <li><strong>The Cobra VM caught up with the 0.13 compiler:</strong> portable format v2 and the eleven fused opcodes &mdash; freshly compiled stored procedures used to be refused, or die at runtime on the first fused instruction.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; operations</h4>
+        <ul>
+          <li><strong><code>OXIDB_READY_FILE</code></strong> &mdash; the server atomically writes each listener&rsquo;s <em>actual</em> bound address once everything is up, and <code>auto</code> binds kernel-assigned ports (<code>OXIDB_PG_PORT</code>, MQTT, AMQP, S3, OxiMem): what <code>postmaster.pid</code> does for PostgreSQL. Spawning tools stop guessing ports and stop probing them.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.42.12 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.42.12</h3>
         <span class="version-date">2026-08-08</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; realtime subscriptions that filter, and events that carry the document</h4>

@@ -13,8 +13,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "OxiDBEmbeddedBinary",
-            url: "https://github.com/parisxmas/OxiDB/releases/download/v0.42.12/OxiDBEmbedded.xcframework.zip",
-            checksum: "8a56f3ceecb880c73014514bf8761f7a9b1ed0b3f2849d9f7e3211339a89542a"
+            url: "https://github.com/parisxmas/OxiDB/releases/download/v0.43.0/OxiDBEmbedded.xcframework.zip",
+            checksum: "32f0c3324e16bc3edee9a530bad0fdb832b4a8d9ee83223046c39471c280a966"
         ),
         .target(
             name: "COxiDBEmbedded",

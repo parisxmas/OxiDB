@@ -1,0 +1,33 @@
+OxiDB Proprietary License
+
+Copyright (c) 2026 Barış AKIN. All rights reserved.
+
+This software, including its source code, binaries, documentation, and
+associated files (the "Software"), is the proprietary property of
+Barış AKIN (the "Licensor").
+
+1. NO LICENSE GRANTED. Except as expressly granted in a separate written
+   agreement with the Licensor (a "Commercial License" — see
+   COMMERCIAL-LICENSE.md), no right is granted to any person or entity
+   to use, copy, modify, merge, publish, distribute, sublicense, sell,
+   or offer as a service the Software, in whole or in part.
+
+2. COMMERCIAL LICENSING. Commercial licenses, including embedding,
+   redistribution, and hosted-service rights, are available from the
+   Licensor. See COMMERCIAL-LICENSE.md for how to obtain one.
+
+3. PRIOR VERSIONS. Earlier versions of OxiDB were published under
+   open-source licenses: releases up to the MIT-era versions under
+   "MIT OR Apache-2.0", and subsequent releases up to and including
+   v0.32.x under "AGPL-3.0-only". Those grants are irrevocable for
+   those specific published versions, which remain available under
+   their original terms. This proprietary license applies to version
+   0.33.0 and all later versions of the Software.
+
+4. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
