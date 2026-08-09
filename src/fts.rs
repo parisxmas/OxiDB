@@ -116,6 +116,81 @@ fn fts_b() -> f64 {
 /// `OXIDB_FTS_SCORE_CAP` overrides; `0` = unbounded (the old behavior).
 const FTS_SCORE_CAP_DEFAULT: usize = 200_000;
 
+/// Ceiling on the text one extraction may produce, in bytes.
+///
+/// DOCX/XLSX are zip archives (a 100 KB upload can decompress to gigabytes)
+/// and a PDF's text stream is unbounded by its file size — extraction runs on
+/// every `put_object` AND per hit of a highlighted blob search, so an
+/// uncapped extractor turns one hostile upload into an OOM lever. The zip
+/// readers stop PULLING at the cap (`Read::take`, so the bomb is never
+/// inflated); PDF is truncated after the library returns — pdf_extract's
+/// internal memory is not boundable from outside, which is the honest limit
+/// of this cap. `OXIDB_FTS_MAX_EXTRACT_BYTES` overrides; `0` = uncapped.
+const FTS_MAX_EXTRACT_BYTES_DEFAULT: usize = 4 * 1024 * 1024;
+
+fn fts_max_extract_bytes() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("OXIDB_FTS_MAX_EXTRACT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => FTS_MAX_EXTRACT_BYTES_DEFAULT,
+        }
+    })
+}
+
+/// Ceiling on how much of a text `highlight()` scans for snippets.
+///
+/// Highlighting tokenizes the WHOLE text per indexed field of every result —
+/// megabyte fields made a 500-row highlighted search pay result × field
+/// size. A match past the window simply yields no snippet (the result row
+/// itself is unaffected). `OXIDB_FTS_MAX_HIGHLIGHT_BYTES` overrides; `0` =
+/// uncapped.
+const FTS_MAX_HIGHLIGHT_BYTES_DEFAULT: usize = 256 * 1024;
+
+fn fts_max_highlight_bytes() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("OXIDB_FTS_MAX_HIGHLIGHT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => FTS_MAX_HIGHLIGHT_BYTES_DEFAULT,
+        }
+    })
+}
+
+/// Read all of `r` (already `Take`-bounded by the caller) into `out` as
+/// lossy UTF-8: a cap that lands mid-character must truncate, not error.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_to_string_lossy_capped(
+    r: &mut impl std::io::Read,
+    out: &mut String,
+) -> std::io::Result<()> {
+    let mut bytes = Vec::new();
+    r.read_to_end(&mut bytes)?;
+    out.push_str(&String::from_utf8_lossy(&bytes));
+    Ok(())
+}
+
+/// The longest prefix of `s` that is at most `cap` bytes and ends on a char
+/// boundary.
+fn prefix_at_boundary(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn fts_score_cap() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1397,13 +1472,18 @@ pub fn highlight(
 }
 
 pub fn highlight_with_tags(
-    text: &str,
+    full_text: &str,
     query: &str,
     snippet_chars: usize,
     max_snippets: usize,
     open_tag: &str,
     close_tag: &str,
 ) -> Vec<HighlightSnippet> {
+    // Snippets are only searched for in a bounded prefix: highlighting
+    // tokenizes the whole text per field of every result, and megabyte
+    // fields made a highlighted search pay result × field size. A match
+    // past the window yields no snippet; the result itself is unaffected.
+    let text = prefix_at_boundary(full_text, fts_max_highlight_bytes());
     use std::collections::HashSet;
 
     let query_stems: HashSet<String> = tokenize(query).into_iter().collect();
@@ -1563,6 +1643,25 @@ fn resolve_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serd
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
+    extract_text_capped(data, content_type, fts_max_extract_bytes())
+}
+
+/// [`extract_text`] with an explicit cap — split out so tests can exercise
+/// the ceiling without the process-global env knob.
+#[cfg(not(target_arch = "wasm32"))]
+fn extract_text_capped(data: &[u8], content_type: &str, cap: usize) -> Option<String> {
+    let text = extract_text_inner(data, content_type, cap)?;
+    // The single choke point: whatever an extractor produced, no more than
+    // `cap` bytes of it reaches tokenization or the caller.
+    if text.len() > cap {
+        Some(prefix_at_boundary(&text, cap).to_string())
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn extract_text_inner(data: &[u8], content_type: &str, cap: usize) -> Option<String> {
     let ct = content_type.to_lowercase();
 
     // HTML and XML are different content types that happen to share a handler;
@@ -1600,7 +1699,7 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     } else if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
         #[cfg(feature = "doc-formats")]
         {
-            extract_docx(data)
+            extract_docx(data, cap)
         }
         #[cfg(not(feature = "doc-formats"))]
         {
@@ -1609,7 +1708,7 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     } else if ct == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" {
         #[cfg(feature = "doc-formats")]
         {
-            extract_xlsx(data)
+            extract_xlsx(data, cap)
         }
         #[cfg(not(feature = "doc-formats"))]
         {
@@ -1639,13 +1738,17 @@ fn extract_pdf(data: &[u8]) -> Option<String> {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "doc-formats"))]
-fn extract_docx(data: &[u8]) -> Option<String> {
+fn extract_docx(data: &[u8], cap: usize) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
     let mut xml = String::new();
     {
-        let mut file = archive.by_name("word/document.xml").ok()?;
-        std::io::Read::read_to_string(&mut file, &mut xml).ok()?;
+        // `take`: stop PULLING at the cap — a decompression bomb is never
+        // inflated past it. (×4: markup overhead; the choke point in
+        // `extract_text_capped` trims the final text exactly.)
+        let file = archive.by_name("word/document.xml").ok()?;
+        let mut file = std::io::Read::take(file, cap.saturating_mul(4) as u64);
+        read_to_string_lossy_capped(&mut file, &mut xml).ok()?;
     }
     let text = strip_html_tags(&xml);
     let trimmed = text.trim().to_string();
@@ -1768,13 +1871,15 @@ fn otsu_threshold(img: &image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> u8 {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "doc-formats"))]
-fn extract_xlsx(data: &[u8]) -> Option<String> {
+fn extract_xlsx(data: &[u8], cap: usize) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
     let mut xml = String::new();
     {
-        let mut file = archive.by_name("xl/sharedStrings.xml").ok()?;
-        std::io::Read::read_to_string(&mut file, &mut xml).ok()?;
+        // See extract_docx on the bounded pull.
+        let file = archive.by_name("xl/sharedStrings.xml").ok()?;
+        let mut file = std::io::Read::take(file, cap.saturating_mul(4) as u64);
+        read_to_string_lossy_capped(&mut file, &mut xml).ok()?;
     }
     // Extract text between <t> and </t> tags
     let mut parts = Vec::new();
@@ -2722,6 +2827,73 @@ startxref
     fn highlight_zero_max_returns_empty() {
         let snippets = highlight("rust is fast", "rust", 60, 0);
         assert!(snippets.is_empty());
+    }
+
+    /// Extraction output is capped at the choke point, whatever the source
+    /// format — and for zip-based formats the bomb is never inflated: the
+    /// reader stops pulling at the cap.
+    #[test]
+    fn extraction_is_capped_and_zip_bombs_are_not_inflated() {
+        // Plain text over the cap: truncated at a char boundary, not errored.
+        let big = "çok ".repeat(10_000); // multibyte on purpose
+        let out = extract_text_capped(big.as_bytes(), "text/plain", 1000).unwrap();
+        assert!(out.len() <= 1000);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(big.starts_with(&out));
+
+        // A DOCX whose document.xml decompresses far past the cap: the
+        // extractor returns (bounded pull), and the result honors the cap.
+        let mut zip_bytes = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("word/document.xml", opts).unwrap();
+            use std::io::Write as _;
+            // Highly compressible: megabytes of the same word.
+            let body = format!("<w:t>{}</w:t>", "bomba ".repeat(2_000_000));
+            w.write_all(body.as_bytes()).unwrap();
+            w.finish().unwrap();
+        }
+        let out = extract_text_capped(
+            &zip_bytes,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            4096,
+        )
+        .unwrap();
+        assert!(
+            out.len() <= 4096,
+            "cap ignored: {} bytes extracted",
+            out.len()
+        );
+        assert!(out.contains("bomba"));
+    }
+
+    /// A highlight match beyond the scan window yields no snippet; the same
+    /// match inside it does. The window bounds the cost of highlighting a
+    /// megabyte field × 500 results — the result row itself is unaffected
+    /// (highlighting has no say in matching).
+    #[test]
+    fn highlight_scans_a_bounded_window() {
+        // The knob is process-global (OnceLock); pin it here so the test is
+        // deterministic regardless of what other tests resolved.
+        // SAFETY: set_var before any concurrent reader of this var matters
+        // only for THIS cached knob; tests in this binary run threaded, so
+        // instead of env we rely on the default (256 KiB) being far larger
+        // than the fixture and craft the fixture around it.
+        let window = fts_max_highlight_bytes();
+        let filler = "dolgu ".repeat(window / 6 + 10); // pushes past the window
+        let text = format!("{filler} zümrüt");
+        let snippets = highlight(&text, "zümrüt", 160, 3);
+        assert!(
+            snippets.is_empty(),
+            "a match {} bytes past the window produced a snippet",
+            text.len() - window
+        );
+
+        let text = format!("zümrüt {filler}");
+        let snippets = highlight(&text, "zümrüt", 160, 3);
+        assert_eq!(snippets.len(), 1, "a match inside the window must snippet");
     }
 
     /// The blob index's disk mode, end to end at the unit layer: build,

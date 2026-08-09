@@ -89,7 +89,14 @@ pub struct PitrRestoreInfo {
 #[cfg(not(target_arch = "wasm32"))]
 enum FtsJob {
     Index {
-        data: Vec<u8>,
+        // The job deliberately does NOT carry the object's bytes: a
+        // 256-deep queue per worker full of whole blobs pinned
+        // queue-depth × blob-size during an upload burst. The worker
+        // re-reads the object from the store — bounded by workers ×
+        // one blob; an object deleted meanwhile simply skips (its
+        // Remove job follows), an overwritten one indexes the newer
+        // bytes, which the newer put's own job then re-indexes:
+        // idempotent.
         content_type: String,
         bucket: String,
         key: String,
@@ -308,7 +315,10 @@ impl FtsRuntime {
 /// FTS index into batched-persist mode so high-volume ingestion does
 /// not rewrite the whole index file on every document.
 #[cfg(not(target_arch = "wasm32"))]
-fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<FtsRuntime>) {
+fn setup_fts_workers(
+    fts_index: &Arc<RwLock<FtsIndex>>,
+    blob_store: &Arc<BlobStore>,
+) -> (FtsDispatcher, Arc<FtsRuntime>) {
     let n_workers = std::env::var("OXIDB_FTS_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -329,17 +339,25 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<F
     for worker_id in 0..n_workers {
         let (tx, rx) = mpsc::sync_channel::<FtsJob>(256);
         let fts_worker = Arc::clone(fts_index);
+        let blobs_w = Arc::clone(blob_store);
         let runtime_w = Arc::clone(&runtime);
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
                     FtsJob::Index {
-                        data,
                         content_type,
                         bucket,
                         key,
                     } => {
                         runtime_w.start(worker_id, &bucket, &key);
+                        // Re-read the object; gone = deleted since queueing.
+                        let Ok((data, _meta)) = blobs_w.get_object(&bucket, &key) else {
+                            runtime_w.finish(
+                                worker_id,
+                                JobOutcome::Skipped("object gone before indexing"),
+                            );
+                            continue;
+                        };
                         // CPU-bound extraction happens BEFORE the lock so
                         // workers parallelize across cores. catch_unwind:
                         // the extractors (pdf_extract, zip, image decoding)
@@ -416,7 +434,7 @@ pub struct OxiDb {
     data_dir: PathBuf,
     collections: RwLock<HashMap<String, Arc<BTreeCollection>>>,
     #[cfg(not(target_arch = "wasm32"))]
-    blob_store: BlobStore,
+    blob_store: Arc<BlobStore>,
     #[cfg(not(target_arch = "wasm32"))]
     fts_index: Arc<RwLock<FtsIndex>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -611,11 +629,11 @@ impl OxiDb {
         ));
         std::fs::create_dir_all(&tmp)?;
 
-        let blob_store = BlobStore::open_with_encryption(&tmp, None)?;
+        let blob_store = Arc::new(BlobStore::open_with_encryption(&tmp, None)?);
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(&tmp)?));
         let tx_log = TxCommitLog::open(&tmp)?;
 
-        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index);
+        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index, &blob_store);
 
         Ok(Self {
             data_dir: tmp,
@@ -762,7 +780,10 @@ impl OxiDb {
         #[cfg(not(target_arch = "wasm32"))]
         Self::check_legacy_dat_layout(data_dir)?;
 
-        let blob_store = BlobStore::open_with_encryption(data_dir, encryption.clone())?;
+        let blob_store = Arc::new(BlobStore::open_with_encryption(
+            data_dir,
+            encryption.clone(),
+        )?);
 
         if verbose {
             vlog("[verbose] blob store opened");
@@ -785,7 +806,7 @@ impl OxiDb {
             ));
         }
 
-        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index);
+        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index, &blob_store);
 
         if verbose {
             vlog("[verbose] FTS worker threads started");
@@ -3467,7 +3488,6 @@ impl OxiDb {
             .put_object(bucket, key, data, content_type, metadata)?;
 
         if let Err(e) = self.fts_tx.send(FtsJob::Index {
-            data: data.to_vec(),
             content_type: content_type.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -3502,7 +3522,6 @@ impl OxiDb {
         )?;
 
         if let Err(e) = self.fts_tx.send(FtsJob::Index {
-            data: data.to_vec(),
             content_type: content_type.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
