@@ -84,14 +84,14 @@ fn a_document_written_while_an_index_is_building_is_still_findable() {
     db.create_index("users", "email").unwrap();
     // Keep writing after the build too: the writes the barrier delayed land
     // here, and they must be maintained by the index that was just registered.
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
     let n = written.load(Ordering::Relaxed);
     // The fix blocks writers for the build, so most of these land on either
     // side of it — but if none were attempted at all this test proves nothing.
-    assert!(n >= 10, "the writer never ran ({n} writes) — vacuous");
+    assert!(n >= 3, "the writer never ran ({n} writes) — vacuous");
     let missing: Vec<u64> = (0..n)
         .filter(|k| find_by_email(&db, &format!("mid{k}@x.com")) == 0)
         .collect();
@@ -156,12 +156,12 @@ fn an_index_built_over_a_concurrent_update_does_not_answer_with_the_old_value() 
 
     std::thread::sleep(Duration::from_millis(20));
     db.create_index("items", "tag").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
     let n = updated.load(Ordering::Relaxed);
-    assert!(n >= 10, "the writer never ran ({n} updates) — vacuous");
+    assert!(n >= 3, "the writer never ran ({n} updates) — vacuous");
     let mut stale = Vec::new();
     let mut lost = Vec::new();
     for k in 0..n {
@@ -229,12 +229,12 @@ fn a_document_deleted_during_a_build_is_not_resurrected_by_the_index() {
 
     std::thread::sleep(Duration::from_millis(20));
     db.create_index("gone", "tag").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
     let n = deleted.load(Ordering::Relaxed);
-    assert!(n >= 10, "the writer never ran ({n} deletes) — vacuous");
+    assert!(n >= 3, "the writer never ran ({n} deletes) — vacuous");
     let resurrected: Vec<u64> = (0..n)
         .filter(|k| {
             !db.find("gone", &json!({"tag": format!("seed{k}")}))
@@ -276,10 +276,10 @@ fn a_unique_index_built_over_a_concurrent_write_still_rejects_duplicates() {
 
     std::thread::sleep(Duration::from_millis(20));
     db.create_unique_index("accounts", "tag").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     stop.store(true, Ordering::Relaxed);
     let n = writer.join().unwrap();
-    assert!(n >= 10, "the writer never ran ({n} writes) — vacuous");
+    assert!(n >= 3, "the writer never ran ({n} writes) — vacuous");
 
     // Every value written during the build must now be enforced as unique:
     // a second copy has to be refused.

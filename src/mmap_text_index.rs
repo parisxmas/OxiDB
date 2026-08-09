@@ -405,6 +405,362 @@ impl MtidxWriter {
     }
 }
 
+// ─── Blob (bucket/key) variant ──────────────────────────────────────────────
+
+const BLOB_MAGIC: &[u8; 4] = b"OXTB";
+const BLOB_DOC_ENTRY: usize = 24; // name_off u64 + bucket_len u16 + key_len u16 + dl u32 + text_bytes u64
+const BLOB_POST_ENTRY: usize = 8; // doc ordinal u32 + freq u32
+
+/// The blob search index's mmap'd base — the same model as [`MmapTextIndex`]
+/// with two differences forced by the domain: documents are named by
+/// `(bucket, key)` strings, so the doc table is (offset, lengths) into a
+/// names blob and postings reference doc **ordinals** (u32, 8 bytes an entry
+/// instead of 12); and each doc carries `text_bytes`, because per-bucket FTS
+/// quota accounting reads it. The doc table is sorted by `(bucket, key)`, so
+/// a name lookup is a binary search and a whole bucket is one contiguous run
+/// — `bucket_text_size` walks exactly its own range.
+pub struct MmapBlobTextIndex {
+    mmap: Mmap,
+    total_term_count: u64,
+    doc_count: u32,
+    term_count: u32,
+    doc_table: usize,
+    postings: usize,
+    term_table: usize,
+    names_blob: usize,
+    string_blob: usize,
+    len: usize,
+}
+
+impl MmapBlobTextIndex {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = fs::File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let b: &[u8] = &mmap;
+        let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
+
+        if b.len() < 8 || &b[0..4] != BLOB_MAGIC {
+            return Err(bad("not an OXTB file"));
+        }
+        if rd_u32(b, 4) != VERSION {
+            return Err(bad("unsupported OXTB version"));
+        }
+        let mut at = 8;
+        if at + 8 + 4 + 4 + 8 + 8 + 8 > b.len() {
+            return Err(bad("truncated header"));
+        }
+        let total_term_count = rd_u64(b, at);
+        at += 8;
+        let doc_count = rd_u32(b, at);
+        at += 4;
+        let term_count = rd_u32(b, at);
+        at += 4;
+        let postings_len = rd_u64(b, at) as usize;
+        at += 8;
+        let names_blob_len = rd_u64(b, at) as usize;
+        at += 8;
+        let string_blob_len = rd_u64(b, at) as usize;
+        at += 8;
+
+        let doc_table = at;
+        let postings = doc_table + doc_count as usize * BLOB_DOC_ENTRY;
+        let term_table = postings + postings_len;
+        let names_blob = term_table + term_count as usize * TERM_ENTRY;
+        let string_blob = names_blob + names_blob_len;
+        let len = string_blob + string_blob_len;
+        if len != b.len() {
+            return Err(bad("OXTB length mismatch"));
+        }
+
+        Ok(Self {
+            mmap,
+            total_term_count,
+            doc_count,
+            term_count,
+            doc_table,
+            postings,
+            term_table,
+            names_blob,
+            string_blob,
+            len,
+        })
+    }
+
+    pub fn doc_count(&self) -> u32 {
+        self.doc_count
+    }
+    pub fn total_term_count(&self) -> u64 {
+        self.total_term_count
+    }
+    pub fn file_len(&self) -> usize {
+        self.len
+    }
+
+    /// (bucket, key, dl, text_bytes) of the doc at `ord`.
+    pub fn doc_at(&self, ord: u32) -> (&str, &str, u32, u64) {
+        let b: &[u8] = &self.mmap;
+        let at = self.doc_table + ord as usize * BLOB_DOC_ENTRY;
+        let name_off = rd_u64(b, at) as usize;
+        let bucket_len = rd_u16(b, at + 8) as usize;
+        let key_len = rd_u16(b, at + 10) as usize;
+        let dl = rd_u32(b, at + 12);
+        let text_bytes = rd_u64(b, at + 16);
+        let name =
+            &b[self.names_blob + name_off..self.names_blob + name_off + bucket_len + key_len];
+        (
+            std::str::from_utf8(&name[..bucket_len]).unwrap_or(""),
+            std::str::from_utf8(&name[bucket_len..]).unwrap_or(""),
+            dl,
+            text_bytes,
+        )
+    }
+
+    /// Ordinal of `(bucket, key)`, if the base knows it.
+    pub fn find_doc(&self, bucket: &str, key: &str) -> Option<u32> {
+        let (mut lo, mut hi) = (0usize, self.doc_count as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (mb, mk, _, _) = self.doc_at(mid as u32);
+            match (mb, mk).cmp(&(bucket, key)) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid as u32),
+            }
+        }
+        None
+    }
+
+    /// Walk the docs of exactly one bucket — a contiguous run of the sorted
+    /// doc table, located by binary search.
+    pub fn for_each_bucket_doc(&self, bucket: &str, mut f: impl FnMut(u32, &str, u32, u64)) {
+        // Lower bound: first entry with bucket >= target.
+        let (mut lo, mut hi) = (0usize, self.doc_count as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.doc_at(mid as u32).0 < bucket {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        while lo < self.doc_count as usize {
+            let (b, k, dl, bytes) = self.doc_at(lo as u32);
+            if b != bucket {
+                break;
+            }
+            f(lo as u32, k, dl, bytes);
+            lo += 1;
+        }
+    }
+
+    fn term_at(&self, i: usize) -> (&[u8], u64, u32) {
+        let b: &[u8] = &self.mmap;
+        let at = self.term_table + i * TERM_ENTRY;
+        let str_off = rd_u64(b, at) as usize;
+        let str_len = rd_u16(b, at + 8) as usize;
+        let post_off = rd_u64(b, at + 10);
+        let post_cnt = rd_u32(b, at + 18);
+        (
+            &b[self.string_blob + str_off..self.string_blob + str_off + str_len],
+            post_off,
+            post_cnt,
+        )
+    }
+
+    /// Base postings for `term` as `(doc ordinal, frequency)`, plus the df.
+    pub fn postings(&self, term: &str) -> Option<(BlobPostingsIter<'_>, u32)> {
+        let (mut lo, mut hi) = (0usize, self.term_count as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (bytes, post_off, post_cnt) = self.term_at(mid);
+            match bytes.cmp(term.as_bytes()) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    return Some((
+                        BlobPostingsIter {
+                            b: &self.mmap,
+                            at: self.postings + post_off as usize,
+                            left: post_cnt,
+                        },
+                        post_cnt,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk every term with its postings, in term order — the persist merge's
+    /// base side.
+    pub fn for_each_term(&self, mut f: impl FnMut(&str, BlobPostingsIter<'_>)) {
+        for i in 0..self.term_count as usize {
+            let (bytes, post_off, post_cnt) = self.term_at(i);
+            let term = std::str::from_utf8(bytes).unwrap_or("");
+            f(
+                term,
+                BlobPostingsIter {
+                    b: &self.mmap,
+                    at: self.postings + post_off as usize,
+                    left: post_cnt,
+                },
+            );
+        }
+    }
+}
+
+/// Sequential reader over one term's blob postings.
+pub struct BlobPostingsIter<'a> {
+    b: &'a [u8],
+    at: usize,
+    left: u32,
+}
+
+impl Iterator for BlobPostingsIter<'_> {
+    type Item = (u32, u32);
+    fn next(&mut self) -> Option<(u32, u32)> {
+        if self.left == 0 {
+            return None;
+        }
+        let ord = rd_u32(self.b, self.at);
+        let freq = rd_u32(self.b, self.at + 4);
+        self.at += BLOB_POST_ENTRY;
+        self.left -= 1;
+        Some((ord, freq))
+    }
+}
+
+/// Streaming writer for the blob variant. Docs first, sorted by
+/// `(bucket, key)` — their arrival order IS the ordinal assignment the
+/// caller's postings must reference. Then terms in ascending byte order.
+pub struct BtidxWriter {
+    path: PathBuf,
+    tmp: PathBuf,
+    out: BufWriter<fs::File>,
+    stats_at: usize,
+    doc_count: u32,
+    docs_pushed: u32,
+    term_count: u32,
+    term_entries: Vec<u8>,
+    names_blob: Vec<u8>,
+    string_blob: Vec<u8>,
+    postings_entries: u64,
+}
+
+impl BtidxWriter {
+    pub fn create(path: &Path, total_term_count: u64, doc_count: u32) -> io::Result<Self> {
+        let tmp = path.with_extension("mtidx.tmp");
+        let mut header = Vec::new();
+        header.extend_from_slice(BLOB_MAGIC);
+        header.extend_from_slice(&VERSION.to_le_bytes());
+        header.extend_from_slice(&total_term_count.to_le_bytes());
+        header.extend_from_slice(&doc_count.to_le_bytes());
+        let stats_at = header.len();
+        header.extend_from_slice(&0u32.to_le_bytes()); // term_count
+        header.extend_from_slice(&0u64.to_le_bytes()); // postings_len
+        header.extend_from_slice(&0u64.to_le_bytes()); // names_blob_len
+        header.extend_from_slice(&0u64.to_le_bytes()); // string_blob_len
+
+        let mut out = BufWriter::new(fs::File::create(&tmp)?);
+        out.write_all(&header)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            tmp,
+            out,
+            stats_at,
+            doc_count,
+            docs_pushed: 0,
+            term_count: 0,
+            term_entries: Vec::new(),
+            names_blob: Vec::new(),
+            string_blob: Vec::new(),
+            postings_entries: 0,
+        })
+    }
+
+    /// Docs must arrive sorted by `(bucket, key)`; the Nth call defines
+    /// ordinal N. Returns that ordinal.
+    pub fn push_doc(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        dl: u32,
+        text_bytes: u64,
+    ) -> io::Result<u32> {
+        let ord = self.docs_pushed;
+        self.docs_pushed += 1;
+        let name_off = self.names_blob.len() as u64;
+        self.names_blob.extend_from_slice(bucket.as_bytes());
+        self.names_blob.extend_from_slice(key.as_bytes());
+        self.out.write_all(&name_off.to_le_bytes())?;
+        self.out.write_all(&(bucket.len() as u16).to_le_bytes())?;
+        self.out.write_all(&(key.len() as u16).to_le_bytes())?;
+        self.out.write_all(&dl.to_le_bytes())?;
+        self.out.write_all(&text_bytes.to_le_bytes())?;
+        Ok(ord)
+    }
+
+    /// Terms in ascending byte order; postings in ordinal order, non-empty.
+    pub fn push_term(
+        &mut self,
+        term: &str,
+        postings: impl Iterator<Item = (u32, u32)>,
+    ) -> io::Result<()> {
+        debug_assert_eq!(self.docs_pushed, self.doc_count, "terms before all docs");
+        let str_off = self.string_blob.len() as u64;
+        self.string_blob.extend_from_slice(term.as_bytes());
+        let post_off = self.postings_entries * BLOB_POST_ENTRY as u64;
+        let mut cnt: u32 = 0;
+        for (ord, freq) in postings {
+            self.out.write_all(&ord.to_le_bytes())?;
+            self.out.write_all(&freq.to_le_bytes())?;
+            cnt += 1;
+        }
+        debug_assert!(cnt > 0, "empty posting list pushed");
+        self.postings_entries += cnt as u64;
+
+        let mut e = [0u8; TERM_ENTRY];
+        e[0..8].copy_from_slice(&str_off.to_le_bytes());
+        e[8..10].copy_from_slice(&(term.len() as u16).to_le_bytes());
+        e[10..18].copy_from_slice(&post_off.to_le_bytes());
+        e[18..22].copy_from_slice(&cnt.to_le_bytes());
+        self.term_entries.extend_from_slice(&e);
+        self.term_count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        if self.docs_pushed != self.doc_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "doc table incomplete: {} of {} pushed",
+                    self.docs_pushed, self.doc_count
+                ),
+            ));
+        }
+        self.out.write_all(&self.term_entries)?;
+        self.out.write_all(&self.names_blob)?;
+        self.out.write_all(&self.string_blob)?;
+        let mut file = self.out.into_inner()?;
+        use std::io::Seek;
+        file.seek(io::SeekFrom::Start(self.stats_at as u64))?;
+        file.write_all(&self.term_count.to_le_bytes())?;
+        file.write_all(&(self.postings_entries * BLOB_POST_ENTRY as u64).to_le_bytes())?;
+        file.write_all(&(self.names_blob.len() as u64).to_le_bytes())?;
+        file.write_all(&(self.string_blob.len() as u64).to_le_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.tmp, &self.path)?;
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

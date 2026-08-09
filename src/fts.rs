@@ -13,7 +13,10 @@ use crate::error::Result;
 struct Posting {
     doc_id: String,
     frequency: u32,
-    positions: Vec<u32>,
+    // `positions` existed here once (4 bytes per token OCCURRENCE, resident)
+    // and nothing read it: search scores on frequency, and highlights
+    // re-extract the blob. Legacy index.json files that carry it still parse
+    // — serde ignores unknown fields.
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -186,8 +189,21 @@ fn bm25_score(tf: f64, dl: f64, avgdl: f64, idf: f64) -> f64 {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct FtsIndex {
+    /// Legacy `_fts/index.json` — read once for migration, then removed.
     index_path: PathBuf,
+    /// The mmap'd base (`_fts/index.mtidx`); `data` is its overlay.
+    mtidx_path: PathBuf,
+    /// OVERLAY since the last persist (in legacy/fresh states, everything).
     data: IndexData,
+    /// Immutable persisted base — same model as the collection index's.
+    base: Option<crate::mmap_text_index::MmapBlobTextIndex>,
+    /// Base doc ORDINALS whose postings are void (removed or re-indexed
+    /// since the base was written). Integer-keyed on purpose: the search
+    /// path checks it per posting, and a name-keyed set would build a
+    /// String per check.
+    dead: std::collections::HashSet<u32>,
+    /// Σ dl of the dead — keeps live corpus stats exact.
+    dead_terms: u64,
     /// When true, mutations only mark the index dirty; persistence
     /// happens lazily via an external flusher calling `flush()`.
     /// When false (default), every mutation writes the full index
@@ -275,6 +291,25 @@ impl FtsIndex {
         let fts_dir = data_dir.join("_fts");
         std::fs::create_dir_all(&fts_dir)?;
         let index_path = fts_dir.join("index.json");
+        let mtidx_path = fts_dir.join("index.mtidx");
+
+        // The mmap'd base wins when present: instant open, nothing resident.
+        // (If a legacy index.json also survives — a crash between migration
+        // and its removal — the base is the complete one; the rename that
+        // published it is atomic.)
+        if let Ok(base) = crate::mmap_text_index::MmapBlobTextIndex::open(&mtidx_path) {
+            let _ = std::fs::remove_file(&index_path);
+            return Ok(Self {
+                index_path,
+                mtidx_path,
+                data: IndexData::default(),
+                base: Some(base),
+                dead: std::collections::HashSet::new(),
+                dead_terms: 0,
+                batched: false,
+                dirty: false,
+            });
+        }
 
         let mut data: IndexData = if index_path.exists() {
             let bytes = std::fs::read(&index_path)?;
@@ -305,12 +340,29 @@ impl FtsIndex {
             data.total_term_count = data.docs.values().map(|d| d.total_terms as u64).sum();
         }
 
-        Ok(Self {
+        let mut idx = Self {
             index_path,
+            mtidx_path,
             data,
+            base: None,
+            dead: std::collections::HashSet::new(),
+            dead_terms: 0,
             batched: false,
             dirty: false,
-        })
+        };
+        // Migrate a legacy JSON index to the mmap'd form now — it is fully
+        // resident at this point either way, and the persist folds it to
+        // disk and frees it. On failure keep running resident; the JSON
+        // stays until a persist succeeds.
+        if !idx.data.docs.is_empty() {
+            match idx.persist() {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&idx.index_path);
+                }
+                Err(e) => eprintln!("[fts] mtidx migration failed ({e}); staying resident"),
+            }
+        }
+        Ok(idx)
     }
 
     /// Switch the index into batched mode (no per-mutation persist).
@@ -329,9 +381,11 @@ impl FtsIndex {
     }
 
     pub fn index_document(&mut self, bucket: &str, key: &str, text: &str) -> Result<()> {
-        // Remove any existing entry for this doc first
+        // Remove any existing entry for this doc first — overlay postings,
+        // and the base version (which cannot be edited) via the dead set.
         let doc_id = make_doc_id(bucket, key);
         self.remove_postings(&doc_id);
+        self.kill_base_doc(bucket, key);
 
         let tokens = tokenize(text);
         let total_terms = tokens.len() as u32;
@@ -340,21 +394,18 @@ impl FtsIndex {
             return Ok(());
         }
 
-        // Count term frequencies and positions
-        let mut term_freq: HashMap<String, (u32, Vec<u32>)> = HashMap::new();
-        for (pos, token) in tokens.iter().enumerate() {
-            let entry = term_freq.entry(token.clone()).or_insert((0, Vec::new()));
-            entry.0 += 1;
-            entry.1.push(pos as u32);
+        // Count term frequencies
+        let mut term_freq: HashMap<String, u32> = HashMap::new();
+        for token in &tokens {
+            *term_freq.entry(token.clone()).or_insert(0) += 1;
         }
 
         // Add postings (keep the distinct-term list for targeted removal)
         let doc_terms: Vec<String> = term_freq.keys().cloned().collect();
-        for (term, (freq, positions)) in term_freq {
+        for (term, freq) in term_freq {
             let posting = Posting {
                 doc_id: doc_id.clone(),
                 frequency: freq,
-                positions,
             };
             self.data.postings.entry(term).or_default().push(posting);
         }
@@ -400,7 +451,8 @@ impl FtsIndex {
     /// re-indexed.
     pub fn bucket_text_size(&self, bucket: &str) -> u64 {
         const ESTIMATED_BYTES_PER_TERM: u64 = 6;
-        self.data
+        let overlay: u64 = self
+            .data
             .docs
             .values()
             .filter(|d| d.bucket == bucket)
@@ -411,12 +463,39 @@ impl FtsIndex {
                     d.total_terms as u64 * ESTIMATED_BYTES_PER_TERM
                 }
             })
-            .sum()
+            .sum();
+        // The doc table is (bucket, key)-sorted, so the bucket is one
+        // contiguous run of it; dead docs are the overlay's problem (their
+        // current size was counted above if re-indexed, nothing if removed).
+        let mut base_sum = 0u64;
+        if let Some(base) = &self.base {
+            base.for_each_bucket_doc(bucket, |ord, _key, dl, bytes| {
+                if !self.dead.contains(&ord) {
+                    base_sum += if bytes > 0 {
+                        bytes
+                    } else {
+                        dl as u64 * ESTIMATED_BYTES_PER_TERM
+                    };
+                }
+            });
+        }
+        overlay + base_sum
+    }
+
+    /// Void the base's copy of `(bucket, key)`, if it has one.
+    fn kill_base_doc(&mut self, bucket: &str, key: &str) {
+        if let Some(base) = &self.base
+            && let Some(ord) = base.find_doc(bucket, key)
+            && self.dead.insert(ord)
+        {
+            self.dead_terms += base.doc_at(ord).2 as u64;
+        }
     }
 
     pub fn remove_document(&mut self, bucket: &str, key: &str) -> Result<()> {
         let doc_id = make_doc_id(bucket, key);
         self.remove_postings(&doc_id);
+        self.kill_base_doc(bucket, key);
         if let Some(removed) = self.data.docs.remove(&doc_id) {
             self.data.total_term_count = self
                 .data
@@ -467,61 +546,113 @@ impl FtsIndex {
 
     pub fn search(&self, bucket: Option<&str>, query: &str, limit: usize) -> Vec<SearchResult> {
         let mut query_terms = tokenize(query);
-        if query_terms.is_empty() || self.data.docs.is_empty() {
+        let base_docs = self.base.as_ref().map_or(0, |b| b.doc_count() as u64);
+        let total_docs = self.data.docs.len() as u64 + base_docs - self.dead.len() as u64;
+        if query_terms.is_empty() || total_docs == 0 {
             return Vec::new();
         }
-        // Rarest term first + a distinct-doc scoring cap — same transient
-        // bound as `CollectionTextIndex::search_capped`, and here each map
-        // entry is costlier still (the key is an owned `"bucket/key"` String).
-        query_terms.sort_by_key(|t| self.data.postings.get(t).map_or(0, Vec::len));
+        // Rarest term first + the distinct-doc scoring cap — see
+        // `CollectionTextIndex::search_capped`. Base df counts dead docs
+        // until the next persist, the same documented approximation.
+        let term_df = |t: &String| -> usize {
+            self.data.postings.get(t).map_or(0, Vec::len)
+                + self
+                    .base
+                    .as_ref()
+                    .and_then(|b| b.postings(t).map(|(_, df)| df as usize))
+                    .unwrap_or(0)
+        };
+        query_terms.sort_by_key(term_df);
         let cap = fts_score_cap();
 
-        let total_docs = self.data.docs.len() as f64;
-        let avgdl = (self.data.total_term_count as f64 / total_docs).max(1.0);
-        let mut scores: HashMap<String, f64> = HashMap::new();
+        let total_term_count = self.data.total_term_count
+            + self.base.as_ref().map_or(0, |b| b.total_term_count())
+            - self.dead_terms;
+        let avgdl = (total_term_count as f64 / total_docs as f64).max(1.0);
+
+        // Scores are keyed by a small integer, never a String: base docs by
+        // their ordinal, overlay docs by base_count + position in a
+        // per-search overlay list. A String key would allocate once per
+        // scored posting — the exact transient this path is trying to bound.
+        let base_count = self.base.as_ref().map_or(0u32, |b| b.doc_count());
+        let overlay_ids: Vec<&String> = self.data.docs.keys().collect();
+        let overlay_slot: HashMap<&str, u32> = overlay_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), base_count + i as u32))
+            .collect();
+        let mut scores: HashMap<u32, f64> = HashMap::new();
 
         for term in &query_terms {
-            if let Some(postings) = self.data.postings.get(term) {
-                let docs_with_term = postings.len() as f64;
-                let idf = bm25_idf(total_docs, docs_with_term);
-
-                for posting in postings {
-                    // Optionally filter by bucket
+            let docs_with_term = term_df(term) as f64;
+            if docs_with_term == 0.0 {
+                continue;
+            }
+            let idf = bm25_idf(total_docs as f64, docs_with_term);
+            let mut score_one = |slot: u32, freq: u32, dl: u32| {
+                let contribution = bm25_score(freq as f64, dl as f64, avgdl, idf);
+                let at_cap = scores.len() >= cap;
+                match scores.entry(slot) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        *e.get_mut() += contribution;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        if !at_cap {
+                            e.insert(contribution);
+                        }
+                    }
+                }
+            };
+            if let Some(base) = &self.base
+                && let Some((iter, _)) = base.postings(term)
+            {
+                for (ord, freq) in iter {
+                    if self.dead.contains(&ord) {
+                        continue;
+                    }
+                    let (doc_bucket, _, dl, _) = base.doc_at(ord);
                     if let Some(b) = bucket
-                        && let Some(doc_info) = self.data.docs.get(&posting.doc_id)
+                        && doc_bucket != b
+                    {
+                        continue;
+                    }
+                    score_one(ord, freq, dl);
+                }
+            }
+            if let Some(postings) = self.data.postings.get(term.as_str()) {
+                for posting in postings {
+                    let Some(doc_info) = self.data.docs.get(&posting.doc_id) else {
+                        continue;
+                    };
+                    if let Some(b) = bucket
                         && doc_info.bucket != b
                     {
                         continue;
                     }
-
-                    if let Some(doc_info) = self.data.docs.get(&posting.doc_id) {
-                        let dl = doc_info.total_terms as f64;
-                        let f = posting.frequency as f64;
-                        let contribution = bm25_score(f, dl, avgdl, idf);
-                        let at_cap = scores.len() >= cap;
-                        match scores.entry(posting.doc_id.clone()) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => {
-                                *e.get_mut() += contribution;
-                            }
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                if !at_cap {
-                                    e.insert(contribution);
-                                }
-                            }
-                        }
-                    }
+                    let slot = overlay_slot[posting.doc_id.as_str()];
+                    score_one(slot, posting.frequency, doc_info.total_terms);
                 }
             }
         }
 
         let mut results: Vec<SearchResult> = scores
             .into_iter()
-            .filter_map(|(doc_id, score)| {
-                self.data.docs.get(&doc_id).map(|info| SearchResult {
-                    bucket: info.bucket.clone(),
-                    key: info.key.clone(),
-                    score,
-                })
+            .filter_map(|(slot, score)| {
+                if slot < base_count {
+                    let (b, k, _, _) = self.base.as_ref().unwrap().doc_at(slot);
+                    Some(SearchResult {
+                        bucket: b.to_string(),
+                        key: k.to_string(),
+                        score,
+                    })
+                } else {
+                    let doc_id = overlay_ids[(slot - base_count) as usize];
+                    self.data.docs.get(doc_id).map(|info| SearchResult {
+                        bucket: info.bucket.clone(),
+                        key: info.key.clone(),
+                        score,
+                    })
+                }
             })
             .collect();
 
@@ -536,19 +667,159 @@ impl FtsIndex {
         results
     }
 
-    fn persist(&self) -> Result<()> {
-        let json = serde_json::to_vec(&self.data)?;
-        // tmp + fsync + atomic rename: this file is rewritten every flush
-        // tick under write load, and the previous truncate-in-place
-        // `fs::write` left a torn index.json when a crash hit mid-write.
-        let tmp = self.index_path.with_extension("json.tmp");
+    /// Fold the overlay + dead set into a fresh `.mtidx` base and free them.
+    /// (The pre-mtidx implementation serialized the WHOLE index to one JSON
+    /// buffer per flush tick — a resident copy plus a 2-3x write transient.)
+    fn persist(&mut self) -> Result<()> {
+        if self.base.is_some()
+            && self.data.docs.is_empty()
+            && self.dead.is_empty()
+            && self.mtidx_path.exists()
         {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&json)?;
-            f.sync_data()?;
+            return Ok(());
         }
-        std::fs::rename(&tmp, &self.index_path)?;
+        let base_docs = self.base.as_ref().map_or(0, |b| b.doc_count() as u64);
+        let doc_count = self.data.docs.len() as u64 + base_docs - self.dead.len() as u64;
+        let total_terms = self.data.total_term_count
+            + self.base.as_ref().map_or(0, |b| b.total_term_count())
+            - self.dead_terms;
+
+        let mut w = crate::mmap_text_index::BtidxWriter::create(
+            &self.mtidx_path,
+            total_terms,
+            doc_count as u32,
+        )?;
+
+        // Doc table merge, (bucket, key) order; ordinals are assigned by
+        // arrival, so record the remapping both layers' postings need.
+        let mut overlay_docs: Vec<(&String, &DocInfo)> = self.data.docs.iter().collect();
+        overlay_docs.sort_unstable_by_key(|(_, d)| (&d.bucket, &d.key));
+        let base_count = self.base.as_ref().map_or(0u32, |b| b.doc_count());
+        const UNMAPPED: u32 = u32::MAX;
+        let mut ord_map: Vec<u32> = vec![UNMAPPED; base_count as usize];
+        let mut overlay_ord: HashMap<&str, u32> = HashMap::new();
+        {
+            let mut ov = overlay_docs.iter().peekable();
+            let mut err: Option<std::io::Error> = None;
+            if let Some(base) = &self.base {
+                for old in 0..base_count {
+                    if err.is_some() {
+                        break;
+                    }
+                    if self.dead.contains(&old) {
+                        continue;
+                    }
+                    let (b, k, dl, bytes) = base.doc_at(old);
+                    while let Some((id, d)) = ov.peek() {
+                        if (d.bucket.as_str(), d.key.as_str()) < (b, k) {
+                            match w.push_doc(&d.bucket, &d.key, d.total_terms, d.text_bytes) {
+                                Ok(ord) => {
+                                    overlay_ord.insert(id.as_str(), ord);
+                                }
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            ov.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if err.is_some() {
+                        break;
+                    }
+                    match w.push_doc(b, k, dl, bytes) {
+                        Ok(ord) => ord_map[old as usize] = ord,
+                        Err(e) => err = Some(e),
+                    }
+                }
+            }
+            if let Some(e) = err {
+                return Err(e.into());
+            }
+            for (id, d) in ov {
+                let ord = w.push_doc(&d.bucket, &d.key, d.total_terms, d.text_bytes)?;
+                overlay_ord.insert(id.as_str(), ord);
+            }
+        }
+
+        // Term merge-join, base file order against the overlay's sorted
+        // vocabulary; per-term postings remap to the new ordinals.
+        let merged = |term: &str,
+                      base_iter: Option<crate::mmap_text_index::BlobPostingsIter<'_>>|
+         -> Vec<(u32, u32)> {
+            let mut out: Vec<(u32, u32)> = Vec::new();
+            if let Some(iter) = base_iter {
+                out.extend(iter.filter_map(|(old, freq)| {
+                    let new = ord_map[old as usize];
+                    (new != UNMAPPED).then_some((new, freq))
+                }));
+            }
+            if let Some(list) = self.data.postings.get(term) {
+                out.extend(list.iter().filter_map(|p| {
+                    overlay_ord
+                        .get(p.doc_id.as_str())
+                        .map(|&o| (o, p.frequency))
+                }));
+            }
+            out.sort_unstable_by_key(|&(ord, _)| ord);
+            out
+        };
+
+        let mut overlay_terms: Vec<&String> = self.data.postings.keys().collect();
+        overlay_terms.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut ov = overlay_terms.iter().peekable();
+        let mut err: Option<std::io::Error> = None;
+        if let Some(base) = &self.base {
+            base.for_each_term(|term, base_iter| {
+                if err.is_some() {
+                    return;
+                }
+                while let Some(o) = ov.peek() {
+                    if o.as_bytes() < term.as_bytes() {
+                        let o = ov.next().unwrap();
+                        let m = merged(o, None);
+                        if !m.is_empty()
+                            && let Err(e) = w.push_term(o, m.into_iter())
+                        {
+                            err = Some(e);
+                            return;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                let in_overlay = ov.peek().is_some_and(|o| o.as_bytes() == term.as_bytes());
+                let m = merged(term, Some(base_iter));
+                if in_overlay {
+                    ov.next();
+                }
+                if !m.is_empty()
+                    && let Err(e) = w.push_term(term, m.into_iter())
+                {
+                    err = Some(e);
+                }
+            });
+        }
+        if let Some(e) = err {
+            return Err(e.into());
+        }
+        for o in ov {
+            let m = merged(o, None);
+            if !m.is_empty() {
+                w.push_term(o, m.into_iter())?;
+            }
+        }
+        w.finish()?;
+
+        // Reopen; REPLACE the overlay (clear keeps bucket capacity).
+        self.base = Some(crate::mmap_text_index::MmapBlobTextIndex::open(
+            &self.mtidx_path,
+        )?);
+        self.data = IndexData::default();
+        self.dead = std::collections::HashSet::new();
+        self.dead_terms = 0;
         Ok(())
     }
 }
@@ -2453,35 +2724,116 @@ startxref
         assert!(snippets.is_empty());
     }
 
+    /// The blob index's disk mode, end to end at the unit layer: build,
+    /// persist, mutate across the persisted base, search with and without a
+    /// bucket filter, quota accounting across both layers, reopen.
     #[test]
-    fn bm25_persistence_backfills_total_term_count_on_load() {
-        // Simulate an old index file that predates the total_term_count
-        // field (serialized with 0 because of #[serde(default)]).
+    fn blob_disk_mode_folds_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
-        {
-            let mut idx = FtsIndex::open(dir.path()).unwrap();
-            idx.index_document("docs", "a.txt", "rust performance database engine")
-                .unwrap();
-            idx.index_document("docs", "b.txt", "go programming language")
-                .unwrap();
+        let mut idx = FtsIndex::open(dir.path()).unwrap();
+        idx.set_batched(true);
+        for i in 1..=20 {
+            let bucket = if i % 2 == 0 { "even" } else { "odd" };
+            idx.index_document(
+                bucket,
+                &format!("f{i}.txt"),
+                &format!(
+                    "ortak metin {} {}",
+                    i,
+                    if i == 7 { "zümrüt" } else { "dolgu" }
+                ),
+            )
+            .unwrap();
         }
+        idx.flush().unwrap();
+        assert!(idx.data.docs.is_empty(), "flush must fold the overlay");
+        assert!(dir.path().join("_fts/index.mtidx").exists());
 
-        // Manually clobber total_term_count in the persisted JSON to 0
-        // to simulate a pre-BM25 index.
-        let path = dir.path().join("_fts").join("index.json");
-        let bytes = std::fs::read(&path).unwrap();
-        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        json["total_term_count"] = serde_json::json!(0u64);
-        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-
-        // Reopening should rebuild the cache from existing doc info.
-        let idx = FtsIndex::open(dir.path()).unwrap();
-        assert!(
-            idx.data.total_term_count > 0,
-            "old index should be backfilled on open"
+        // Search from the base, bucket-filtered and not.
+        assert_eq!(idx.search(None, "ortak", 50).len(), 20);
+        assert_eq!(idx.search(Some("even"), "ortak", 50).len(), 10);
+        let hit = &idx.search(None, "zümrüt", 10);
+        assert_eq!(
+            (hit[0].bucket.as_str(), hit[0].key.as_str()),
+            ("odd", "f7.txt")
         );
+
+        // Mutations across the base: remove one, re-index another.
+        idx.remove_document("odd", "f7.txt").unwrap();
+        idx.index_document("even", "f2.txt", "artık bambaşka içerik")
+            .unwrap();
+        assert!(
+            idx.search(None, "zümrüt", 10).is_empty(),
+            "removed doc answered"
+        );
+        assert_eq!(
+            idx.search(None, "ortak", 50).len(),
+            18,
+            "one removed, one re-indexed away from 'ortak'"
+        );
+        assert_eq!(idx.search(None, "bambaşka", 10).len(), 1);
+
+        // Quota accounting spans base + overlay and skips the dead.
+        let even = idx.bucket_text_size("even");
+        assert!(even > 0);
+        idx.flush().unwrap();
+        assert_eq!(
+            idx.bucket_text_size("even"),
+            even,
+            "folding must not change what a bucket is charged"
+        );
+
+        // Reopen straight from the base.
+        drop(idx);
+        let idx = FtsIndex::open(dir.path()).unwrap();
+        assert_eq!(idx.search(None, "ortak", 50).len(), 18);
+        assert_eq!(idx.search(None, "bambaşka", 10).len(), 1);
+        assert!(idx.search(None, "zümrüt", 10).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_json_index_is_migrated_backfilled_and_still_searchable() {
+        // A hand-written pre-BM25, pre-mtidx index.json: total_term_count
+        // absent (defaults 0 — must be backfilled from the docs at load) and
+        // postings still carrying the long-dead `positions` field (must be
+        // ignored, not refused). Open migrates it to the mmap'd base and
+        // removes the JSON.
+        let dir = tempfile::tempdir().unwrap();
+        let fts_dir = dir.path().join("_fts");
+        std::fs::create_dir_all(&fts_dir).unwrap();
+        let legacy = serde_json::json!({
+            "postings": {
+                "rust": [{"doc_id": "docs\ta.txt", "frequency": 2, "positions": [0, 3]}],
+                "go":   [{"doc_id": "docs\tb.txt", "frequency": 1, "positions": [0]}]
+            },
+            "docs": {
+                "docs\ta.txt": {"bucket": "docs", "key": "a.txt", "total_terms": 4},
+                "docs\tb.txt": {"bucket": "docs", "key": "b.txt", "total_terms": 3}
+            }
+        });
+        let json_path = fts_dir.join("index.json");
+        std::fs::write(&json_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let idx = FtsIndex::open(dir.path()).unwrap();
+        // Migrated: mmap'd base carries the backfilled corpus stats, the
+        // JSON is gone, nothing stays resident.
+        let base = idx.base.as_ref().expect("legacy index migrated to mtidx");
+        assert_eq!(base.doc_count(), 2);
+        assert_eq!(base.total_term_count(), 7, "backfilled from per-doc totals");
+        assert!(
+            !json_path.exists(),
+            "legacy JSON left behind after migration"
+        );
+        assert!(idx.data.docs.is_empty());
+
         let r = idx.search(None, "rust", 10);
         assert_eq!(r.len(), 1);
+        assert_eq!((r[0].bucket.as_str(), r[0].key.as_str()), ("docs", "a.txt"));
         assert!(r[0].score > 0.0);
+
+        // And a REOPEN comes straight from the base file.
+        drop(idx);
+        let idx = FtsIndex::open(dir.path()).unwrap();
+        assert_eq!(idx.search(None, "go", 10).len(), 1);
     }
 }
