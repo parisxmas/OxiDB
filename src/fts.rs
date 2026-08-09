@@ -101,6 +101,32 @@ fn fts_b() -> f64 {
     *CACHED.get_or_init(|| parse_b(std::env::var("OXIDB_FTS_B").ok().as_deref()))
 }
 
+/// Hard ceiling on how many DISTINCT documents one search will score.
+///
+/// Term-at-a-time BM25 accumulates a score entry per document matching any
+/// query term BEFORE `limit` applies, so a common term made a search's
+/// transient proportional to the corpus: measured 25 MB per query at 500k
+/// matches, 51 MB at 1M (`examples/fts_mem_bench.rs`) — multiplied by
+/// concurrent searches, an OOM. The cap bounds that at ~10 MB; terms are
+/// processed rarest-first so what the cap cuts is the tail of the most
+/// common (least informative) term, never the docs matching a rare one.
+/// `OXIDB_FTS_SCORE_CAP` overrides; `0` = unbounded (the old behavior).
+const FTS_SCORE_CAP_DEFAULT: usize = 200_000;
+
+fn fts_score_cap() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("OXIDB_FTS_SCORE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => FTS_SCORE_CAP_DEFAULT,
+        }
+    })
+}
+
 fn fts_stemmer() -> &'static rust_stemmers::Stemmer {
     static CACHED: std::sync::OnceLock<rust_stemmers::Stemmer> = std::sync::OnceLock::new();
     CACHED.get_or_init(|| {
@@ -440,10 +466,15 @@ impl FtsIndex {
     }
 
     pub fn search(&self, bucket: Option<&str>, query: &str, limit: usize) -> Vec<SearchResult> {
-        let query_terms = tokenize(query);
+        let mut query_terms = tokenize(query);
         if query_terms.is_empty() || self.data.docs.is_empty() {
             return Vec::new();
         }
+        // Rarest term first + a distinct-doc scoring cap — same transient
+        // bound as `CollectionTextIndex::search_capped`, and here each map
+        // entry is costlier still (the key is an owned `"bucket/key"` String).
+        query_terms.sort_by_key(|t| self.data.postings.get(t).map_or(0, Vec::len));
+        let cap = fts_score_cap();
 
         let total_docs = self.data.docs.len() as f64;
         let avgdl = (self.data.total_term_count as f64 / total_docs).max(1.0);
@@ -466,8 +497,18 @@ impl FtsIndex {
                     if let Some(doc_info) = self.data.docs.get(&posting.doc_id) {
                         let dl = doc_info.total_terms as f64;
                         let f = posting.frequency as f64;
-                        *scores.entry(posting.doc_id.clone()).or_insert(0.0) +=
-                            bm25_score(f, dl, avgdl, idf);
+                        let contribution = bm25_score(f, dl, avgdl, idf);
+                        let at_cap = scores.len() >= cap;
+                        match scores.entry(posting.doc_id.clone()) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                *e.get_mut() += contribution;
+                            }
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                if !at_cap {
+                                    e.insert(contribution);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -528,12 +569,19 @@ struct DocPosting {
 pub struct CollectionTextIndex {
     fields: Vec<String>,
     /// term → list of postings
-    postings: HashMap<String, Vec<DocPosting>>,
+    postings: HashMap<std::sync::Arc<str>, Vec<DocPosting>>,
     /// doc_id → total indexed terms count
     doc_term_counts: HashMap<DocumentId, u32>,
     /// doc_id → the distinct terms it contributed, so removal touches only
     /// those posting lists instead of sweeping the whole inverted index.
-    doc_terms: HashMap<DocumentId, Vec<String>>,
+    ///
+    /// The terms are `Arc<str>` SHARED with the postings keys, not owned
+    /// `String`s: a copy per document was, measured, **55% of the whole
+    /// index** — 558 MB of a 1 GB index at 1M documents
+    /// (`examples/fts_mem_bench.rs`) — to store a vocabulary the postings map
+    /// already holds. Interning keeps removal O(doc terms) at 8 bytes per
+    /// doc-term instead of a String.
+    doc_terms: HashMap<DocumentId, Vec<std::sync::Arc<str>>>,
     /// Sum of all per-doc term counts; cached for BM25 avgdl.
     total_term_count: u64,
 }
@@ -597,10 +645,17 @@ impl CollectionTextIndex {
             *term_freq.entry(token.clone()).or_insert(0) += 1;
         }
 
-        // Add postings (keep the distinct-term list for targeted removal)
-        let terms: Vec<String> = term_freq.keys().cloned().collect();
+        // Add postings, interning each term: the doc_terms list shares the
+        // postings map's own key so the string exists once per vocabulary
+        // entry, not once per (document × term).
+        let mut terms: Vec<std::sync::Arc<str>> = Vec::with_capacity(term_freq.len());
         for (term, freq) in term_freq {
-            self.postings.entry(term).or_default().push(DocPosting {
+            let key: std::sync::Arc<str> = match self.postings.get_key_value(term.as_str()) {
+                Some((k, _)) => std::sync::Arc::clone(k),
+                None => std::sync::Arc::from(term.as_str()),
+            };
+            terms.push(std::sync::Arc::clone(&key));
+            self.postings.entry(key).or_default().push(DocPosting {
                 doc_id,
                 frequency: freq,
             });
@@ -623,10 +678,10 @@ impl CollectionTextIndex {
                 // Targeted: only the doc's own posting lists — O(doc terms)
                 // instead of a sweep over the whole inverted index.
                 for term in &terms {
-                    if let Some(postings) = self.postings.get_mut(term) {
+                    if let Some(postings) = self.postings.get_mut(&**term) {
                         postings.retain(|p| p.doc_id != doc_id);
                         if postings.is_empty() {
-                            self.postings.remove(term);
+                            self.postings.remove(&**term);
                         }
                     }
                 }
@@ -650,17 +705,29 @@ impl CollectionTextIndex {
 
     /// Search the index. Returns doc_ids with BM25 scores, sorted by score descending.
     pub fn search(&self, query: &str, limit: usize) -> Vec<DocSearchResult> {
-        let query_terms = tokenize(query);
+        self.search_capped(query, limit, fts_score_cap())
+    }
+
+    /// [`search`](Self::search) with an explicit distinct-doc scoring cap —
+    /// see [`fts_score_cap`] for why the cap exists. Split out so tests can
+    /// exercise the cap without the process-global env knob.
+    fn search_capped(&self, query: &str, limit: usize, cap: usize) -> Vec<DocSearchResult> {
+        let mut query_terms = tokenize(query);
         if query_terms.is_empty() || self.doc_term_counts.is_empty() {
             return Vec::new();
         }
+        // Rarest term first. With the cap in play the ORDER is the guarantee:
+        // every document matching a rare (high-idf, informative) term is
+        // scored before the commonest term can fill the budget, so what the
+        // cap cuts is the tail of the least informative posting list.
+        query_terms.sort_by_key(|t| self.postings.get(t.as_str()).map_or(0, Vec::len));
 
         let total_docs = self.doc_term_counts.len() as f64;
         let avgdl = (self.total_term_count as f64 / total_docs).max(1.0);
         let mut scores: HashMap<DocumentId, f64> = HashMap::new();
 
         for term in &query_terms {
-            if let Some(postings) = self.postings.get(term) {
+            if let Some(postings) = self.postings.get(term.as_str()) {
                 let docs_with_term = postings.len() as f64;
                 let idf = bm25_idf(total_docs, docs_with_term);
 
@@ -668,8 +735,21 @@ impl CollectionTextIndex {
                     if let Some(&total_terms) = self.doc_term_counts.get(&posting.doc_id) {
                         let dl = total_terms as f64;
                         let f = posting.frequency as f64;
-                        *scores.entry(posting.doc_id).or_insert(0.0) +=
-                            bm25_score(f, dl, avgdl, idf);
+                        let contribution = bm25_score(f, dl, avgdl, idf);
+                        // At the cap, documents already scored keep
+                        // accumulating (their ranking stays exact); new ones
+                        // are not admitted.
+                        let at_cap = scores.len() >= cap;
+                        match scores.entry(posting.doc_id) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                *e.get_mut() += contribution;
+                            }
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                if !at_cap {
+                                    e.insert(contribution);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -693,6 +773,10 @@ impl CollectionTextIndex {
     pub fn clear(&mut self) {
         self.postings.clear();
         self.doc_term_counts.clear();
+        // Pre-existing leak: `clear` (the compaction rebuild) left every
+        // doc's term list resident while the postings it referred to were
+        // gone.
+        self.doc_terms.clear();
         self.total_term_count = 0;
     }
 }
@@ -1543,6 +1627,78 @@ startxref
         }
         let results = idx.search("databases", 3);
         assert_eq!(results.len(), 3);
+    }
+
+    /// The scoring cap must never cost a document that matches a RARE query
+    /// term its place in the results. The fixture is adversarial on purpose:
+    /// the rare document is indexed LAST, so its postings sit at the tail of
+    /// the common term's list — a search that processed terms in query order
+    /// (or didn't order them at all) fills the cap with common-term docs and
+    /// never scores it. Rarest-first processing is what this pins.
+    #[test]
+    fn the_scoring_cap_cannot_evict_a_rare_term_match() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        // 40 docs with only the common term...
+        for i in 1..=40 {
+            idx.index_doc(i, &serde_json::json!({"text": format!("ortak konu {i}")}));
+        }
+        // ...then the one doc that also matches the rare term, indexed last.
+        idx.index_doc(41, &serde_json::json!({"text": "ortak konu zümrütlü"}));
+
+        // Cap far below the common term's match count.
+        let results = idx.search_capped("ortak zümrütlü", 10, 5);
+        assert!(
+            results.iter().any(|r| r.doc_id == 41),
+            "the rare-term document was cut by the cap: {:?}",
+            results.iter().map(|r| r.doc_id).collect::<Vec<_>>()
+        );
+        // And it ranks first — it matched both terms, one of them rare.
+        assert_eq!(results[0].doc_id, 41);
+    }
+
+    /// At the cap, a common-term-only search still answers — degraded to the
+    /// capped candidate set, never empty. This is why the cap is not a term
+    /// SKIP: dropping common terms would make a query made only of them
+    /// return nothing.
+    #[test]
+    fn a_common_only_search_at_the_cap_still_answers() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        for i in 1..=40 {
+            idx.index_doc(i, &serde_json::json!({"text": format!("ortak konu {i}")}));
+        }
+        let results = idx.search_capped("ortak", 10, 5);
+        assert_eq!(
+            results.len(),
+            5,
+            "cap bounds candidates, limit bounds output"
+        );
+        let results = idx.search_capped("ortak", 3, 5);
+        assert_eq!(results.len(), 3);
+    }
+
+    /// Documents scored before the cap was reached keep ACCUMULATING from
+    /// later terms — the cap gates admission, not addition. Otherwise a
+    /// two-term match inside the cap would rank as a one-term match.
+    #[test]
+    fn a_doc_admitted_before_the_cap_still_accumulates_later_terms() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "zümrütlü ortak"}));
+        for i in 2..=20 {
+            idx.index_doc(i, &serde_json::json!({"text": format!("ortak konu {i}")}));
+        }
+        // Cap of 1: only doc 1 (rare term processed first) is admitted; its
+        // "ortak" contribution must still land on top.
+        let capped = idx.search_capped("zümrütlü ortak", 10, 1);
+        assert_eq!(capped.len(), 1);
+        let uncapped = idx.search_capped("zümrütlü ortak", 10, usize::MAX);
+        let uncapped_doc1 = uncapped.iter().find(|r| r.doc_id == 1).unwrap();
+        assert!(
+            (capped[0].score - uncapped_doc1.score).abs() < 1e-9,
+            "capped score {} != uncapped score {} — the second term's \
+             contribution was dropped for an admitted doc",
+            capped[0].score,
+            uncapped_doc1.score
+        );
     }
 
     #[test]
