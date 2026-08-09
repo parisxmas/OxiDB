@@ -1,6 +1,6 @@
 # ADR-0025: Fourth engine — a co-occurrence recommendation engine crate (`oxidb-rec`)
 
-**Status:** Proposed — 2026-08-09
+**Status:** Accepted (v1 implemented, phases 1–5) — 2026-08-09
 **Branch:** `feat/rec-engine-crate`
 **Supersedes:** —
 **Related:** [ADR-0010](0010-sql-engine-crate.md) (the second-engine pattern this
@@ -309,6 +309,32 @@ packing and no line protocol to write. The PostgREST surface
 Phase 5 is not optional garnish. The claim this engine makes is that scoring
 choice changes the lists visibly, and that claim should be demonstrated on real
 orders before the default is fixed in a release.
+
+### Phase 5 results (UCI Online Retail, 541k order lines, 2010–2011)
+
+Run via `oxidb-rec/examples/scoring_validation.rs` (the dataset is fetched, not
+committed). Findings, with top-10 overlap against LLR as the number:
+
+- **Count vs LLR: visibly different, worst where it matters.** Overlap ranges
+  10/10 (lunch bags — a family so tight every mode agrees) down to **2/10 on a
+  rare probe**, where count's top item is the shop's global bestseller at a
+  co-occurrence of 2 — the base-rate contamination §4 predicts, in the flesh.
+  On the mid-popularity cakestand probe, 5/10: count's list admits bestsellers
+  the LLR list correctly omits.
+- **Cosine vs LLR: converges on head items (9–10/10), diverges exactly where
+  §4 predicts.** For a probe in only 5 baskets, cosine's podium is a
+  three-way 0.41 tie of perfectly-exclusive one-off pairings, while LLR ranks
+  the evidenced items first — including the probe's sister product (the other
+  bookcover tape) and demoting the coincidences. Cosine also *excludes* LLR's
+  top item because its larger margin dilutes the cosine denominator: the
+  exclusivity bias, observed.
+- **LLR's lists read right on inspection**: the Regency cakestand pulls the
+  Regency teacups/teapot/sugar-bowl family; the red lunch bag pulls the other
+  lunch bags; the tape pulls the other tape.
+
+The LLR default stands validated; the claim survives contact with real
+orders, with one calibration: cosine's failure needs a small-margin probe to
+manifest, so a head-only evaluation would wrongly conclude the modes agree.
 
 ## Consequences
 
