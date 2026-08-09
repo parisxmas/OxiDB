@@ -54,3 +54,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0022](0022-oxibase-dedicated-isolation.md) | Dedicated tenant isolation for OxiBase (one process per project) | Proposed |
 | [0023](0023-postgres-wire-protocol.md) | PostgreSQL wire protocol as a separate listener (psql, psycopg) | Accepted (v1) |
 | [0024](0024-mcp-server.md) | MCP server (`oxidb-mcp`) — a Model Context Protocol front end as a standalone client binary | Accepted (v1) |
+| [0025](0025-recommendation-engine-crate.md) | Co-occurrence recommendation engine crate (`oxidb-rec`) mounted as a fourth engine | Proposed |
