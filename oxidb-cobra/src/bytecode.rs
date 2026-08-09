@@ -213,9 +213,13 @@ pub enum Op {
     EndFinally, Import, Halt, Await, LocalConstBin, SuperCall, FromImport,
     Str, Destructure, GetLocalBox, SetLocalBox, GetLocalCell, GetFreeCell,
     LocalBoxConstBin,
+    // 0.13 "faster VM" fusions (52..=62) — peephole compositions of the ops
+    // above; discriminants continue the Go iota block exactly.
+    GetLocalProp, SetLocalProp, LocalLocalBin, IndexLL, JumpNotLL, JumpNotLC,
+    LLBinStore, LCBinStore, ConstBin, ConstBinRev, BinStoreL,
 }
 
-pub const OP_COUNT: u8 = Op::LocalBoxConstBin as u8 + 1;
+pub const OP_COUNT: u8 = Op::BinStoreL as u8 + 1;
 
 impl Op {
     pub fn from_byte(b: u8) -> Option<Op> {
@@ -244,6 +248,15 @@ impl Op {
             FromImport => &[2, 2],
             LocalConstBin | LocalBoxConstBin => &[1, 2, 1],
             Struct => &[2, 1, 1, 1, 1],
+            GetLocalProp | SetLocalProp => &[1, 2],
+            LocalLocalBin => &[1, 1, 1],
+            IndexLL => &[1, 1],
+            JumpNotLL => &[1, 1, 1, 2],
+            JumpNotLC => &[1, 2, 1, 2],
+            LLBinStore => &[1, 1, 1, 1],
+            LCBinStore => &[1, 1, 2, 1],
+            ConstBin | ConstBinRev => &[2, 1],
+            BinStoreL => &[1, 1],
         }
     }
 
@@ -302,6 +315,17 @@ impl Op {
             GetLocalCell => "OpGetLocalCell",
             GetFreeCell => "OpGetFreeCell",
             LocalBoxConstBin => "OpLocalBoxConstBin",
+            GetLocalProp => "OpGetLocalProp",
+            SetLocalProp => "OpSetLocalProp",
+            LocalLocalBin => "OpLocalLocalBin",
+            IndexLL => "OpIndexLL",
+            JumpNotLL => "OpJumpNotLL",
+            JumpNotLC => "OpJumpNotLC",
+            LLBinStore => "OpLLBinStore",
+            LCBinStore => "OpLCBinStore",
+            ConstBin => "OpConstBin",
+            ConstBinRev => "OpConstBinRev",
+            BinStoreL => "OpBinStoreL",
         }
     }
 }
@@ -349,7 +373,6 @@ mod tests {
         assert_eq!(b.global_names, vec!["x"]);
     }
 
-    #[test]
     /// Format v2 (compiler 0.13+) appends an exported-names section; the VM
     /// reads it to keep the trailing-bytes check exact and discards it.
     /// Found the hard way: `cobra build --portable` moved to v2 and every

@@ -206,6 +206,12 @@ impl Vm {
         }
     }
 
+    /// Like [`push_checked`](Self::push_checked) but hands the value back —
+    /// for fused ops that consume it (a jump condition, a store).
+    fn checked(&mut self, r: Result<Value, NativeError>) -> Result<Value, VmError> {
+        r.map_err(|e| self.wrap_native(e))
+    }
+
     /// Current source line via the executing function's line table.
     fn cur_line(&self) -> u32 {
         let f = self.frames.last().expect("at least main frame");
@@ -959,6 +965,200 @@ impl Vm {
                     self.push_checked(result)?;
                 }
 
+                // ─── 0.13 fusions — each mirrors its Go vm.go arm exactly ──
+                Op::GetLocalProp => {
+                    let local_idx = u8_operand!();
+                    let name_idx = u16_operand!();
+                    let Value::Str(name) = &self.constants[name_idx] else {
+                        return Err(VmError::Fatal(
+                            "property name constant is not a string".into(),
+                        ));
+                    };
+                    let name = Rc::clone(name);
+                    let receiver = local_value(&self.stack[bp + local_idx]);
+                    if let Value::Instance(inst) = &receiver {
+                        let field = inst.borrow().get_field(&name);
+                        if let Some(v) = field {
+                            self.push(v)?;
+                            continue;
+                        }
+                    }
+                    self.sync_ip(ip);
+                    let result = methods::get_property(self, &receiver, &name);
+                    self.push_checked(result)?;
+                }
+
+                Op::SetLocalProp => {
+                    let local_idx = u8_operand!();
+                    let name_idx = u16_operand!();
+                    let Value::Str(name) = &self.constants[name_idx] else {
+                        return Err(VmError::Fatal(
+                            "property name constant is not a string".into(),
+                        ));
+                    };
+                    let name = Rc::clone(name);
+                    let receiver = local_value(&self.stack[bp + local_idx]);
+                    let value = self.pop();
+                    if let Value::Instance(inst) = &receiver
+                        && inst.borrow_mut().set_field_if_exists(&name, value.clone())
+                    {
+                        self.push(value)?;
+                        continue;
+                    }
+                    self.sync_ip(ip);
+                    let result = methods::set_property(self, &receiver, &name, value);
+                    self.push_checked(result)?;
+                }
+
+                Op::LocalLocalBin => {
+                    let l_idx = u8_operand!();
+                    let r_idx = u8_operand!();
+                    let op_idx = u8_operand!();
+                    let left = local_value(&self.stack[bp + l_idx]);
+                    let right = local_value(&self.stack[bp + r_idx]);
+                    if let (Value::Int(l), Value::Int(r)) = (&left, &right)
+                        && let Some(res) = fast_int_op(op_idx, *l, *r)
+                    {
+                        self.push(res)?;
+                        continue;
+                    }
+                    self.sync_ip(ip);
+                    let result = ops::binary_op(BINARY_OPS[op_idx], &left, &right);
+                    self.push_checked(result)?;
+                }
+
+                Op::IndexLL => {
+                    let l_idx = u8_operand!();
+                    let i_idx = u8_operand!();
+                    let left = local_value(&self.stack[bp + l_idx]);
+                    let index = local_value(&self.stack[bp + i_idx]);
+                    match &left {
+                        Value::List(l) => {
+                            if let Value::Int(i) = index {
+                                let l = l.borrow();
+                                let mut idx = i;
+                                if idx < 0 {
+                                    idx += l.len() as i64;
+                                }
+                                if idx >= 0 && (idx as usize) < l.len() {
+                                    let v = l[idx as usize].clone();
+                                    drop(l);
+                                    self.push(v)?;
+                                    continue;
+                                }
+                            }
+                        }
+                        Value::Dict(d) => {
+                            if let Some(hk) = hash_key(&index) {
+                                let hit = d.borrow().get(&hk).map(|(_, v)| v.clone());
+                                if let Some(v) = hit {
+                                    self.push(v)?;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.sync_ip(ip);
+                    let result = ops::index_get(&left, &index);
+                    self.push_checked(result)?;
+                }
+
+                Op::JumpNotLL | Op::JumpNotLC => {
+                    let a = u8_operand!();
+                    let (left, right, op_idx, pos);
+                    if op == Op::JumpNotLL {
+                        let b = u8_operand!();
+                        op_idx = u8_operand!();
+                        pos = u16_operand!();
+                        left = local_value(&self.stack[bp + a]);
+                        right = local_value(&self.stack[bp + b]);
+                    } else {
+                        let const_idx = u16_operand!();
+                        op_idx = u8_operand!();
+                        pos = u16_operand!();
+                        left = local_value(&self.stack[bp + a]);
+                        right = self.constants[const_idx].clone();
+                    }
+                    if let (Value::Int(l), Value::Int(r)) = (&left, &right) {
+                        if !int_cmp(op_idx, *l, *r) {
+                            ip = pos as i64 - 1;
+                        }
+                        continue;
+                    }
+                    self.sync_ip(ip);
+                    let result = ops::binary_op(BINARY_OPS[op_idx], &left, &right);
+                    let v = self.checked(result)?;
+                    if !truthy(&v) {
+                        ip = pos as i64 - 1;
+                    }
+                }
+
+                Op::LLBinStore | Op::LCBinStore => {
+                    let dst = u8_operand!();
+                    let a = u8_operand!();
+                    let (left, right, op_idx);
+                    if op == Op::LLBinStore {
+                        let b = u8_operand!();
+                        op_idx = u8_operand!();
+                        left = local_value(&self.stack[bp + a]);
+                        right = local_value(&self.stack[bp + b]);
+                    } else {
+                        let const_idx = u16_operand!();
+                        op_idx = u8_operand!();
+                        left = local_value(&self.stack[bp + a]);
+                        right = self.constants[const_idx].clone();
+                    }
+                    let res = if let (Value::Int(l), Value::Int(r)) = (&left, &right)
+                        && let Some(res) = fast_int_op(op_idx, *l, *r)
+                    {
+                        res
+                    } else {
+                        self.sync_ip(ip);
+                        let result = ops::binary_op(BINARY_OPS[op_idx], &left, &right);
+                        self.checked(result)?
+                    };
+                    store_local(&mut self.stack[bp + dst], res);
+                }
+
+                Op::ConstBin | Op::ConstBinRev => {
+                    let const_idx = u16_operand!();
+                    let op_idx = u8_operand!();
+                    let konst = self.constants[const_idx].clone();
+                    let tos = self.pop();
+                    let (left, right) = if op == Op::ConstBin {
+                        (tos, konst)
+                    } else {
+                        (konst, tos)
+                    };
+                    if let (Value::Int(l), Value::Int(r)) = (&left, &right)
+                        && let Some(res) = fast_int_op(op_idx, *l, *r)
+                    {
+                        self.push(res)?;
+                        continue;
+                    }
+                    self.sync_ip(ip);
+                    let result = ops::binary_op(BINARY_OPS[op_idx], &left, &right);
+                    self.push_checked(result)?;
+                }
+
+                Op::BinStoreL => {
+                    let dst = u8_operand!();
+                    let op_idx = u8_operand!();
+                    let right = self.pop();
+                    let left = self.pop();
+                    let res = if let (Value::Int(l), Value::Int(r)) = (&left, &right)
+                        && let Some(res) = fast_int_op(op_idx, *l, *r)
+                    {
+                        res
+                    } else {
+                        self.sync_ip(ip);
+                        let result = ops::binary_op(BINARY_OPS[op_idx], &left, &right);
+                        self.checked(result)?
+                    };
+                    store_local(&mut self.stack[bp + dst], res);
+                }
+
                 Op::Halt => {
                     self.sync_ip(ip);
                     return Ok(());
@@ -1305,6 +1505,42 @@ fn finish_construction(v: &Value) {
 
 /// Integer-integer binary op without generic dispatch; div/mod by zero
 /// report None so the slow path produces the proper error.
+/// Unwrap the Cell of a boxed (captured) local; plain locals pass through —
+/// the fused opcodes read locals this way, exactly as Go's `localValue`.
+fn local_value(v: &Value) -> Value {
+    if let Value::Cell(cell) = v {
+        cell.borrow().clone()
+    } else {
+        v.clone()
+    }
+}
+
+/// Write a local slot, writing THROUGH the Cell of a boxed local — the
+/// store-fused opcodes' contract (Go `storeLocal`): a store fusion only runs
+/// after the slot was initialized, so a Cell there is never stack garbage.
+fn store_local(slot: &mut Value, v: Value) {
+    if let Value::Cell(cell) = slot {
+        *cell.borrow_mut() = v;
+    } else {
+        *slot = v;
+    }
+}
+
+/// Integer comparison by BinaryOps index (5..=10) — the jump fusions' fast
+/// path. Non-comparison indices never reach it (the compiler only fuses
+/// comparisons into jumps).
+fn int_cmp(op_idx: usize, l: i64, r: i64) -> bool {
+    match op_idx {
+        5 => l == r,
+        6 => l != r,
+        7 => l < r,
+        8 => l > r,
+        9 => l <= r,
+        10 => l >= r,
+        _ => false,
+    }
+}
+
 fn fast_int_op(op_idx: usize, l: i64, r: i64) -> Option<Value> {
     Some(match op_idx {
         0 => Value::Int(l.wrapping_add(r)),

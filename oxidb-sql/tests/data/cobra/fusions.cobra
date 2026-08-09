@@ -1,0 +1,40 @@
+# CREATE PROCEDURE fusions() LANGUAGE COBRA
+# Exercises every 0.13 fused opcode (52..62): the Rust VM learned them after
+# the Go compiler started emitting them, and this fixture is the proof they
+# EXECUTE correctly — the companion test also asserts they are PRESENT in the
+# compiled bytecode, so an unfused recompilation cannot pass it vacuously.
+struct Box
+    def init(v)
+        self.v = v
+    end
+end
+
+def run(db)
+    let a = 7
+    let b = 5
+    let sum = a + b              # OpLocalLocalBin (or LLBinStore)
+    let list = [10, 20, 30, 40]
+    let i = 0
+    let total = 0
+    while i < 4                  # OpJumpNotLC
+        total = total + list[i]  # OpIndexLL feeding an accumulate
+        i = i + 1                # OpLCBinStore
+    end
+    let n = 4
+    let j = 0
+    let count = 0
+    while j < n                  # OpJumpNotLL
+        count = count + 2
+        j = j + 1
+    end
+    let scaled = total * 2       # const on the right: OpConstBin family
+    let inv = 100 - total        # const on the left:  OpConstBinRev family
+    let box = Box(sum)
+    let held = box.v             # OpGetLocalProp
+    box.v = held + 1             # OpSetLocalProp
+    let acc = a * b + sum        # OpBinStoreL tail
+    return {
+        "sum": sum, "total": total, "count": count,
+        "scaled": scaled, "inv": inv, "boxv": box.v, "acc": acc
+    }
+end

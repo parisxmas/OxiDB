@@ -405,3 +405,66 @@ fn an_extension_error_names_its_method() {
     let err = db.execute("CALL rec_related('x')").unwrap_err();
     assert!(format!("{err}").contains("OXIDB_REC"), "{err}");
 }
+
+// ─── 0.13 fused opcodes (compiler ahead of the VM) ───────────────────────
+
+/// The 0.13 compiler emits fused opcodes (52..=62) the VM did not know —
+/// container format v2 decoded fine and execution then died on the first
+/// fusion. This fixture provokes them and checks the arithmetic; the
+/// bytecode assertion below is the vacuity guard: if a future compiler
+/// stops fusing (or the fixture is recompiled unfused), the execution test
+/// alone would pass without testing anything.
+#[test]
+fn fused_opcodes_execute_correctly() {
+    let (_d, db) = open();
+    create_cobra(&db, "fusions()", "fusions");
+    let (cols, rws) = cols_rows(&db, "CALL fusions()");
+    let get = |name: &str| {
+        let at = cols.iter().position(|c| c == name).unwrap();
+        rws[0][at].clone()
+    };
+    assert_eq!(get("sum"), i(12));
+    assert_eq!(get("total"), i(100));
+    assert_eq!(get("count"), i(8));
+    assert_eq!(get("scaled"), i(200));
+    assert_eq!(get("inv"), i(0));
+    assert_eq!(get("boxv"), i(13));
+    assert_eq!(get("acc"), i(47));
+}
+
+/// The vacuity guard: the compiled fixture must actually CONTAIN fused
+/// opcodes, across the whole constant pool (functions live there).
+#[test]
+fn the_fusion_fixture_really_contains_fusions() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/cobra/fusions.cobrac");
+    let bytes = std::fs::read(&path).unwrap();
+    let bc = oxidb_cobra::bytecode::decode(&bytes).unwrap();
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut scan = |ins: &[u8]| {
+        let mut ip = 0usize;
+        while ip < ins.len() {
+            let op = oxidb_cobra::bytecode::Op::from_byte(ins[ip]).unwrap_or_else(|| {
+                panic!(
+                    "unknown opcode {} at {ip} — VM behind the compiler AGAIN",
+                    ins[ip]
+                )
+            });
+            if (op as u8) >= 52 {
+                seen.insert(op.name());
+            }
+            ip += 1 + op.operand_widths().iter().sum::<usize>();
+        }
+    };
+    scan(&bc.instructions);
+    for c in &bc.constants {
+        if let oxidb_cobra::bytecode::Constant::Func(f) = c {
+            scan(&f.instructions);
+        }
+    }
+    assert!(
+        seen.len() >= 5,
+        "expected a spread of fused opcodes in the fixture, found only: {seen:?}"
+    );
+}
