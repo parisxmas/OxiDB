@@ -16,6 +16,10 @@ COPY oxidb-embedded-ffi/ oxidb-embedded-ffi/
 COPY oxidb-cli/ oxidb-cli/
 COPY oxipool/ oxipool/
 COPY oxidb-agg-merge/ oxidb-agg-merge/
+COPY oxidb-sql/ oxidb-sql/
+COPY oxidb-cobra/ oxidb-cobra/
+COPY oxidb-tsdb/ oxidb-tsdb/
+COPY oxidb-http/ oxidb-http/
 
 # Create stubs for workspace members not needed for server build
 RUN mkdir -p oxidb-app/src-tauri/src && \
@@ -26,7 +30,16 @@ RUN mkdir -p oxidb-app/src-tauri/src && \
     echo '' > oxidb-wasm/src/lib.rs && \
     mkdir -p oxidb-tail/src && \
     echo '[package]\nname = "oxidb-tail"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-tail/Cargo.toml && \
-    echo 'fn main() {}' > oxidb-tail/src/main.rs
+    echo 'fn main() {}' > oxidb-tail/src/main.rs && \
+    mkdir -p oxidb-client/src && \
+    echo '[package]\nname = "oxidb-client"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-client/Cargo.toml && \
+    echo '' > oxidb-client/src/lib.rs && \
+    mkdir -p oxidb-mcp/src && \
+    echo '[package]\nname = "oxidb-mcp"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-mcp/Cargo.toml && \
+    echo '' > oxidb-mcp/src/lib.rs && \
+    mkdir -p oxibase/src && \
+    echo '[package]\nname = "oxibase"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxibase/Cargo.toml && \
+    echo 'fn main() {}' > oxibase/src/main.rs
 
 RUN cargo build --release --package oxidb-server --features cluster,ocr
 
