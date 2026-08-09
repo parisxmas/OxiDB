@@ -10,6 +10,7 @@ fn engine() -> Rec {
     Rec::new(RecConfig {
         bucket_secs: 30 * DAY,
         max_basket: 50,
+        ..RecConfig::default()
     })
 }
 
@@ -119,6 +120,7 @@ fn oversized_baskets_are_skipped_and_reported() {
     let mut rec = Rec::new(RecConfig {
         bucket_secs: 30 * DAY,
         max_basket: 3,
+        ..RecConfig::default()
     });
     let big: Vec<String> = (0..10).map(|i| format!("i{i}")).collect();
     let refs: Vec<&str> = big.iter().map(String::as_str).collect();

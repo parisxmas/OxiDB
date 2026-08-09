@@ -16,6 +16,7 @@
 //! bridge is Phase 3.
 
 mod model;
+mod persist;
 mod store;
 
 pub use model::{BUCKETS, DEFAULT_BUCKET_SECS, DEFAULT_MAX_BASKET, ModelStats, Scoring};
@@ -46,10 +47,15 @@ pub type Result<T> = std::result::Result<T, RecError>;
 /// Engine configuration, fixed at open.
 #[derive(Clone, Debug)]
 pub struct RecConfig {
-    /// Bucket width in seconds; the window is `BUCKETS ×` this.
+    /// Bucket width in seconds; the window is `BUCKETS ×` this. Persisted in
+    /// the snapshot and validated at open — reopening under a different
+    /// width would silently re-interpret every counter's period.
     pub bucket_secs: u64,
     /// Baskets larger than this are skipped (counted in stats).
     pub max_basket: usize,
+    /// Auto-checkpoint once the WAL passes this many bytes (`0` = manual
+    /// only). Bounds recovery replay, like TSDB's 8 MiB default.
+    pub checkpoint_bytes: u64,
 }
 
 impl Default for RecConfig {
@@ -57,6 +63,7 @@ impl Default for RecConfig {
         Self {
             bucket_secs: DEFAULT_BUCKET_SECS,
             max_basket: DEFAULT_MAX_BASKET,
+            checkpoint_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -76,15 +83,77 @@ pub struct Rec {
     config: RecConfig,
     interner: Interner,
     store: Store,
+    /// `None` = ephemeral (tests, embedding without a data dir).
+    persist: Option<persist::Persist>,
 }
 
 impl Rec {
+    /// An ephemeral engine — nothing touches disk.
     pub fn new(config: RecConfig) -> Self {
         Self {
             config,
             interner: Interner::default(),
             store: Store::default(),
+            persist: None,
         }
+    }
+
+    /// Open (or create) a persistent engine at `dir`: load the authoritative
+    /// generation's snapshot, then replay its WAL through the normal ingest
+    /// path — replay IS ingestion, and the snapshotted seen-set makes
+    /// re-applying already-folded records a no-op.
+    pub fn open(dir: &std::path::Path, config: RecConfig) -> std::io::Result<Self> {
+        let (p, snapshot, records) = persist::Persist::open(dir)?;
+        let mut rec = match snapshot {
+            Some(s) => {
+                if s.bucket_secs != config.bucket_secs {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "bucket_secs mismatch: snapshot has {}, config wants {} —                              periods would be silently re-interpreted",
+                            s.bucket_secs, config.bucket_secs
+                        ),
+                    ));
+                }
+                Self {
+                    config,
+                    interner: s.interner,
+                    store: s.store,
+                    persist: Some(p),
+                }
+            }
+            None => Self {
+                config,
+                interner: Interner::default(),
+                store: Store::default(),
+                persist: Some(p),
+            },
+        };
+        for r in records {
+            let items: Vec<&str> = r.items.iter().map(String::as_str).collect();
+            rec.apply(&r.model, r.basket_id, &items, r.ts_secs);
+        }
+        Ok(rec)
+    }
+
+    /// Fold the WAL into a fresh generation snapshot; also runs the lazy
+    /// shift's GC first so fully-expired rows never reach the file.
+    pub fn checkpoint(&mut self, ts_secs: u64) -> std::io::Result<()> {
+        self.gc(ts_secs);
+        let Some(p) = &mut self.persist else {
+            return Ok(());
+        };
+        let snap = persist::Snapshot {
+            bucket_secs: self.config.bucket_secs,
+            interner: std::mem::take(&mut self.interner),
+            store: std::mem::take(&mut self.store),
+        };
+        let res = p.checkpoint(&snap);
+        // Moved out only to serialize without a clone; always restored —
+        // including on error.
+        self.interner = snap.interner;
+        self.store = snap.store;
+        res.map(|_| ())
     }
 
     fn period(&self, ts_secs: u64) -> u32 {
@@ -96,6 +165,30 @@ impl Rec {
     /// basket over the size cap is skipped and counted, never silently
     /// dropped. Returns whether the basket was counted.
     pub fn track(&mut self, model: &str, basket_id: u64, items: &[&str], ts_secs: u64) -> bool {
+        let counted = self.apply(model, basket_id, items, ts_secs);
+        if counted && let Some(p) = &mut self.persist {
+            let rec = persist::WalRecord {
+                model: model.to_string(),
+                basket_id,
+                items: items.iter().map(|s| s.to_string()).collect(),
+                ts_secs,
+            };
+            if let Err(e) = p.append(&rec) {
+                eprintln!("[rec] WAL append failed: {e}");
+            }
+            if self.config.checkpoint_bytes > 0
+                && p.wal_bytes >= self.config.checkpoint_bytes
+                && let Err(e) = self.checkpoint(ts_secs)
+            {
+                eprintln!("[rec] auto-checkpoint failed: {e}");
+            }
+        }
+        counted
+    }
+
+    /// The pure ingest — counters only, no WAL. Recovery replays through
+    /// this so a replayed record is never re-appended.
+    fn apply(&mut self, model: &str, basket_id: u64, items: &[&str], ts_secs: u64) -> bool {
         let now = self.period(ts_secs);
         // Dedup BEFORE the size cap: variants of one item are one occurrence,
         // and a 60-line order of 40 distinct items is within the cap.
@@ -178,6 +271,8 @@ impl Rec {
             "catalogue_items": self.interner.len(),
             "bucket_secs": self.config.bucket_secs,
             "buckets": BUCKETS,
+            "generation": self.persist.as_ref().map(|p| p.generation()),
+            "wal_bytes": self.persist.as_ref().map(|p| p.wal_bytes),
             "models": models,
         })
     }

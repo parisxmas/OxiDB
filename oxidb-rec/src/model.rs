@@ -91,6 +91,8 @@ impl Row {
         sum
     }
 
+    /// Used by tests today and by the Phase 2 snapshot writer's row filter.
+    #[allow(dead_code)]
     pub fn is_zero(&self) -> bool {
         self.counts.iter().all(|&c| c == 0)
     }
@@ -100,20 +102,15 @@ impl Row {
 /// (ADR-0025 §4). LLR is the default for the reason stated there: cosine
 /// hands a perfect score to a single coincidence, raw counts hand the list
 /// to the bestseller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scoring {
+    #[default]
     Llr,
     Cosine,
     Jaccard,
     Lift,
     Count,
-}
-
-impl Default for Scoring {
-    fn default() -> Self {
-        Scoring::Llr
-    }
 }
 
 impl std::str::FromStr for Scoring {
@@ -225,10 +222,6 @@ impl Interner {
 
     pub fn len(&self) -> usize {
         self.names.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
     }
 }
 
