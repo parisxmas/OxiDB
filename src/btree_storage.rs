@@ -1393,16 +1393,25 @@ impl BTreeStorage {
         Ok(())
     }
 
-    /// Smallest `limit` keys strictly greater than `after`, ascending.
+    /// Smallest `limit` keys in `(after, end]`, ascending, plus the largest key
+    /// the pass saw at all.
     ///
     /// One pass over the key index, keeping a bounded max-heap: memory is
     /// `limit` keys, not the collection. Past the point where the heap fills,
     /// the common case is a single compare against its maximum.
-    fn keys_after(&self, after: Option<u64>, limit: usize) -> Vec<u64> {
+    ///
+    /// `end` is what makes the walk a walk over a *fixed* set rather than a
+    /// chase: without it, a collection taking inserts faster than the scan
+    /// consumes windows has no last window, and an un-limited `find` over a hot
+    /// collection would never return. The returned maximum is how the first
+    /// window establishes that bound — see `scan_chunked_while`.
+    fn keys_after(&self, after: Option<u64>, end: Option<u64>, limit: usize) -> (Vec<u64>, u64) {
         let mut heap: std::collections::BinaryHeap<u64> =
             std::collections::BinaryHeap::with_capacity(limit);
+        let mut seen_max = 0u64;
         self.scan_keys(|k| {
-            if after.is_some_and(|a| k <= a) {
+            seen_max = seen_max.max(k);
+            if after.is_some_and(|a| k <= a) || end.is_some_and(|e| k > e) {
                 return;
             }
             if heap.len() < limit {
@@ -1414,7 +1423,7 @@ impl BTreeStorage {
         });
         let mut keys = heap.into_vec();
         keys.sort_unstable();
-        keys
+        (keys, seen_max)
     }
 
     /// Iterate every entry in key order, holding only one *chunk* of keys at a
@@ -1430,26 +1439,32 @@ impl BTreeStorage {
     /// a full scan stays at a handful of passes over a structure whose entries
     /// are cheap next to the documents being read.
     ///
-    /// **Visibility, versus the un-chunked scans:** those fix the key set at
-    /// `t₀`, this one re-reads the index per window, so a document inserted
-    /// mid-scan *above* the current position is now seen. That is the phantom
-    /// `docs/isolation.md` already admits for non-transactional readers, and
-    /// the two consumers with a stronger guarantee do not take it from the
-    /// scan: `snapshot_docs` resolves every id against the snapshot gate
-    /// (a post-snapshot insert resolves to `Prior(None)` and is dropped, a
-    /// mid-scan delete is recovered from `remembered_ids`, neither sourced
-    /// from the scan), and `aggregate` validates `changed_since` *after* the
-    /// run and re-runs the slow path if anything wrote at all. Index builds
-    /// deliberately keep the un-chunked scans.
+    /// **Visibility matches the un-chunked scans**, and the `end` bound is what
+    /// makes that true rather than nearly true. Those fix the key set at `t₀`;
+    /// re-reading the index per window would otherwise let a document inserted
+    /// mid-scan *above* the cursor into the result — an extra phantom, and worse
+    /// than a phantom: a collection taking inserts faster than the scan consumes
+    /// windows would have no last window, so an unbounded `find` over a hot
+    /// collection need never return. Keys are monotonic document ids, so
+    /// stopping at the largest key the first window saw is exactly "everything
+    /// that existed when the scan began", and it terminates. Documents *deleted*
+    /// mid-scan are skipped, as on the un-chunked path.
+    ///
+    /// Index builds deliberately keep the un-chunked scans (they run under
+    /// `index_build_barrier`, so nothing can write while they look).
     fn scan_chunked_while<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
     {
         let cap = (self.count() / SCAN_CHUNK_PASSES).max(SCAN_CHUNK_MIN);
-        let mut limit = SCAN_CHUNK_MIN.min(cap);
+        let mut limit = SCAN_CHUNK_MIN;
         let mut after: Option<u64> = None;
+        let mut end: Option<u64> = None;
         loop {
-            let keys = self.keys_after(after, limit);
+            let (keys, seen_max) = self.keys_after(after, end, limit);
+            // The first pass establishes the snapshot bound; later ones are
+            // filtered by it.
+            end = Some(end.unwrap_or(seen_max));
             if keys.is_empty() {
                 return Ok(());
             }
@@ -1896,16 +1911,53 @@ mod tests {
         let storage = BTreeStorage::new_in_memory("chunked_window");
         gapped(&storage, 10_000);
 
-        let first = storage.keys_after(None, 10);
+        let (first, seen_max) = storage.keys_after(None, None, 10);
         assert_eq!(first, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
 
         // Strictly greater than the resume point — a `>=` here re-emits the
         // last key of every window.
-        let next = storage.keys_after(Some(19), 10);
+        // The pass also reports the largest key it saw — the snapshot bound
+        // the walk stops at.
+        assert_eq!(seen_max, 19_999);
+
+        let (next, _) = storage.keys_after(Some(19), None, 10);
         assert_eq!(next, vec![21, 23, 25, 27, 29, 31, 33, 35, 37, 39]);
 
         // Past the end: empty, which is what terminates the loop.
-        assert!(storage.keys_after(Some(19_999), 10).is_empty());
+        assert!(storage.keys_after(Some(19_999), None, 10).0.is_empty());
+
+        // And a key past `end` is not offered, however small the window.
+        assert!(storage.keys_after(Some(19), Some(19), 10).0.is_empty());
+    }
+
+    /// A window walk re-reads the key index, so without a bound it would chase
+    /// its own tail: a writer inserting above the cursor keeps producing a next
+    /// window, and a scan over a collection taking writes need never end. The
+    /// bound is the largest key the first window saw, which also restores the
+    /// un-chunked scans' visibility exactly — documents born mid-scan are not
+    /// in the result.
+    ///
+    /// Written as a fixture rather than a race: the callback inserts a key
+    /// above every existing one on every call, which is the worst case a real
+    /// writer could produce and is deterministic.
+    #[test]
+    fn a_chunked_scan_does_not_chase_documents_written_while_it_runs() {
+        let storage = BTreeStorage::new_in_memory("chunked_moving");
+        let keys = gapped(&storage, (SCAN_CHUNK_MIN as u64) + 25);
+        let born_above = std::cell::Cell::new(keys[keys.len() - 1] + 1);
+
+        let mut seen = Vec::new();
+        storage
+            .scan_all_chunked_while(|k, _| {
+                let next = born_above.get();
+                storage.insert(next, b"born mid-scan".to_vec());
+                born_above.set(next + 2);
+                seen.push(k);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(seen, keys, "the scan returned exactly what existed at t0");
     }
 
     /// A document deleted while the scan is between windows is skipped, the
