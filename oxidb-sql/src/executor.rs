@@ -895,7 +895,7 @@ fn exec_update<S: Store>(
         params,
         def: &def,
     };
-    lock_matching_rows(store, &scope, None)?;
+    let locked = lock_matching_rows(store, &scope, None)?;
 
     let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
@@ -905,6 +905,7 @@ fn exec_update<S: Store>(
     // streaming buys here is that only the *matched* rows are held, where the
     // old path held every row of the table first.
     let matched = collect_dml_matches(store, &scope, None, true)?;
+    lock_stragglers(store, table, &matched, &locked)?;
     for (row_id, cells) in matched {
         let mut new_cells = cells.clone();
         for (idx, expr) in &targets {
@@ -997,7 +998,7 @@ fn lock_select_for_update<S: Store>(
         params,
         def: &def,
     };
-    lock_matching_rows(store, &scope, None)
+    lock_matching_rows(store, &scope, None).map(|_| ())
 }
 
 /// Lock every row of `table` the filter currently matches, re-evaluating
@@ -1024,7 +1025,11 @@ struct DmlScope<'a> {
     def: &'a crate::catalog::Table,
 }
 
-fn lock_matching_rows<S: Store>(store: &S, sc: &DmlScope<'_>, limit: Option<u64>) -> Result<()> {
+fn lock_matching_rows<S: Store>(
+    store: &S,
+    sc: &DmlScope<'_>,
+    limit: Option<u64>,
+) -> Result<std::collections::BTreeSet<u64>> {
     let mut locked: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for _ in 0..10 {
         // Ids only — this pass locks, it does not read values. Streaming here
@@ -1037,20 +1042,52 @@ fn lock_matching_rows<S: Store>(store: &S, sc: &DmlScope<'_>, limit: Option<u64>
             .filter(|id| !locked.contains(id))
             .collect();
         if fresh.is_empty() {
-            return Ok(());
+            return Ok(locked);
         }
         let mut fresh = fresh;
         fresh.sort_unstable();
         store.lock_rows(sc.table, &fresh)?;
         locked.extend(fresh);
-        // With LIMIT the fixpoint is "we hold `limit` matching rows", which the
-        // first pass reaches whenever that many exist; without it, the loop
-        // re-scans until a pass finds nothing new to lock.
-        if limit.is_some_and(|n| locked.len() as u64 >= n) {
-            return Ok(());
-        }
+        // No early exit for LIMIT. It used to return as soon as `limit` rows
+        // were held — one pass — and that quietly reopened the hole this loop
+        // exists to close: the statement re-finds its matches afterwards, and
+        // `LIMIT n` takes the *first* n in row-id order, so a row that starts
+        // matching in between (a concurrent committed UPDATE on a LOWER id)
+        // enters the set and pushes a locked row out of it. The statement then
+        // wrote a row it had never locked. Converging like the un-limited case
+        // costs one extra pass and locks a few rows the statement may not use,
+        // which is harmless — over-locking only delays other writers, while
+        // under-locking loses their writes.
     }
-    Ok(())
+    Ok(locked)
+}
+
+/// Lock anything the statement is about to write that the fixpoint above did
+/// not already cover, so "we hold a lock on every row we write" is true by
+/// construction rather than by argument.
+///
+/// The fixpoint converges on the rows that matched when it last looked; a row
+/// that starts matching after that — or one whose lock another transaction
+/// takes in the gap — is still reachable by the statement's own match pass.
+/// Called before any write, so a conflict here is a clean lock error rather
+/// than a half-applied statement.
+fn lock_stragglers<S: Store>(
+    store: &S,
+    table: &str,
+    matched: &[(u64, Vec<Value>)],
+    locked: &std::collections::BTreeSet<u64>,
+) -> Result<()> {
+    let mut extra: Vec<u64> = matched
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !locked.contains(id))
+        .collect();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    extra.sort_unstable();
+    extra.dedup();
+    store.lock_rows(table, &extra)
 }
 
 fn dml_candidates<S: Store>(
@@ -1430,7 +1467,7 @@ fn exec_delete<S: Store>(
         params,
         def: &def,
     };
-    lock_matching_rows(store, &scope, limit)?;
+    let locked = lock_matching_rows(store, &scope, limit)?;
 
     // The matched rows' *cells* are only needed to project `RETURNING` and to
     // walk an `ON DELETE` closure. Without either, ids alone are kept, so a
@@ -1439,6 +1476,7 @@ fn exec_delete<S: Store>(
     let referenced = !referencing_fks(store, table).is_empty();
     let want_cells = returning.is_some() || referenced;
     let to_delete = collect_dml_matches(store, &scope, limit, want_cells)?;
+    lock_stragglers(store, table, &to_delete, &locked)?;
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
     // Collect every row to remove — the matched rows plus each one's ON DELETE

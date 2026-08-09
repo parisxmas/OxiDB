@@ -5712,3 +5712,282 @@ mod checkpoint_reuse_tests {
         assert_eq!(one_int(&db, "SELECT count(*) FROM t"), 3);
     }
 }
+
+#[cfg(test)]
+mod dml_lock_tests {
+    //! A DML statement must hold a row lock on every row it writes.
+    //!
+    //! Finding the rows happens twice — once to lock them, once to act on them
+    //! — and the set can change in between, because another connection can
+    //! commit a write in that gap. `LIMIT` made this sharp: it takes the
+    //! *first* n matches in row-id order, so a row that starts matching on a
+    //! LOWER id does not merely join the set, it pushes a locked row out of it,
+    //! and the statement then writes a row nobody locked. The victim is a third
+    //! transaction that takes `SELECT ... FOR UPDATE` on that row in the same
+    //! gap and is entitled to it until it commits.
+    //!
+    //! The gap is microseconds wide and needs three parties, so it is not
+    //! reachable by racing threads in a test. It IS reachable exactly, by
+    //! interposing on the store: [`Interposed`] delegates every call to a real
+    //! engine and commits a chosen statement at the start of the Nth table
+    //! scan. That makes the interleaving a parameter instead of a coin flip.
+    use super::*;
+    use crate::ast::Statement;
+    use crate::store::{Chunk, RangeBound, Rows};
+    use std::cell::{Cell, RefCell};
+
+    /// A `Store` that is a real engine plus a stopwatch: it counts table scans,
+    /// fires one committed statement at the start of scan `fire_at`, and
+    /// records every row locked and every row deleted.
+    struct Interposed<'a> {
+        inner: &'a SqlEngine,
+        fire_at: usize,
+        mutation: &'a str,
+        scans: Cell<usize>,
+        fired: Cell<bool>,
+        locked: RefCell<Vec<u64>>,
+        deleted: RefCell<Vec<u64>>,
+    }
+
+    impl<'a> Interposed<'a> {
+        fn new(inner: &'a SqlEngine, fire_at: usize, mutation: &'a str) -> Self {
+            Self {
+                inner,
+                fire_at,
+                mutation,
+                scans: Cell::new(0),
+                fired: Cell::new(false),
+                locked: RefCell::new(Vec::new()),
+                deleted: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The concurrent commit. The nested `execute` scopes a lock owner of
+        /// its own and clears it on the way out, so ours is saved and restored
+        /// around it — otherwise the statement under test loses the identity
+        /// its own locks are held under.
+        fn maybe_fire(&self) {
+            self.scans.set(self.scans.get() + 1);
+            if self.scans.get() != self.fire_at || self.fired.get() {
+                return;
+            }
+            self.fired.set(true);
+            let saved = STMT_LOCK_OWNER.get();
+            STMT_LOCK_OWNER.set(0);
+            self.inner.execute(self.mutation).unwrap();
+            STMT_LOCK_OWNER.set(saved);
+        }
+    }
+
+    impl Store for Interposed<'_> {
+        /// The one method that is not pure delegation: the interposition
+        /// point. Firing *before* delegating matters — the engine's lock is
+        /// taken inside the delegate, and the nested statement needs it free.
+        fn scan_visit_ids(
+            &self,
+            table: &str,
+            want: Option<&[usize]>,
+            visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+        ) -> Result<()> {
+            self.maybe_fire();
+            Store::scan_visit_ids(self.inner, table, want, visit)
+        }
+        fn index_visit_eq_ids(
+            &self,
+            table: &str,
+            eqs: &[(String, Value)],
+            visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+        ) -> Result<Option<()>> {
+            Store::index_visit_eq_ids(self.inner, table, eqs, visit)
+        }
+        fn index_visit_range_ids(
+            &self,
+            table: &str,
+            col: &str,
+            lo: &RangeBound,
+            hi: &RangeBound,
+            visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+        ) -> Result<Option<()>> {
+            Store::index_visit_range_ids(self.inner, table, col, lo, hi, visit)
+        }
+        fn note_dml_examined(&self, rows: u64) {
+            Store::note_dml_examined(self.inner, rows)
+        }
+        fn create_procedure(
+            &self,
+            name: &str,
+            def: crate::catalog::ProcedureDef,
+            or_replace: bool,
+        ) -> Result<()> {
+            Store::create_procedure(self.inner, name, def, or_replace)
+        }
+        fn table_def(&self, name: &str) -> Option<catalog::Table> {
+            Store::table_def(self.inner, name)
+        }
+        fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
+            Store::scan(self.inner, table)
+        }
+        fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
+            Store::insert(self.inner, table, cells)
+        }
+        fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
+            Store::update_row(self.inner, table, row_id, cells)
+        }
+        fn delete(&self, table: &str, row_id: u64) -> Result<bool> {
+            self.deleted.borrow_mut().push(row_id);
+            Store::delete(self.inner, table, row_id)
+        }
+        fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()> {
+            self.locked.borrow_mut().extend_from_slice(row_ids);
+            Store::lock_rows(self.inner, table, row_ids)
+        }
+        fn create_table(&self, table: catalog::Table) -> Result<()> {
+            Store::create_table(self.inner, table)
+        }
+        fn drop_table(&self, name: &str) -> Result<()> {
+            Store::drop_table(self.inner, name)
+        }
+        fn alter_table(&self, table: &str, op: &crate::ast::AlterOp) -> Result<()> {
+            Store::alter_table(self.inner, table, op)
+        }
+        fn drop_index(&self, name: &str) -> Result<()> {
+            Store::drop_index(self.inner, name)
+        }
+        fn create_view(&self, name: &str, q: &str, or_replace: bool) -> Result<()> {
+            Store::create_view(self.inner, name, q, or_replace)
+        }
+        fn drop_view(&self, name: &str) -> Result<()> {
+            Store::drop_view(self.inner, name)
+        }
+        fn view_sql(&self, name: &str) -> Option<String> {
+            Store::view_sql(self.inner, name)
+        }
+        fn drop_procedure(&self, name: &str) -> Result<()> {
+            Store::drop_procedure(self.inner, name)
+        }
+        fn procedure_def(&self, name: &str) -> Option<catalog::ProcedureDef> {
+            Store::procedure_def(self.inner, name)
+        }
+        fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
+            Store::next_auto_block(self.inner, table, n)
+        }
+        fn list_tables(&self) -> Vec<catalog::Table> {
+            Store::list_tables(self.inner)
+        }
+        fn list_views(&self) -> Vec<(String, String)> {
+            Store::list_views(self.inner)
+        }
+        fn list_procedures(&self) -> Vec<(String, catalog::ProcedureDef)> {
+            Store::list_procedures(self.inner)
+        }
+        fn list_indexes(&self) -> Vec<IndexDef> {
+            Store::list_indexes(self.inner)
+        }
+        fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<Rows>> {
+            Store::index_lookup_eq(self.inner, table, eqs)
+        }
+        fn scan_pruned(&self, table: &str, keep: &[usize]) -> Result<Chunk> {
+            Store::scan_pruned(self.inner, table, keep)
+        }
+        fn create_index(
+            &self,
+            name: &str,
+            table: &str,
+            columns: &[String],
+            unique: bool,
+        ) -> Result<()> {
+            Store::create_index(self.inner, name, table, columns, unique)
+        }
+    }
+
+    /// Four rows, two of them matching; the DELETE takes two.
+    fn fixture() -> (tempfile::TempDir, SqlEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,'keep'), (3,'keep'), (5,'old'), (9,'old')")
+            .unwrap();
+        (dir, db)
+    }
+
+    /// Run `sql` against the engine through the interposer, with a statement
+    /// lock scope of its own — the same one `SqlEngine::execute` sets up for an
+    /// autocommit statement, which is what `lock_rows` records ownership under.
+    fn run_interposed<'a>(
+        db: &'a SqlEngine,
+        sql: &str,
+        fire_at: usize,
+        mutation: &'a str,
+    ) -> Interposed<'a> {
+        let stmts = crate::parser::parse(sql).unwrap();
+        let Statement::Delete { .. } = &stmts[0] else {
+            panic!("these tests are about DELETE")
+        };
+        let spy = Interposed::new(db, fire_at, mutation);
+        let owner = db.alloc_lock_owner();
+        STMT_LOCK_OWNER.set(owner);
+        let r = executor::execute(&spy, stmts[0].clone(), &[]);
+        STMT_LOCK_OWNER.set(0);
+        db.row_locks.release_all(owner);
+        r.unwrap();
+        spy
+    }
+
+    /// The reported hole. `LIMIT 2` locks {5,9}; row 3 then starts matching, so
+    /// the statement's own match pass returns {3,5} and row 3 — which nobody
+    /// locked — is deleted. Firing at scan 2 is the gap: under the old
+    /// single-pass locking that scan WAS the statement's match pass.
+    #[test]
+    fn a_limited_delete_never_writes_a_row_it_did_not_lock() {
+        let (_d, db) = fixture();
+        let spy = run_interposed(
+            &db,
+            "DELETE FROM t WHERE status = 'old' LIMIT 2",
+            2,
+            "UPDATE t SET status = 'old' WHERE id = 3",
+        );
+
+        assert!(spy.fired.get(), "the concurrent commit never ran — vacuous");
+        let locked = spy.locked.borrow();
+        let deleted = spy.deleted.borrow();
+        assert_eq!(deleted.len(), 2, "LIMIT 2 still deletes two rows");
+        for id in deleted.iter() {
+            assert!(
+                locked.contains(id),
+                "deleted row {id} was never locked (locked: {locked:?}, deleted: {deleted:?})"
+            );
+        }
+    }
+
+    /// The same property one step later: the row starts matching *after* the
+    /// locking fixpoint has converged, so only the pre-write straggler lock can
+    /// cover it. Scan 3 is the statement's own match pass once the fixpoint
+    /// takes two passes to settle — asserted, so a change to the lock protocol
+    /// breaks this loudly instead of silently firing somewhere harmless.
+    #[test]
+    fn a_row_that_starts_matching_after_the_lock_pass_is_still_locked_first() {
+        let (_d, db) = fixture();
+        let spy = run_interposed(
+            &db,
+            "DELETE FROM t WHERE status = 'old' LIMIT 2",
+            3,
+            "UPDATE t SET status = 'old' WHERE id = 3",
+        );
+
+        assert!(spy.fired.get(), "the concurrent commit never ran — vacuous");
+        assert_eq!(
+            spy.scans.get(),
+            3,
+            "lock protocol changed: scan 3 is no longer the statement's match pass"
+        );
+        let locked = spy.locked.borrow();
+        let deleted = spy.deleted.borrow();
+        for id in deleted.iter() {
+            assert!(
+                locked.contains(id),
+                "deleted row {id} was never locked (locked: {locked:?}, deleted: {deleted:?})"
+            );
+        }
+    }
+}
