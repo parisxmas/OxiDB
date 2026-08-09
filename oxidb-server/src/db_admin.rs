@@ -163,6 +163,7 @@ pub fn execute_local(
             Ok(()) => {
                 crate::sql_bridge::forget_database(name);
                 crate::tsdb_bridge::forget_database(name);
+                crate::rec_bridge::forget_database(name);
                 dropped_ok(name, *via_sql)
             }
             Err(oxidb::Error::DatabaseNotFound(_)) if *tolerate_missing => {

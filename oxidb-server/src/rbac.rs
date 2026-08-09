@@ -49,6 +49,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "proc_status"
                 | "sql"
                 | "tsdb"
+                | "rec"
                 | "call_procedure"
                 | "enable_schedule"
                 | "disable_schedule"
@@ -80,6 +81,9 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 // Read role runs tsdb queries only (writes/retention rejected
                 // by the bridge via the read-only flag).
                 | "tsdb"
+                // Same shape for rec: related/for_basket/stats pass, track and
+                // checkpoint are rejected by the bridge's read-only flag.
+                | "rec"
                 | "list_collections"
                 | "list_buckets"
                 | "list_objects"

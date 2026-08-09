@@ -19,6 +19,7 @@ COPY oxidb-agg-merge/ oxidb-agg-merge/
 COPY oxidb-sql/ oxidb-sql/
 COPY oxidb-cobra/ oxidb-cobra/
 COPY oxidb-tsdb/ oxidb-tsdb/
+COPY oxidb-rec/ oxidb-rec/
 COPY oxidb-http/ oxidb-http/
 
 # Create stubs for workspace members not needed for server build

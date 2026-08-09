@@ -214,6 +214,10 @@ fn handle_request_session_inner(
         Some("tsdb") => {
             return crate::tsdb_bridge::handle_tsdb(&cmd, &request, sql_readonly, db_name);
         }
+        // Fourth engine (oxidb-rec): co-occurrence recommendations (ADR-0025).
+        Some("rec") => {
+            return crate::rec_bridge::handle_rec(&cmd, &request, sql_readonly, db_name);
+        }
         Some("doc") | None => {}
         Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
     }
@@ -222,6 +226,9 @@ fn handle_request_session_inner(
     }
     if cmd == "tsdb" {
         return crate::tsdb_bridge::handle_tsdb(&cmd, &request, sql_readonly, db_name);
+    }
+    if cmd == "rec" {
+        return crate::rec_bridge::handle_rec(&cmd, &request, sql_readonly, db_name);
     }
 
     // Everything past this point is the document engine. With OXIDB_DOC=0 it was

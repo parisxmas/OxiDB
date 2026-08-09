@@ -4,7 +4,7 @@
 //! and which engine owns it" by walking `OXIDB_DATA` once and attributing
 //! every file to the engine whose layout it belongs to. Attribution is by
 //! path shape — the same conventions the engines themselves lay down:
-//! `sql/` dirs (per-database, ADR-0012), `tsdb/` dirs, `_blobs/`, `_fts/`,
+//! `sql/` dirs (per-database, ADR-0012), `tsdb/` dirs, `rec/` dirs, `_blobs/`, `_fts/`,
 //! `_archive/` (PITR), `_oximem.snap`, `_mqtt*`/`_amqp*` collections
 //! (the broker substrates), `_auth`/`_audit`/`_profile` (system), and
 //! everything else is the document engine's own data.
@@ -23,6 +23,7 @@ struct Buckets {
     documents_mmap: u64,
     sql: u64,
     tsdb: u64,
+    rec: u64,
     blobs: u64,
     fts: u64,
     oximem: u64,
@@ -45,6 +46,7 @@ pub fn snapshot_at(root: &Path) -> Value {
     let total = b.documents
         + b.sql
         + b.tsdb
+        + b.rec
         + b.blobs
         + b.fts
         + b.oximem
@@ -59,6 +61,7 @@ pub fn snapshot_at(root: &Path) -> Value {
             "documents_mmap": b.documents_mmap,
             "sql": b.sql,
             "tsdb": b.tsdb,
+            "rec": b.rec,
             "blobs": b.blobs,
             "oximem": b.oximem,
             "messaging": b.messaging,
@@ -107,6 +110,7 @@ fn bucket_for<'b>(root: &Path, file: &Path, b: &'b mut Buckets) -> &'b mut u64 {
         match c.as_ref() {
             "sql" => return &mut b.sql,
             "tsdb" => return &mut b.tsdb,
+            "rec" => return &mut b.rec,
             "_blobs" => return &mut b.blobs,
             "_fts" => return &mut b.fts,
             "_archive" => return &mut b.pitr_archive,
