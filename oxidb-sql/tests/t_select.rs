@@ -135,7 +135,10 @@ fn order_by_limit_top_n_matches_full_sort() {
     let all = rows(&db, "SELECT id FROM t ORDER BY k, id DESC");
     let top7 = rows(&db, "SELECT id FROM t ORDER BY k, id DESC LIMIT 7");
     assert_eq!(top7, all[..7].to_vec());
-    let off = rows(&db, "SELECT id FROM t ORDER BY k, id DESC LIMIT 5 OFFSET 10");
+    let off = rows(
+        &db,
+        "SELECT id FROM t ORDER BY k, id DESC LIMIT 5 OFFSET 10",
+    );
     assert_eq!(off, all[10..15].to_vec());
 
     // Stable ties: equal keys keep input order.
@@ -214,7 +217,10 @@ fn streamed_scan_shapes_match_materialized_semantics() {
     assert_eq!(w, vec![vec![i(2), i(100)], vec![i(5), i(100)]]);
 
     // In-scan top-N with WHERE + OFFSET, against the no-LIMIT oracle.
-    let all = rows(&db, "SELECT id, name FROM s WHERE grp = 0 ORDER BY name, id DESC");
+    let all = rows(
+        &db,
+        "SELECT id, name FROM s WHERE grp = 0 ORDER BY name, id DESC",
+    );
     let top = rows(
         &db,
         "SELECT id, name FROM s WHERE grp = 0 ORDER BY name, id DESC LIMIT 5 OFFSET 3",
@@ -234,7 +240,8 @@ fn streamed_scan_shapes_match_materialized_semantics() {
 #[test]
 fn streamed_scan_sees_transaction_overlay() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE so (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE so (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO so VALUES (1, 10), (2, 20), (3, 30)")
         .unwrap();
     let mut tx = None;
@@ -244,17 +251,25 @@ fn streamed_scan_sees_transaction_overlay() {
     db.execute_params_in_session("UPDATE so SET v = 99 WHERE id = 2", &[], &mut tx)
         .unwrap();
     let r = db
-        .execute_params_in_session("SELECT id FROM so WHERE v > 25 ORDER BY v DESC LIMIT 2", &[], &mut tx)
+        .execute_params_in_session(
+            "SELECT id FROM so WHERE v > 25 ORDER BY v DESC LIMIT 2",
+            &[],
+            &mut tx,
+        )
         .unwrap();
     match r.last().unwrap() {
         oxidb_sql::QueryResult::Select { rows, .. } => {
             assert_eq!(
                 rows,
-                &vec![vec![oxidb_sql::Value::Int(2)], vec![oxidb_sql::Value::Int(4)]],
+                &vec![
+                    vec![oxidb_sql::Value::Int(2)],
+                    vec![oxidb_sql::Value::Int(4)]
+                ],
                 "sees the in-txn update (v=99) and insert (v=40)"
             );
         }
         other => panic!("expected Select, got {other:?}"),
     }
-    db.execute_params_in_session("ROLLBACK", &[], &mut tx).unwrap();
+    db.execute_params_in_session("ROLLBACK", &[], &mut tx)
+        .unwrap();
 }

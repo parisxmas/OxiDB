@@ -41,6 +41,15 @@ pub enum OxiDbRequest {
     Delete {
         collection: String,
         query: Value,
+        /// `delete ... limit N`. Replicated so every node deletes the same
+        /// count, and deterministic because the delete path selects in
+        /// document-id order and ids come from the replicated insert order —
+        /// a limit over an unordered selection would diverge replicas.
+        ///
+        /// `#[serde(default)]`: log entries written before this field existed
+        /// replay as `None`, which is what they meant.
+        #[serde(default)]
+        limit: Option<usize>,
     },
     DeleteOne {
         collection: String,

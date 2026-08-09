@@ -187,10 +187,17 @@ fn programmatic_index_api() {
         .unwrap();
     db.insert("t", vec![Value::Int(2), Value::Text("a".into())])
         .unwrap();
-    db.create_index("t_tag", "t", &["tag".to_string()], false).unwrap();
+    db.create_index("t_tag", "t", &["tag".to_string()], false)
+        .unwrap();
     // Duplicate index name errors; unknown column errors.
-    assert!(db.create_index("t_tag", "t", &["tag".to_string()], false).is_err());
-    assert!(db.create_index("t_x", "t", &["nope".to_string()], false).is_err());
+    assert!(
+        db.create_index("t_tag", "t", &["tag".to_string()], false)
+            .is_err()
+    );
+    assert!(
+        db.create_index("t_x", "t", &["nope".to_string()], false)
+            .is_err()
+    );
     db.drop_index("t_tag").unwrap();
     assert!(db.drop_index("t_tag").is_err());
 }

@@ -13,6 +13,46 @@ use crate::types::{Value, ValueRef};
 /// A set of rows as `(row_id, cells)` pairs.
 pub(crate) type Rows = Vec<(u64, Vec<Value>)>;
 
+/// One end of a single-column index range.
+///
+/// Deliberately not `std::ops::Bound<Value>`: the open end has to survive being
+/// compared against a stored cell, and `total_order` (not `PartialOrd`) is what
+/// this engine orders index keys by — see `IndexKey`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RangeBound {
+    /// No bound on this side.
+    Unbounded,
+    /// `col >= v` (low side) or `col <= v` (high side).
+    Included(Value),
+    /// `col > v` (low side) or `col < v` (high side).
+    Excluded(Value),
+}
+
+impl RangeBound {
+    /// Is `v` inside this bound, treated as the **low** end?
+    pub fn allows_low(&self, v: &Value) -> bool {
+        match self {
+            RangeBound::Unbounded => true,
+            RangeBound::Included(b) => crate::types::Value::total_order(v, b).is_ge(),
+            RangeBound::Excluded(b) => crate::types::Value::total_order(v, b).is_gt(),
+        }
+    }
+    /// Is `v` inside this bound, treated as the **high** end?
+    pub fn allows_high(&self, v: &Value) -> bool {
+        match self {
+            RangeBound::Unbounded => true,
+            RangeBound::Included(b) => crate::types::Value::total_order(v, b).is_le(),
+            RangeBound::Excluded(b) => crate::types::Value::total_order(v, b).is_lt(),
+        }
+    }
+    pub fn value(&self) -> Option<&Value> {
+        match self {
+            RangeBound::Unbounded => None,
+            RangeBound::Included(v) | RangeBound::Excluded(v) => Some(v),
+        }
+    }
+}
+
 /// A column-pruned table scan in one flat allocation: row `i` occupies
 /// `cells[i*width .. (i+1)*width]`. Avoids the per-row `Vec` of a
 /// [`Rows`]-shaped scan, which dominates large-join query time.
@@ -143,6 +183,85 @@ pub(crate) trait Store {
         Ok(false)
     }
 
+    /// Stream a table's live rows as `(row_id, cells)`, in `row_id` order,
+    /// stopping when `visit` returns `false`.
+    ///
+    /// This is [`scan_visit_cols`](Store::scan_visit_cols) for DML, which needs
+    /// the row id it is about to write. It exists because the collecting
+    /// [`scan`](Store::scan) materializes **the whole table** into an owned
+    /// `Vec<(u64, Vec<Value>)>` before the caller can look at a single row — on
+    /// a table larger than memory that is not slow, it is fatal, and it happened
+    /// for any `DELETE`/`UPDATE` whose predicate was not pure equality.
+    ///
+    /// Rows are handed over **borrowed under the store's lock**, so the visitor
+    /// MUST NOT call back into the store. The executor only streams predicates
+    /// it has proven free of subqueries and correlation (`expr_is_streamable`).
+    ///
+    /// `want` names the columns the visitor reads (as in `scan_visit_cols`);
+    /// `None` decodes everything.
+    fn scan_visit_ids(
+        &self,
+        table: &str,
+        want: Option<&[usize]>,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        let _ = want;
+        for (id, cells) in self.scan(table)? {
+            if !visit(id, &cells)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`index_visit_eq`](Store::index_visit_eq) handing the visitor the row id
+    /// too. `Ok(None)` when no index qualifies.
+    fn index_visit_eq_ids(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let Some(rows) = self.index_lookup_eq(table, eqs)? else {
+            return Ok(None);
+        };
+        for (id, cells) in rows {
+            if !visit(id, &cells)? {
+                break;
+            }
+        }
+        Ok(Some(()))
+    }
+
+    /// Stream the rows an index selects for a **range** on one column, as
+    /// `(row_id, cells)`. `Ok(None)` when no index can serve it — the caller
+    /// then scans, exactly as with the equality form.
+    ///
+    /// The `.sidx` base is ordered by decoded key tuple and the overlay is a
+    /// `BTreeMap`, so both sides answer a range directly; what this cannot do is
+    /// promise the rows arrive in key order (base and overlay are merged by row
+    /// id), which is why it serves DML and not `ORDER BY`.
+    ///
+    /// Candidates are verified against the live row before being handed over —
+    /// the base is a hint, as everywhere else in this engine.
+    fn index_visit_range_ids(
+        &self,
+        table: &str,
+        col: &str,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let _ = (table, col, lo, hi, visit);
+        Ok(None)
+    }
+
+    /// Record how many rows the last DML statement examined to find its
+    /// matches. Diagnostic only — it is what makes "the index served this" and
+    /// "this walked the table" distinguishable from outside, including in
+    /// tests. Default: ignored.
+    fn note_dml_examined(&self, _rows: u64) {}
+
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64>;
     /// Insert many rows as one durable unit (a single WAL fsync where the
     /// implementation supports it). Returns the number of rows inserted.
@@ -216,7 +335,8 @@ pub(crate) trait Store {
     fn drop_table(&self, name: &str) -> Result<()>;
     /// `ALTER TABLE` — one operation (autocommit only in v1).
     fn alter_table(&self, table: &str, op: &crate::ast::AlterOp) -> Result<()>;
-    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()>;
+    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool)
+    -> Result<()>;
     fn drop_index(&self, name: &str) -> Result<()>;
     fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()>;
     fn drop_view(&self, name: &str) -> Result<()>;

@@ -106,8 +106,16 @@ fn build_table(db: &SqlEngine, rng: &mut Rng, rows: usize) {
     for id in 0..rows {
         // ~25% NULLs: NULL is the entire subject of the third partition, and a
         // table without NULLs makes TLP a much weaker test than it looks.
-        let a = if rng.chance(25) { "NULL".into() } else { format!("{}", rng.below(10)) };
-        let b = if rng.chance(25) { "NULL".into() } else { format!("{}", rng.below(10)) };
+        let a = if rng.chance(25) {
+            "NULL".into()
+        } else {
+            format!("{}", rng.below(10))
+        };
+        let b = if rng.chance(25) {
+            "NULL".into()
+        } else {
+            format!("{}", rng.below(10))
+        };
         let s = if rng.chance(25) {
             "NULL".into()
         } else {
@@ -148,8 +156,16 @@ fn predicate(rng: &mut Rng, depth: u32) -> String {
     }
     match rng.below(4) {
         0 => format!("NOT ({})", predicate(rng, depth - 1)),
-        1 => format!("({}) AND ({})", predicate(rng, depth - 1), predicate(rng, depth - 1)),
-        2 => format!("({}) OR ({})", predicate(rng, depth - 1), predicate(rng, depth - 1)),
+        1 => format!(
+            "({}) AND ({})",
+            predicate(rng, depth - 1),
+            predicate(rng, depth - 1)
+        ),
+        2 => format!(
+            "({}) OR ({})",
+            predicate(rng, depth - 1),
+            predicate(rng, depth - 1)
+        ),
         _ => leaf(rng),
     }
 }
@@ -158,9 +174,19 @@ fn leaf(rng: &mut Rng) -> String {
     let cmp = ["=", "<>", ">", ">=", "<", "<="];
     match rng.below(10) {
         // int vs literal — the form `index_lookup_eq` can serve
-        0 | 1 => format!("{} {} {}", rng.pick(&INT_COLS), rng.pick(&cmp), rng.below(10)),
+        0 | 1 => format!(
+            "{} {} {}",
+            rng.pick(&INT_COLS),
+            rng.pick(&cmp),
+            rng.below(10)
+        ),
         // int vs int: no index can serve this, so the two paths must agree
-        2 => format!("{} {} {}", rng.pick(&INT_COLS), rng.pick(&cmp), rng.pick(&INT_COLS)),
+        2 => format!(
+            "{} {} {}",
+            rng.pick(&INT_COLS),
+            rng.pick(&cmp),
+            rng.pick(&INT_COLS)
+        ),
         // arithmetic in an operand
         3 => format!(
             "{} + {} {} {}",
@@ -188,7 +214,12 @@ fn leaf(rng: &mut Rng) -> String {
         ),
         6 => {
             let lo = rng.below(8);
-            format!("{} BETWEEN {} AND {}", rng.pick(&INT_COLS), lo, lo + rng.below(4))
+            format!(
+                "{} BETWEEN {} AND {}",
+                rng.pick(&INT_COLS),
+                lo,
+                lo + rng.below(4)
+            )
         }
         // LIKE — each shape hits a different fast path (prefix/suffix/contains/exact)
         7 => {
@@ -203,7 +234,13 @@ fn leaf(rng: &mut Rng) -> String {
         }
         // a bare BOOL column: TRUE / FALSE / NULL straight from the data
         8 => rng.pick(&BOOL_COLS).to_string(),
-        _ => format!("{} {} {}.{}", rng.pick(&DBL_COLS), rng.pick(&cmp), rng.below(10), rng.below(10)),
+        _ => format!(
+            "{} {} {}.{}",
+            rng.pick(&DBL_COLS),
+            rng.pick(&cmp),
+            rng.below(10),
+            rng.below(10)
+        ),
     }
 }
 
@@ -287,8 +324,16 @@ fn tlp_round(db: &SqlEngine, rng: &mut Rng, seed: u64, cov: &mut Coverage) {
 
     if union != expect {
         // Say exactly what to run, not just that something is wrong.
-        let missing: Vec<_> = expect.iter().filter(|x| !union.contains(x)).take(5).collect();
-        let extra: Vec<_> = union.iter().filter(|x| !expect.contains(x)).take(5).collect();
+        let missing: Vec<_> = expect
+            .iter()
+            .filter(|x| !union.contains(x))
+            .take(5)
+            .collect();
+        let extra: Vec<_> = union
+            .iter()
+            .filter(|x| !expect.contains(x))
+            .take(5)
+            .collect();
         panic!(
             "TLP violation (seed {seed})\n\n\
              \x20 predicate: {p}\n\n\
@@ -404,8 +449,14 @@ fn tlp_holds_across_random_predicates() {
 #[test]
 #[ignore = "soak: run explicitly, tune with TLP_SEEDS / TLP_QUERIES"]
 fn tlp_soak() {
-    let seeds: u64 = std::env::var("TLP_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-    let queries: usize = std::env::var("TLP_QUERIES").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let seeds: u64 = std::env::var("TLP_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let queries: usize = std::env::var("TLP_QUERIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
 
     let mut checked = 0;
     for seed in 0..seeds {

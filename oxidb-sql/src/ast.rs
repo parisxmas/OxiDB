@@ -93,6 +93,16 @@ pub enum Statement {
         filter: Option<Expr>,
         /// `RETURNING <items>`: project the deleted rows back as a result set.
         returning: Option<Vec<SelectItem>>,
+        /// `DELETE ... LIMIT n` (MySQL): delete at most `n` matching rows and
+        /// stop looking. This is how a bulk purge is expressed against a table
+        /// far larger than memory — the executor stops streaming at the `n`th
+        /// match, so a batch costs the rows it walked, not the table.
+        ///
+        /// Which `n` rows, when more than `n` match, is deliberately
+        /// unspecified (as it is in MySQL without `ORDER BY`): they arrive in
+        /// storage order. A caller that needs a specific set narrows the
+        /// `WHERE`.
+        limit: Option<u64>,
     },
     /// Transaction control. Within one `execute()` call these are
     /// batch-scoped; through `execute_params_in_session` they span calls

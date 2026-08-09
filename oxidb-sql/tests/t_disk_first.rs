@@ -17,8 +17,8 @@ fn disk_opts() -> SqlOptions {
     SqlOptions {
         disk_first: true,
         checkpoint_bytes: 0, // manual checkpoints unless a test says otherwise,
-            ..SqlOptions::default()
-        }
+        ..SqlOptions::default()
+    }
 }
 
 fn open_disk() -> (tempfile::TempDir, SqlEngine) {
@@ -207,8 +207,8 @@ fn mode_switch_round_trip() {
             SqlOptions {
                 disk_first: false,
                 checkpoint_bytes: 0,
-            ..SqlOptions::default()
-        },
+                ..SqlOptions::default()
+            },
         )
         .unwrap();
         seed(&db);

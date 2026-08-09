@@ -21,7 +21,7 @@ use crate::ast::{
 };
 use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
-use crate::store::{Chunk, Store};
+use crate::store::{Chunk, RangeBound, Store};
 use crate::types::{IndexKey, SqlType, Value, ValueRef};
 
 /// A column in a working row set, qualified by its (aliased) table name.
@@ -134,7 +134,16 @@ pub(crate) fn execute<S: Store>(
             alias,
             filter,
             returning,
-        } => exec_delete(store, &table, alias.as_deref(), filter, returning, params),
+            limit,
+        } => exec_delete(
+            store,
+            &table,
+            alias.as_deref(),
+            filter,
+            returning,
+            limit,
+            params,
+        ),
         Statement::CreateProcedure {
             name,
             mut def,
@@ -878,32 +887,25 @@ fn exec_update<S: Store>(
     // Writer-writer exclusion: every row this UPDATE matches is locked
     // before any assignment is evaluated, so a concurrent FOR UPDATE holder
     // or UPDATE serializes against us instead of losing its write.
-    lock_matching_rows(
-        store,
+    let scope = DmlScope {
         table,
-        alias.unwrap_or(table),
-        &filter,
-        &schema,
+        key: alias.unwrap_or(table),
+        filter: &filter,
+        schema: &schema,
         params,
-    )?;
+        def: &def,
+    };
+    lock_matching_rows(store, &scope, None)?;
 
-    let filter_corr = filter.as_ref().is_some_and(has_corr);
     let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
-    for (row_id, cells) in dml_candidates(store, table, alias.unwrap_or(table), &filter, params)? {
-        if let Some(pred) = &filter
-            && !truthy(&eval_scalar_corr(
-                store,
-                filter_corr,
-                pred,
-                &schema,
-                cells.as_slice(),
-                params,
-            )?)
-        {
-            continue;
-        }
+    // Matches are collected before any write: the assignments and the FK checks
+    // below call back into the store, which a streamed visitor may not do. What
+    // streaming buys here is that only the *matched* rows are held, where the
+    // old path held every row of the table first.
+    let matched = collect_dml_matches(store, &scope, None, true)?;
+    for (row_id, cells) in matched {
         let mut new_cells = cells.clone();
         for (idx, expr) in &targets {
             new_cells[*idx] =
@@ -987,7 +989,15 @@ fn lock_select_for_update<S: Store>(
         .ok_or_else(|| SqlError::NoSuchTable(from.name.clone()))?;
     let key = from.alias.as_deref().unwrap_or(&from.name);
     let schema = table_schema(key, &def);
-    lock_matching_rows(store, &from.name, key, &stmt.filter, &schema, params)
+    let scope = DmlScope {
+        table: &from.name,
+        key,
+        filter: &stmt.filter,
+        schema: &schema,
+        params,
+        def: &def,
+    };
+    lock_matching_rows(store, &scope, None)
 }
 
 /// Lock every row of `table` the filter currently matches, re-evaluating
@@ -998,41 +1008,47 @@ fn lock_select_for_update<S: Store>(
 /// hole this exists to close. Bounded at 10 rounds: every row matched in
 /// the final round is locked either way, because a round only ends by
 /// finding nothing new to lock or by locking everything it found.
-fn lock_matching_rows<S: Store>(
-    store: &S,
-    table: &str,
-    key: &str,
-    filter: &Option<Expr>,
-    schema: &[ColRef],
-    params: &[Value],
-) -> Result<()> {
-    let filter_corr = filter.as_ref().is_some_and(has_corr);
+/// The rows a DML statement is aimed at: which table, under which name, and
+/// the predicate that selects them.
+///
+/// Bundled because finding those rows now happens in two places (locking them,
+/// then acting on them) and both need the identical six pieces — passing them
+/// separately made two functions of eight and nine arguments.
+struct DmlScope<'a> {
+    table: &'a str,
+    /// The name qualified column references use: the alias when there is one.
+    key: &'a str,
+    filter: &'a Option<Expr>,
+    schema: &'a [ColRef],
+    params: &'a [Value],
+    def: &'a crate::catalog::Table,
+}
+
+fn lock_matching_rows<S: Store>(store: &S, sc: &DmlScope<'_>, limit: Option<u64>) -> Result<()> {
     let mut locked: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for _ in 0..10 {
-        let mut fresh: Vec<u64> = Vec::new();
-        for (row_id, cells) in dml_candidates(store, table, key, filter, params)? {
-            if let Some(pred) = filter
-                && !truthy(&eval_scalar_corr(
-                    store,
-                    filter_corr,
-                    pred,
-                    schema,
-                    cells.as_slice(),
-                    params,
-                )?)
-            {
-                continue;
-            }
-            if !locked.contains(&row_id) {
-                fresh.push(row_id);
-            }
-        }
+        // Ids only — this pass locks, it does not read values. Streaming here
+        // matters as much as in the statement itself: this used to materialize
+        // the whole table before the DELETE materialized it a second time.
+        let matched = collect_dml_matches(store, sc, limit, false)?;
+        let fresh: Vec<u64> = matched
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !locked.contains(id))
+            .collect();
         if fresh.is_empty() {
             return Ok(());
         }
+        let mut fresh = fresh;
         fresh.sort_unstable();
-        store.lock_rows(table, &fresh)?;
+        store.lock_rows(sc.table, &fresh)?;
         locked.extend(fresh);
+        // With LIMIT the fixpoint is "we hold `limit` matching rows", which the
+        // first pass reaches whenever that many exist; without it, the loop
+        // re-scans until a pass finds nothing new to lock.
+        if limit.is_some_and(|n| locked.len() as u64 >= n) {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -1055,12 +1071,348 @@ fn dml_candidates<S: Store>(
     store.scan(table)
 }
 
+/// Does evaluating this expression require calling back into the store?
+///
+/// Only these four node kinds do, and they are exactly what a streamed visitor
+/// must not contain: rows are handed over borrowed under the store's lock, which
+/// is not reentrant, so a predicate that re-enters would deadlock rather than
+/// return a wrong answer. Everything else `eval_scalar` answers from the row,
+/// the schema and the params alone.
+///
+/// Note this is deliberately *not* `has_volatile`: `NOW()` is evaluated per row
+/// on the materializing path too, so it is not a reason to refuse streaming —
+/// only re-entrancy is.
+fn calls_store(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::CorrScalar { .. }
+        | Expr::CorrIn { .. } => true,
+        Expr::Binary { left, right, .. } => calls_store(left) || calls_store(right),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => calls_store(expr),
+        Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(calls_store),
+        Expr::Func { args, .. } => args.iter().any(calls_store),
+        Expr::In { expr, list, .. } => calls_store(expr) || list.iter().any(calls_store),
+        Expr::InSet { expr, .. } => calls_store(expr),
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            partition_by.iter().any(calls_store)
+                || order_by.iter().any(|(e, _)| calls_store(e))
+                || matches!(func, WindowFunc::Agg(_, Some(a)) if calls_store(a))
+        }
+        _ => false,
+    }
+}
+
+/// Column positions a predicate reads, for the scan's decode mask — or `None`
+/// when that cannot be established for certain, meaning "decode everything".
+///
+/// **Fail-safe by construction, and it has to be.** A mask that is merely
+/// pessimistic costs a few decoded cells; a mask that is *missing* a column the
+/// predicate reads does not fail loudly — the cell arrives as `Value::Null`, the
+/// comparison is simply false, and the statement quietly matches nothing. So
+/// every node either contributes its columns or gives up on the whole mask.
+///
+/// This bites only after a checkpoint: rows still in the post-checkpoint overlay
+/// are handed over whole and ignore the mask entirely, so a wrong mask is
+/// invisible until the rows have been folded into the on-disk base. That is
+/// exactly how the first version of this shipped green — and what
+/// `a_streamed_scan_after_a_checkpoint_reads_the_columns_its_predicate_needs`
+/// now pins.
+fn filter_col_mask(e: &Expr, schema: &[ColRef]) -> Option<Vec<usize>> {
+    fn walk(e: &Expr, schema: &[ColRef], out: &mut Vec<usize>) -> bool {
+        match e {
+            Expr::Col(i) => {
+                out.push(*i);
+                true
+            }
+            // A DML filter reaches the executor still carrying column *names*;
+            // only some paths bind them to positions first. Both shapes occur.
+            Expr::Column { table, name } => match resolve_col(schema, table, name) {
+                Ok(i) => {
+                    out.push(i);
+                    true
+                }
+                Err(_) => false,
+            },
+            Expr::Literal(_) | Expr::Param(_) => true,
+            Expr::Binary { left, right, .. } => walk(left, schema, out) && walk(right, schema, out),
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => walk(expr, schema, out),
+            Expr::Func { args, .. } => args.iter().all(|a| walk(a, schema, out)),
+            Expr::In { expr, list, .. } => {
+                walk(expr, schema, out) && list.iter().all(|i| walk(i, schema, out))
+            }
+            Expr::InSet { expr, .. } => walk(expr, schema, out),
+            // Aggregates, windows, subqueries, anything added later: unknown
+            // reach, so no mask.
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, schema, &mut out).then(|| {
+        out.sort_unstable();
+        out.dedup();
+        out
+    })
+}
+
+/// A single-column range conjunct usable by an index: `col <op> <const>` terms
+/// joined by `AND`, all naming the **same** column.
+///
+/// Restricted to one column on purpose. An index range only selects a
+/// contiguous run of keys for its *first* column, so bounds on two different
+/// columns cannot both be pushed down; the leftover one would have to be
+/// rechecked anyway, which is what the per-row predicate already does.
+fn range_conjunct(
+    expr: &Expr,
+    key: &str,
+    params: &[Value],
+    def: &crate::catalog::Table,
+) -> Option<(String, RangeBound, RangeBound)> {
+    fn walk(
+        e: &Expr,
+        key: &str,
+        params: &[Value],
+        def: &crate::catalog::Table,
+        found: &mut Option<(String, RangeBound, RangeBound)>,
+    ) {
+        match e {
+            Expr::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => {
+                walk(left, key, params, def, found);
+                walk(right, key, params, def, found);
+            }
+            Expr::Binary { op, left, right } => {
+                // Normalize `literal < col` to `col > literal`.
+                let (name, val, op) = match (
+                    bound_col(left, key, def),
+                    const_value(right, params),
+                    bound_col(right, key, def),
+                    const_value(left, params),
+                ) {
+                    (Some(n), Some(v), _, _) => (n, v, *op),
+                    (_, _, Some(n), Some(v)) => (n, v, flip_cmp(*op)),
+                    _ => return,
+                };
+                let (lo, hi) = match op {
+                    BinOp::Gt => (RangeBound::Excluded(val), RangeBound::Unbounded),
+                    BinOp::Ge => (RangeBound::Included(val), RangeBound::Unbounded),
+                    BinOp::Lt => (RangeBound::Unbounded, RangeBound::Excluded(val)),
+                    BinOp::Le => (RangeBound::Unbounded, RangeBound::Included(val)),
+                    _ => return,
+                };
+                match found {
+                    None => *found = Some((name, lo, hi)),
+                    Some((have, have_lo, have_hi)) => {
+                        // Bounds on a second column are not expressible as one
+                        // index range. Keep the first: the candidates it selects
+                        // are a superset, and every row is rechecked against the
+                        // full predicate anyway.
+                        if *have != name {
+                            return;
+                        }
+                        if !matches!(lo, RangeBound::Unbounded) {
+                            *have_lo = lo;
+                        }
+                        if !matches!(hi, RangeBound::Unbounded) {
+                            *have_hi = hi;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = None;
+    walk(expr, key, params, def, &mut found);
+    found.filter(|(_, lo, hi)| {
+        !(matches!(lo, RangeBound::Unbounded) && matches!(hi, RangeBound::Unbounded))
+    })
+}
+
+/// The column name an expression names, if it is a plain column of `key`'s
+/// table that actually exists.
+fn bound_col(e: &Expr, key: &str, def: &crate::catalog::Table) -> Option<String> {
+    match e {
+        Expr::Column { table, name } if table.as_deref().map(|t| t == key).unwrap_or(true) => def
+            .columns
+            .iter()
+            .any(|c| c.name == *name)
+            .then(|| name.clone()),
+        // After resolution the filter carries bound positions, not names.
+        Expr::Col(i) => def.columns.get(*i).map(|c| c.name.clone()),
+        _ => None,
+    }
+}
+
+/// `a <op> b` -> `b <flipped> a`.
+fn flip_cmp(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        other => other,
+    }
+}
+
+/// Rows accumulated by a streamed DML match pass.
+struct DmlAcc {
+    out: Vec<(u64, Vec<Value>)>,
+    examined: u64,
+    cap: u64,
+    want_cells: bool,
+}
+
+impl DmlAcc {
+    /// Returns `false` once `cap` matches are in hand — the visitor stops there,
+    /// and that early exit is what makes `DELETE ... LIMIT n` cost the rows it
+    /// walked rather than the table.
+    fn feed(
+        &mut self,
+        filter: &Option<Expr>,
+        schema: &[ColRef],
+        params: &[Value],
+        row_id: u64,
+        cells: &[Value],
+    ) -> Result<bool> {
+        self.examined += 1;
+        if let Some(pred) = filter
+            && !truthy(&eval_scalar(pred, schema, cells, params)?)
+        {
+            return Ok(true);
+        }
+        self.out.push((
+            row_id,
+            if self.want_cells {
+                cells.to_vec()
+            } else {
+                Vec::new()
+            },
+        ));
+        Ok((self.out.len() as u64) < self.cap)
+    }
+}
+
+/// Find the rows a DML statement matches, **without materializing the table**.
+///
+/// This is the fix for the shape that made a big table undeletable: the old
+/// path called `store.scan()` — an owned `Vec` of every row — for any predicate
+/// that was not pure equality, so a `DELETE` on a table larger than memory died
+/// before it wrote anything. Now the rows stream past a predicate and only
+/// matches are kept, bounded further by `limit`.
+///
+/// `want_cells` says whether the caller needs the matched rows themselves
+/// (`RETURNING`, `UPDATE`'s assignments, a foreign-key parent's cascade closure)
+/// or only their ids — the difference between a row and 8 bytes per match.
+fn collect_dml_matches<S: Store>(
+    store: &S,
+    sc: &DmlScope<'_>,
+    limit: Option<u64>,
+    want_cells: bool,
+) -> Result<Vec<(u64, Vec<Value>)>> {
+    let DmlScope {
+        table,
+        key,
+        filter,
+        schema,
+        params,
+        def,
+    } = *sc;
+    let cap = limit.unwrap_or(u64::MAX);
+    let mut acc = DmlAcc {
+        out: Vec::new(),
+        examined: 0,
+        cap,
+        want_cells,
+    };
+    if cap == 0 {
+        store.note_dml_examined(0);
+        return Ok(acc.out);
+    }
+
+    // A predicate that re-enters the store cannot run inside a streamed
+    // visitor. Keep the materializing path for it, unchanged — correct, and the
+    // only shape that still pays for the whole table.
+    if filter.as_ref().is_some_and(calls_store) {
+        let corr = filter.as_ref().is_some_and(has_corr);
+        for (row_id, cells) in dml_candidates(store, table, key, filter, params)? {
+            acc.examined += 1;
+            if let Some(pred) = filter
+                && !truthy(&eval_scalar_corr(
+                    store,
+                    corr,
+                    pred,
+                    schema,
+                    cells.as_slice(),
+                    params,
+                )?)
+            {
+                continue;
+            }
+            let keep = if want_cells { cells } else { Vec::new() };
+            acc.out.push((row_id, keep));
+            if (acc.out.len() as u64) >= cap {
+                break;
+            }
+        }
+        store.note_dml_examined(acc.examined);
+        return Ok(acc.out);
+    }
+
+    if let Some(expr) = filter {
+        // 1. Equality on an indexed column (including the primary key).
+        let eqs = eq_conjuncts(expr, key, params);
+        if !eqs.is_empty() {
+            let served = store.index_visit_eq_ids(table, &eqs, &mut |id, cells| {
+                acc.feed(filter, schema, params, id, cells)
+            })?;
+            if served.is_some() {
+                store.note_dml_examined(acc.examined);
+                return Ok(acc.out);
+            }
+        }
+        // 2. A range on an indexed column — the shape a purge is written in
+        //    (`WHERE created_at < ?`), and the one that used to force a scan.
+        if let Some((col, lo, hi)) = range_conjunct(expr, key, params, def) {
+            let served = store.index_visit_range_ids(table, &col, &lo, &hi, &mut |id, cells| {
+                acc.feed(filter, schema, params, id, cells)
+            })?;
+            if served.is_some() {
+                store.note_dml_examined(acc.examined);
+                return Ok(acc.out);
+            }
+        }
+    }
+
+    // 3. Streamed scan. Decode only the columns the predicate reads when the
+    //    caller wants ids alone; a purge predicate usually touches one column
+    //    of many.
+    let mask: Option<Vec<usize>> = match (want_cells, filter) {
+        (false, Some(f)) => filter_col_mask(f, schema),
+        (false, None) => Some(Vec::new()),
+        (true, _) => None,
+    };
+    store.scan_visit_ids(table, mask.as_deref(), &mut |id, cells| {
+        acc.feed(filter, schema, params, id, cells)
+    })?;
+    store.note_dml_examined(acc.examined);
+    Ok(acc.out)
+}
+
 fn exec_delete<S: Store>(
     store: &S,
     table: &str,
     alias: Option<&str>,
     filter: Option<Expr>,
     returning: Option<Vec<SelectItem>>,
+    limit: Option<u64>,
     params: &[Value],
 ) -> Result<QueryResult> {
     let def = store
@@ -1070,33 +1422,23 @@ fn exec_delete<S: Store>(
     let schema = table_schema(alias.unwrap_or(table), &def);
 
     // Writer-writer exclusion — see exec_update.
-    lock_matching_rows(
-        store,
+    let scope = DmlScope {
         table,
-        alias.unwrap_or(table),
-        &filter,
-        &schema,
+        key: alias.unwrap_or(table),
+        filter: &filter,
+        schema: &schema,
         params,
-    )?;
+        def: &def,
+    };
+    lock_matching_rows(store, &scope, limit)?;
 
-    let filter_corr = filter.as_ref().is_some_and(has_corr);
-    let mut to_delete = Vec::new();
-    for (row_id, cells) in dml_candidates(store, table, alias.unwrap_or(table), &filter, params)? {
-        let matches = match &filter {
-            Some(pred) => truthy(&eval_scalar_corr(
-                store,
-                filter_corr,
-                pred,
-                &schema,
-                cells.as_slice(),
-                params,
-            )?),
-            None => true,
-        };
-        if matches {
-            to_delete.push((row_id, cells));
-        }
-    }
+    // The matched rows' *cells* are only needed to project `RETURNING` and to
+    // walk an `ON DELETE` closure. Without either, ids alone are kept, so a
+    // bulk purge costs 8 bytes a row instead of a row a row — which is what
+    // lets `DELETE ... LIMIT 10000` run against a table far larger than memory.
+    let referenced = !referencing_fks(store, table).is_empty();
+    let want_cells = returning.is_some() || referenced;
+    let to_delete = collect_dml_matches(store, &scope, limit, want_cells)?;
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
     // Collect every row to remove — the matched rows plus each one's ON DELETE

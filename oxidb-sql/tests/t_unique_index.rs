@@ -55,7 +55,8 @@ fn nulls_are_exempt() {
     // Two NULL notes already exist; the index must accept them and more.
     db.execute("CREATE UNIQUE INDEX ux ON t(note)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'can', NULL)").unwrap();
-    db.execute("INSERT INTO t VALUES (4, 'deniz', NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (4, 'deniz', NULL)")
+        .unwrap();
 }
 
 #[test]
@@ -112,7 +113,8 @@ fn unsupported_shapes_refuse_instead_of_underdelivering() {
     seed(&db);
     // Multi-column uniqueness is not enforced — so it must not be accepted.
     assert!(
-        db.execute("CREATE UNIQUE INDEX ux ON t(name, note)").is_err(),
+        db.execute("CREATE UNIQUE INDEX ux ON t(name, note)")
+            .is_err(),
         "multi-column UNIQUE INDEX must refuse"
     );
     // Inside a transaction there is no committed state to validate against.

@@ -524,7 +524,13 @@ impl Store for Transaction<'_> {
         Ok(())
     }
 
-    fn create_index(&self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<()> {
+    fn create_index(
+        &self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<()> {
         // Enabling a uniqueness constraint validates and seeds against
         // committed state under the engine lock; a buffered transaction has
         // neither. Refused rather than half-enforced.

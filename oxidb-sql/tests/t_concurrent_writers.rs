@@ -202,10 +202,13 @@ fn a_table_created_in_the_batch_commits() {
     let (_d, db) = open();
     let mut tx = None;
     sess(&db, &mut tx, "BEGIN").unwrap();
-    sess(&db, &mut tx, "CREATE TABLE fresh (id INT PRIMARY KEY, v INT)")
-        .unwrap();
-    sess(&db, &mut tx, "INSERT INTO fresh VALUES (1, 1), (2, 2)")
-        .unwrap();
+    sess(
+        &db,
+        &mut tx,
+        "CREATE TABLE fresh (id INT PRIMARY KEY, v INT)",
+    )
+    .unwrap();
+    sess(&db, &mut tx, "INSERT INTO fresh VALUES (1, 1), (2, 2)").unwrap();
     sess(&db, &mut tx, "COMMIT").unwrap();
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM fresh"), r1(vec![i(2)]));
 }
@@ -225,7 +228,8 @@ fn writes_survive_a_restart() {
             .unwrap();
         db.execute("INSERT INTO t VALUES (2, 'autocommit')")
             .unwrap();
-        db.execute_params_in_session("COMMIT", &[], &mut tx).unwrap();
+        db.execute_params_in_session("COMMIT", &[], &mut tx)
+            .unwrap();
     }
     let db = open_at(dir.path());
     assert_eq!(

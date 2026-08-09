@@ -5,8 +5,8 @@
 //! is an error, not a hang; and every shape whose rows are not base-table
 //! rows is refused by name instead of silently not locking.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use oxidb_sql::{SqlEngine, SqlOptions, Value};

@@ -796,7 +796,7 @@ impl BTreeCollection {
         };
         let mut buf: Vec<u8> = Vec::new();
         let mut count = 0usize;
-        let scan = self.storage.scan_bytes_while(|bytes| {
+        let scan = self.storage.scan_bytes_chunked_while(|bytes| {
             // Byte-level match: skip non-matches without decoding to Value.
             let matched = match query::matches_raw_jsonb(&query, bytes) {
                 Some(b) => b,
@@ -1008,6 +1008,45 @@ impl BTreeCollection {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn in_flight_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.apply_barrier.read()
+    }
+
+    /// Hold every writer off for the duration of an index build.
+    ///
+    /// An index builder scans the collection, builds the index in a local, and
+    /// registers it under the index map's write lock only at the end. A writer
+    /// running in that window takes the same map lock, finds no such index, and
+    /// maintains nothing — so the index is published missing everything written
+    /// since the build began, and stays that way: disk-first persists it and
+    /// opens it verbatim, and re-issuing `create_index` is a no-op once the
+    /// field is in the map. Measured before this guard existed, on a 200k
+    /// collection: 36 of 43 concurrent inserts unreachable afterwards **and
+    /// after a restart**; 46 of 56 concurrent updates answered under the value
+    /// the scan saw rather than the document's (a single-field equality is
+    /// "fully indexed", so the post-filter that would have caught it is
+    /// skipped); a UNIQUE index accepting 41 duplicates written during its own
+    /// build. `tests/index_build_race.rs`.
+    ///
+    /// Every write path takes `apply_barrier.read()` across its storage
+    /// mutation *and* its index update, so draining it is what makes the scan
+    /// see a collection that cannot move underneath it. **Reads are
+    /// unaffected** — they never take this lock.
+    ///
+    /// The cost is honest and bounded by the build: writes to this collection
+    /// (only this one — the barrier is per collection) wait for it, which is
+    /// MongoDB's foreground index build. `online_checkpoint` deliberately holds
+    /// the same lock only across a rename because it *can*; a build cannot,
+    /// because correctness here is exactly "nothing changed while I looked".
+    /// Non-blocking is a follow-up, and it is not a smaller change: it needs a
+    /// staging index writers maintain from the moment it is registered, with
+    /// the backfill reading each document **under the lock the writers take**
+    /// — read it outside and the stale-entry direction above comes straight
+    /// back.
+    ///
+    /// Callers must not hold this across anything that writes: `create_ttl_index`
+    /// scopes it to the `create_index` call and evicts afterwards, or the
+    /// eviction's own `apply_barrier.read()` would deadlock against it.
+    fn index_build_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.apply_barrier.write()
     }
 
     /// Checkpoint the WAL **without stopping writes**, and without the data
@@ -1230,7 +1269,7 @@ impl BTreeCollection {
     where
         F: FnMut(DocumentId, &Arc<Value>) -> Result<bool>,
     {
-        self.storage.scan_all_while(|key, bytes| {
+        self.storage.scan_all_chunked_while(|key, bytes| {
             // Serve from cache when present, but do NOT insert on a miss: a
             // full-collection scan that `put`s every doc evicts the entire
             // hot working set (and pays an LRU write per document) for
@@ -1260,7 +1299,7 @@ impl BTreeCollection {
         F: FnMut(&Value) -> Result<bool>,
     {
         // Sorted iteration (preserves key order for find queries)
-        self.storage.scan_all_while(|key, bytes| {
+        self.storage.scan_all_chunked_while(|key, bytes| {
             if let Some(arc) = self.doc_cache.get(key) {
                 return f(&arc);
             }
@@ -1724,7 +1763,7 @@ impl BTreeCollection {
             let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
             let mut results = Vec::new();
             let mut skipped = 0;
-            self.storage.scan_all_while(|key, bytes| {
+            self.storage.scan_all_chunked_while(|key, bytes| {
                 if skipped < skip {
                     skipped += 1;
                     return Ok(true);
@@ -3128,6 +3167,19 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     /// Delete documents matching a query. Returns IDs of deleted documents.
+    /// Does any index hold per-document *values* that a delete has to undo?
+    ///
+    /// Only the field and composite indexes are asked, and deliberately: the
+    /// text, vector and geo indexes are removed from by id alone
+    /// (`remove_doc(id)` / `remove(id)`), so they need no document. Getting this
+    /// wrong in the generous direction costs a retained `Arc`; getting it wrong
+    /// in the other direction would leave stale index entries behind, so this
+    /// asks the indexes themselves rather than tracking a flag some future
+    /// `create_index` could forget to set.
+    fn has_any_index(&self) -> bool {
+        !self.field_indexes.read().is_empty() || !self.composite_indexes.read().is_empty()
+    }
+
     pub fn delete(&self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
         self.delete_docs(query_json, limit, false)
             .map(|(ids, _)| ids)
@@ -3145,12 +3197,33 @@ impl BTreeCollection {
     ) -> Result<(Vec<DocumentId>, Vec<Value>)> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
+        // `limit: Some(0)` means delete nothing, and has to be handled here.
+        // Every access path below pushes a match and *then* tests the limit —
+        // correct for any positive limit, and it was only ever reachable as
+        // `Some(1)` from `delete_one`. Exposing the limit to callers made zero
+        // reachable, where push-then-test deletes one document. A purge loop
+        // that computes a batch size of zero must delete nothing, not one row.
+        if limit == Some(0) {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let query = query::parse_query(query_json)?;
 
-        // Phase 1: Find matching docs
+        // Phase 1: Find matching docs.
+        //
+        // The document is carried as the `Arc` the cache already holds, not a
+        // deep copy of it: phase 2 needs the values to drop this document out of
+        // every index (`remove_value(id, &data)`), but that is a read. Cloning
+        // the JSON per match cost a full document copy for every row of a bulk
+        // delete — on a purge of millions, the pre-images dominated the memory.
+        //
+        // And when nothing will read them it is not carried at all: a collection
+        // with no index of any kind, deleted with no change-stream subscriber
+        // listening, needs the id alone. `keep_docs` is the subscriber's
+        // pre-image, so it forces the document to be kept regardless.
+        let needs_values = keep_docs || self.has_any_index();
         struct DeleteOp {
             id: DocumentId,
-            data: Value,
+            data: Option<Arc<Value>>,
         }
         let mut ops = Vec::new();
 
@@ -3166,7 +3239,7 @@ impl BTreeCollection {
                     {
                         ops.push(DeleteOp {
                             id,
-                            data: (*arc).clone(),
+                            data: needs_values.then_some(arc),
                         });
                         if ops.len() >= lim {
                             return false;
@@ -3190,7 +3263,10 @@ impl BTreeCollection {
                             && let Some(data) = self.read_doc(id)?
                             && query::matches_value(&query, &data)
                         {
-                            ops.push(DeleteOp { id, data });
+                            ops.push(DeleteOp {
+                                id,
+                                data: needs_values.then(|| Arc::new(data)),
+                            });
                             if limit.is_some_and(|l| ops.len() >= l) {
                                 break;
                             }
@@ -3204,7 +3280,7 @@ impl BTreeCollection {
                         if query::matches_value(&query, arc) {
                             ops.push(DeleteOp {
                                 id,
-                                data: (**arc).clone(),
+                                data: needs_values.then(|| Arc::clone(arc)),
                             });
                             if limit.is_some_and(|l| ops.len() >= l) {
                                 return Ok(false);
@@ -3249,11 +3325,13 @@ impl BTreeCollection {
             self.invalidate_bytes_cache(op.id);
             self.doc_cache.remove(op.id);
 
-            for idx in fi.values_mut() {
-                idx.remove_value(op.id, &op.data);
-            }
-            for idx in ci.iter_mut() {
-                idx.remove_value(op.id, &op.data);
+            if let Some(ref data) = op.data {
+                for idx in fi.values_mut() {
+                    idx.remove_value(op.id, data);
+                }
+                for idx in ci.iter_mut() {
+                    idx.remove_value(op.id, data);
+                }
             }
             if let Some(ref mut text_idx) = *ti {
                 text_idx.remove_doc(op.id);
@@ -3270,7 +3348,12 @@ impl BTreeCollection {
 
             deleted_ids.push(op.id);
             if keep_docs {
-                pre_images.push(op.data);
+                // The only place the document is materialized, and only for a
+                // subscriber that asked for pre-images. `try_unwrap` avoids the
+                // copy when this delete holds the last reference.
+                if let Some(arc) = op.data {
+                    pre_images.push(Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
+                }
             }
         }
         if !deleted_ids.is_empty() {
@@ -3547,6 +3630,15 @@ impl BTreeCollection {
             }
         }
 
+        // Writers are held off from here to registration — see
+        // `index_build_barrier`. The existence check is repeated under it
+        // because two builders racing on the same field would otherwise both
+        // scan, and the loser's work is pure waste.
+        let _build = self.index_build_barrier();
+        if self.field_indexes.read().contains_key(field) {
+            return Ok(());
+        }
+
         // Parallel index build: extract (id, IndexValue) pairs from all docs
         let slices = self.storage.values_as_slices();
         let field_owned = field.to_string();
@@ -3603,6 +3695,14 @@ impl BTreeCollection {
             }
         }
 
+        // See `index_build_barrier` — and note this one is not only about
+        // missing entries: a value written during the build is a value the
+        // finished UNIQUE index never saw, so it is not enforced.
+        let _build = self.index_build_barrier();
+        if self.field_indexes.read().contains_key(field) {
+            return Ok(());
+        }
+
         let mut idx = if self.storage.is_disk_first() {
             let mpath = self.data_dir.join(format!("{}.{}.mfidx", self.name, field));
             PagedFieldIndex::new_disk(field.to_string(), true, mpath)
@@ -3657,6 +3757,17 @@ impl BTreeCollection {
             if ci.iter().any(|i| i.name() == name) {
                 return Ok(name);
             }
+        }
+
+        // See `index_build_barrier`.
+        let _build = self.index_build_barrier();
+        if self
+            .composite_indexes
+            .read()
+            .iter()
+            .any(|i| i.name() == name)
+        {
+            return Ok(name);
         }
 
         // Disk-first collections keep composite entries in an mmap'd
@@ -3860,6 +3971,12 @@ impl BTreeCollection {
             }
         }
 
+        // See `index_build_barrier`.
+        let _build = self.index_build_barrier();
+        if self.text_index.read().is_some() {
+            return Ok(());
+        }
+
         let mut idx = CollectionTextIndex::new(fields);
 
         self.storage.scan_bytes_while(|bytes| {
@@ -3893,6 +4010,12 @@ impl BTreeCollection {
             if gi.contains_key(field) {
                 return Ok(());
             }
+        }
+
+        // See `index_build_barrier`.
+        let _build = self.index_build_barrier();
+        if self.geo_indexes.read().contains_key(field) {
+            return Ok(());
         }
         let mut gidx = if self.storage.is_disk_first() {
             GeoIndex::new_disk(
@@ -4008,6 +4131,12 @@ impl BTreeCollection {
             if vi.contains_key(field) {
                 return Ok(());
             }
+        }
+
+        // See `index_build_barrier`.
+        let _build = self.index_build_barrier();
+        if self.vector_indexes.read().contains_key(field) {
+            return Ok(());
         }
 
         let mut idx = VectorIndex::new(field.to_string(), dimension, metric);
@@ -4763,30 +4892,46 @@ impl BTreeCollection {
             return 0;
         }
 
-        // Delete expired docs — acquire write locks for index cleanup
-        let mut fi = self.field_indexes.write();
-        let mut ci = self.composite_indexes.write();
-        let mut ti = self.text_index.write();
-
+        // Evict in chunks, releasing the index write locks between them.
+        //
+        // Steady state this changes nothing — a tick expires a handful of
+        // documents and takes one chunk. It matters for the backlog: putting a
+        // TTL index on an existing large collection, or restarting after
+        // downtime, makes a single tick's `to_delete` the whole expired set,
+        // and evicting it under one set of write locks holds the field,
+        // composite and text indexes for the entire sweep. Every reader and
+        // writer of this collection parks behind a maintenance thread nobody
+        // asked to run. Chunking bounds that to one chunk's worth of work.
+        //
+        // Re-checking `contains_key` per document already made this safe
+        // against concurrent deletion, which is what lets the locks be dropped
+        // mid-sweep: a document another writer removed while we were not
+        // holding them is simply skipped.
+        const TTL_EVICT_CHUNK: usize = 4_096;
         let mut evicted = 0;
-        for id in to_delete {
-            if self.storage.contains_key(id)
-                && let Some(bytes) = self.storage.get(id)
-                && let Ok(data) = codec::decode_doc(&bytes)
-            {
-                self.storage.remove(id);
-                self.invalidate_bytes_cache(id);
-                self.doc_cache.remove(id);
-                for idx in fi.values_mut() {
-                    idx.remove_value(id, &data);
+        for chunk in to_delete.chunks(TTL_EVICT_CHUNK) {
+            let mut fi = self.field_indexes.write();
+            let mut ci = self.composite_indexes.write();
+            let mut ti = self.text_index.write();
+            for &id in chunk {
+                if self.storage.contains_key(id)
+                    && let Some(bytes) = self.storage.get(id)
+                    && let Ok(data) = codec::decode_doc(&bytes)
+                {
+                    self.storage.remove(id);
+                    self.invalidate_bytes_cache(id);
+                    self.doc_cache.remove(id);
+                    for idx in fi.values_mut() {
+                        idx.remove_value(id, &data);
+                    }
+                    for idx in ci.iter_mut() {
+                        idx.remove_value(id, &data);
+                    }
+                    if let Some(ref mut text_idx) = *ti {
+                        text_idx.remove_doc(id);
+                    }
+                    evicted += 1;
                 }
-                for idx in ci.iter_mut() {
-                    idx.remove_value(id, &data);
-                }
-                if let Some(ref mut text_idx) = *ti {
-                    text_idx.remove_doc(id);
-                }
-                evicted += 1;
             }
         }
 

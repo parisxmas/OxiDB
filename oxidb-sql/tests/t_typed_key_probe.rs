@@ -40,11 +40,7 @@ const MS: i64 = 894_240_000_000;
 
 fn assert_probes(db: &oxidb_sql::SqlEngine) {
     // Parameterized, as EF sends it.
-    let n = rows_p(
-        db,
-        "SELECT count(*) FROM o WHERE d = ?",
-        &[Value::Int(MS)],
-    );
+    let n = rows_p(db, "SELECT count(*) FROM o WHERE d = ?", &[Value::Int(MS)]);
     assert_eq!(n[0][0], Value::Int(3), "int param vs TIMESTAMP index");
     // Inline integer literal.
     let n = rows(db, &format!("SELECT count(*) FROM o WHERE d = {MS}"));

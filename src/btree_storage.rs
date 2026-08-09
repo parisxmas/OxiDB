@@ -36,6 +36,24 @@ use wasm_map::WasmMap as SccMap;
 
 use crate::error::{Error, Result};
 
+/// First window of a chunked scan. Small on purpose: a scan that stops at its
+/// first match (`find_one`, a `LIMIT`ed delete) pays exactly this much.
+const SCAN_CHUNK_MIN: usize = 4_096;
+/// A chunked scan re-visits the key index once per window, so the window is
+/// capped at `count / SCAN_CHUNK_PASSES` rather than at an absolute size: the
+/// passes stay bounded as the collection grows. A fixed byte budget would
+/// instead make the pass count grow with the collection — trading a bounded
+/// slowdown for an unbounded one, which on a 100M-document collection is the
+/// difference between 4 passes and 800.
+///
+/// The divisor is where the trade was measured (`examples/scan_chunk_bench.rs`,
+/// 500k and 2M documents): peak live bytes 24 B/document → 2 B/document
+/// (12.6x), a full walk at 0.94-0.97x, a scan that stops at its first match
+/// 5-7x faster. 16 passes bought 0.5 B/document but cost 0.77-0.80x — too much
+/// wall clock for memory that was already bounded well below the documents
+/// being read.
+const SCAN_CHUNK_PASSES: usize = 4;
+
 /// Single-threaded stand-in for `scc::HashMap` on `wasm32-unknown-unknown`.
 ///
 /// Implements only the `*_sync` surface `BTreeStorage` uses, mirroring scc's
@@ -1375,6 +1393,104 @@ impl BTreeStorage {
         Ok(())
     }
 
+    /// Smallest `limit` keys strictly greater than `after`, ascending.
+    ///
+    /// One pass over the key index, keeping a bounded max-heap: memory is
+    /// `limit` keys, not the collection. Past the point where the heap fills,
+    /// the common case is a single compare against its maximum.
+    fn keys_after(&self, after: Option<u64>, limit: usize) -> Vec<u64> {
+        let mut heap: std::collections::BinaryHeap<u64> =
+            std::collections::BinaryHeap::with_capacity(limit);
+        self.scan_keys(|k| {
+            if after.is_some_and(|a| k <= a) {
+                return;
+            }
+            if heap.len() < limit {
+                heap.push(k);
+            } else if heap.peek().is_some_and(|max| k < *max) {
+                heap.pop();
+                heap.push(k);
+            }
+        });
+        let mut keys = heap.into_vec();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Iterate every entry in key order, holding only one *chunk* of keys at a
+    /// time instead of one entry per document.
+    ///
+    /// The key index is a hash map, so producing key order costs a pass over
+    /// it; the un-chunked scans pay that once and keep the whole key set
+    /// (~24 B/document, and a full sort) even when the callback stops at the
+    /// first match. This walks in bounded windows instead: each window is one
+    /// pass keeping the smallest `limit` keys past the previous window's last.
+    /// The window starts small so an early-stopping scan pays one small pass,
+    /// then grows 8x per window to a cap derived from the collection size, so
+    /// a full scan stays at a handful of passes over a structure whose entries
+    /// are cheap next to the documents being read.
+    ///
+    /// **Visibility, versus the un-chunked scans:** those fix the key set at
+    /// `t₀`, this one re-reads the index per window, so a document inserted
+    /// mid-scan *above* the current position is now seen. That is the phantom
+    /// `docs/isolation.md` already admits for non-transactional readers, and
+    /// the two consumers with a stronger guarantee do not take it from the
+    /// scan: `snapshot_docs` resolves every id against the snapshot gate
+    /// (a post-snapshot insert resolves to `Prior(None)` and is dropped, a
+    /// mid-scan delete is recovered from `remembered_ids`, neither sourced
+    /// from the scan), and `aggregate` validates `changed_since` *after* the
+    /// run and re-runs the slow path if anything wrote at all. Index builds
+    /// deliberately keep the un-chunked scans.
+    fn scan_chunked_while<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8]) -> Result<bool>,
+    {
+        let cap = (self.count() / SCAN_CHUNK_PASSES).max(SCAN_CHUNK_MIN);
+        let mut limit = SCAN_CHUNK_MIN.min(cap);
+        let mut after: Option<u64> = None;
+        loop {
+            let keys = self.keys_after(after, limit);
+            if keys.is_empty() {
+                return Ok(());
+            }
+            // Short window ⇒ the index held nothing further; one more pass
+            // would only re-read it to find that out.
+            let exhausted = keys.len() < limit;
+            after = keys.last().copied();
+            for key in keys {
+                // Gone means deleted while we scanned; skip it, as a scan that
+                // started a moment later would have. `get` holds the data lock
+                // only around its own read — see `scan_all_while` for why the
+                // callback must never run under it.
+                let Some(value) = self.get(key) else { continue };
+                if !f(key, &value)? {
+                    return Ok(());
+                }
+            }
+            if exhausted {
+                return Ok(());
+            }
+            limit = limit.saturating_mul(8).min(cap);
+        }
+    }
+
+    /// Bounded-memory [`scan_all_while`](Self::scan_all_while).
+    /// See [`scan_chunked_while`](Self::scan_chunked_while) for the trade.
+    pub fn scan_all_chunked_while<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8]) -> Result<bool>,
+    {
+        self.scan_chunked_while(|key, bytes| f(key, bytes))
+    }
+
+    /// Bounded-memory [`scan_bytes_while`](Self::scan_bytes_while).
+    pub fn scan_bytes_chunked_while<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        self.scan_chunked_while(|_key, bytes| f(bytes))
+    }
+
     /// Iterate all entries calling `f` for each (bytes only, sorted by key).
     /// Collects keys first, then looks up each value.
     pub fn scan_bytes_while<F>(&self, mut f: F) -> Result<()>
@@ -1681,6 +1797,140 @@ mod tests {
         }
         scanner.join().unwrap();
         compactor.join().unwrap();
+    }
+
+    /// Keys are laid out with gaps (1, 3, 5, …) throughout these tests on
+    /// purpose: with contiguous ids a window that resumed one key early or
+    /// late still lands on a real key, so an off-by-one at the boundary is
+    /// invisible. With gaps it either duplicates or skips.
+    fn gapped(storage: &BTreeStorage, count: u64) -> Vec<u64> {
+        let keys: Vec<u64> = (0..count).map(|i| i * 2 + 1).collect();
+        for k in &keys {
+            storage.insert(*k, format!("doc_{k}").into_bytes());
+        }
+        keys
+    }
+
+    fn scanned_chunked(storage: &BTreeStorage) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        storage
+            .scan_all_chunked_while(|k, b| {
+                out.push((k, b.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+        out
+    }
+
+    fn scanned_unchunked(storage: &BTreeStorage) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        storage
+            .scan_all_while(|k, b| {
+                out.push((k, b.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+        out
+    }
+
+    /// The whole contract: walking in windows must be indistinguishable from
+    /// the single-snapshot scan it replaces — same documents, same key order,
+    /// no duplicates across a window boundary and none dropped at one. The
+    /// collection has to be larger than `SCAN_CHUNK_MIN` or the scan is one
+    /// window and this proves nothing.
+    #[test]
+    fn a_chunked_scan_returns_exactly_what_the_unchunked_scan_did() {
+        let storage = BTreeStorage::new_in_memory("chunked");
+        let keys = gapped(&storage, (SCAN_CHUNK_MIN as u64) * 2 + 137);
+        assert!(storage.count() > SCAN_CHUNK_MIN, "fixture fits one window");
+
+        let chunked = scanned_chunked(&storage);
+        assert_eq!(chunked, scanned_unchunked(&storage));
+        assert_eq!(
+            chunked.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            keys,
+            "ascending key order, every key once"
+        );
+    }
+
+    /// Same property against the disk-first backend, where the values come
+    /// from the data file and the window is re-resolved through the index.
+    #[test]
+    fn a_chunked_scan_matches_the_unchunked_one_on_disk_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StorageOptions {
+            disk_first: true,
+            ..StorageOptions::default()
+        };
+        let storage =
+            BTreeStorage::open_with_options("chunked_disk", dir.path(), None, opts).unwrap();
+        gapped(&storage, (SCAN_CHUNK_MIN as u64) + 500);
+
+        assert_eq!(scanned_chunked(&storage), scanned_unchunked(&storage));
+    }
+
+    /// The point of the small first window: a scan that stops early must not
+    /// have walked past it. It also must stop exactly where it said, not at
+    /// the end of the window it was in.
+    #[test]
+    fn a_chunked_scan_stops_where_the_callback_stops_it() {
+        let storage = BTreeStorage::new_in_memory("chunked_stop");
+        gapped(&storage, (SCAN_CHUNK_MIN as u64) * 2);
+
+        let mut seen = Vec::new();
+        storage
+            .scan_all_chunked_while(|k, _| {
+                seen.push(k);
+                Ok(seen.len() < 3)
+            })
+            .unwrap();
+        assert_eq!(seen, vec![1, 3, 5]);
+    }
+
+    /// What makes the scan bounded rather than merely re-sorted: a window is
+    /// at most `limit` keys however large the collection is. A
+    /// collect-everything implementation passes every test above and fails
+    /// this one.
+    #[test]
+    fn a_window_holds_its_limit_not_the_collection() {
+        let storage = BTreeStorage::new_in_memory("chunked_window");
+        gapped(&storage, 10_000);
+
+        let first = storage.keys_after(None, 10);
+        assert_eq!(first, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+
+        // Strictly greater than the resume point — a `>=` here re-emits the
+        // last key of every window.
+        let next = storage.keys_after(Some(19), 10);
+        assert_eq!(next, vec![21, 23, 25, 27, 29, 31, 33, 35, 37, 39]);
+
+        // Past the end: empty, which is what terminates the loop.
+        assert!(storage.keys_after(Some(19_999), 10).is_empty());
+    }
+
+    /// A document deleted while the scan is between windows is skipped, the
+    /// same way one deleted between the key collection and the value read is
+    /// on the un-chunked path. It must not surface as an error or a hole in
+    /// the iteration.
+    #[test]
+    fn a_document_deleted_mid_scan_is_skipped_not_failed() {
+        let storage = BTreeStorage::new_in_memory("chunked_delete");
+        let keys = gapped(&storage, (SCAN_CHUNK_MIN as u64) + 10);
+        let doomed = keys[keys.len() - 1];
+
+        let mut seen = Vec::new();
+        storage
+            .scan_all_chunked_while(|k, _| {
+                if seen.is_empty() {
+                    storage.remove(doomed);
+                }
+                seen.push(k);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(seen.len(), keys.len() - 1);
+        assert!(!seen.contains(&doomed));
     }
 
     #[test]

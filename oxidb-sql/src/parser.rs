@@ -1315,11 +1315,27 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
     let (table, alias) = table_and_alias_from_twj(&twjs[0])?;
     let filter = del.selection.map(|e| translate_expr(e, p)).transpose()?;
     let returning = translate_returning(del.returning.as_ref(), p)?;
+    // `DELETE ... ORDER BY` is refused rather than ignored: accepting it would
+    // promise a deletion order this executor does not implement, and with LIMIT
+    // that silently changes *which* rows go.
+    if !del.order_by.is_empty() {
+        return Err(SqlError::Unsupported("DELETE ... ORDER BY".into()));
+    }
+    let limit = del
+        .limit
+        .map(|e| match translate_expr(e, p)? {
+            Expr::Literal(Value::Int(n)) if n >= 0 => Ok(n as u64),
+            _ => Err(SqlError::Unsupported(
+                "DELETE ... LIMIT must be a non-negative integer literal".into(),
+            )),
+        })
+        .transpose()?;
     Ok(Statement::Delete {
         table,
         alias,
         filter,
         returning,
+        limit,
     })
 }
 
@@ -2017,7 +2033,11 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
             {
                 let (months, ms) = interval_parts(iv)?;
                 if months != 0 {
-                    let sign = if matches!(op, sp::BinaryOperator::Minus) { -1 } else { 1 };
+                    let sign = if matches!(op, sp::BinaryOperator::Minus) {
+                        -1
+                    } else {
+                        1
+                    };
                     let mut e = Expr::Func {
                         func: ScalarFunc::AddMonths,
                         args: vec![
@@ -2474,17 +2494,17 @@ fn interval_parts(iv: &sp::Interval) -> Result<(i64, i64)> {
             DatePart::Week => 604_800_000,
             DatePart::Month | DatePart::Year => {
                 if n.fract() != 0.0 {
-                    return Err(SqlError::Unsupported(
-                        "fractional calendar INTERVAL".into(),
-                    ));
+                    return Err(SqlError::Unsupported("fractional calendar INTERVAL".into()));
                 }
-                let per = if matches!(map_date_part(field)?, DatePart::Year) { 12 } else { 1 };
+                let per = if matches!(map_date_part(field)?, DatePart::Year) {
+                    12
+                } else {
+                    1
+                };
                 return Ok((n as i64 * per, 0));
             }
             other => {
-                return Err(SqlError::Unsupported(format!(
-                    "INTERVAL unit {other:?}"
-                )));
+                return Err(SqlError::Unsupported(format!("INTERVAL unit {other:?}")));
             }
         };
         return Ok((0, (n * unit as f64).round() as i64));
@@ -2505,9 +2525,8 @@ fn interval_parts(iv: &sp::Interval) -> Result<(i64, i64)> {
             months += n as i64 * per;
             continue;
         }
-        let ms = fixed_unit_ms(&unit).ok_or_else(|| {
-            SqlError::Unsupported(format!("INTERVAL unit {unit}"))
-        })?;
+        let ms = fixed_unit_ms(&unit)
+            .ok_or_else(|| SqlError::Unsupported(format!("INTERVAL unit {unit}")))?;
         total += (n * ms as f64).round() as i64;
     }
     Ok((months, total))

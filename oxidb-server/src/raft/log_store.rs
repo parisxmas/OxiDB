@@ -465,7 +465,11 @@ fn apply_request_in(
                 message: e.to_string(),
             },
         },
-        OxiDbRequest::Delete { collection, query } => match db.delete(&collection, &query) {
+        OxiDbRequest::Delete {
+            collection,
+            query,
+            limit,
+        } => match db.delete_limited(&collection, &query, limit) {
             Ok(count) => OxiDbResponse::Ok {
                 data: json!({ "deleted": count }),
             },

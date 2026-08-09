@@ -26,10 +26,8 @@ fn seed() -> (tempfile::TempDir, oxidb_sql::SqlEngine) {
     }
     // A: 2*10 + 3*10 = 50 ; B: 1*100 = 100 ; C: none.
     for (cat, prod, qty) in [(1, 10, 2), (1, 10, 3), (2, 20, 1)] {
-        db.execute(&format!(
-            "INSERT INTO line VALUES ({cat}, {prod}, {qty})"
-        ))
-        .unwrap();
+        db.execute(&format!("INSERT INTO line VALUES ({cat}, {prod}, {qty})"))
+            .unwrap();
     }
     (dir, db)
 }

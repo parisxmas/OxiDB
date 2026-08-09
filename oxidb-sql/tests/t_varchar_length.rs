@@ -70,9 +70,11 @@ fn char_length_enforced_too() {
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, code CHAR(3))")
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
-    assert!(err(&db, "INSERT INTO t VALUES (2, 'abcd')")
-        .to_lowercase()
-        .contains("too long"));
+    assert!(
+        err(&db, "INSERT INTO t VALUES (2, 'abcd')")
+            .to_lowercase()
+            .contains("too long")
+    );
 }
 
 #[test]
@@ -83,9 +85,11 @@ fn length_is_characters_not_bytes() {
     // "çğü" is 3 characters but 6 UTF-8 bytes — must be allowed.
     db.execute("INSERT INTO t VALUES (1, 'çğü')").unwrap();
     // 4 characters is over the limit.
-    assert!(err(&db, "INSERT INTO t VALUES (2, 'çğüx')")
-        .to_lowercase()
-        .contains("too long"));
+    assert!(
+        err(&db, "INSERT INTO t VALUES (2, 'çğüx')")
+            .to_lowercase()
+            .contains("too long")
+    );
 }
 
 #[test]
@@ -121,9 +125,12 @@ fn describe_reports_varchar_length() {
 fn alter_add_column_enforces_length() {
     let (_d, db) = open();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN tag VARCHAR(4)").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN tag VARCHAR(4)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'abcd')").unwrap();
-    assert!(err(&db, "INSERT INTO t VALUES (2, 'abcde')")
-        .to_lowercase()
-        .contains("too long"));
+    assert!(
+        err(&db, "INSERT INTO t VALUES (2, 'abcde')")
+            .to_lowercase()
+            .contains("too long")
+    );
 }

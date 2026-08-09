@@ -51,7 +51,10 @@ fn int_rejects_values_outside_32_bits() {
             .is_err(),
         "2^31 does not fit INT"
     );
-    assert!(db.execute("INSERT INTO t VALUES (3, -2147483649, 1)").is_err());
+    assert!(
+        db.execute("INSERT INTO t VALUES (3, -2147483649, 1)")
+            .is_err()
+    );
 
     // BIGINT keeps the full i64 range, which is what every integer is stored as.
     assert_eq!(
@@ -82,7 +85,10 @@ fn the_range_is_enforced_on_update_and_in_transactions() {
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
 
-    assert!(db.execute("UPDATE t SET small = 40000 WHERE id = 1").is_err());
+    assert!(
+        db.execute("UPDATE t SET small = 40000 WHERE id = 1")
+            .is_err()
+    );
     assert_eq!(rows(&db, "SELECT small FROM t"), vec![vec![i(1)]]);
 
     // Inside a transaction the write is refused at the statement, as any

@@ -104,8 +104,8 @@ fn low_lock_backup_under_concurrent_writes_and_checkpoints() {
             SqlOptions {
                 disk_first: false,
                 checkpoint_bytes: 8 * 1024,
-            ..SqlOptions::default()
-        },
+                ..SqlOptions::default()
+            },
         )
         .unwrap(),
     );

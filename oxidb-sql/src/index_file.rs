@@ -426,6 +426,39 @@ impl MappedIndex {
         Ok(lo)
     }
 
+    /// Row ids whose **first** key column falls inside `[lo, hi]`, as of the
+    /// last checkpoint. Callers must verify each against the live row.
+    ///
+    /// The file is sorted by decoded key tuple, so this is a `lower_bound` seek
+    /// followed by a forward walk that stops at the first key past `hi` — the
+    /// cost is the matching run, not the index. Note the seek is by the
+    /// one-element tuple `[lo]`, which sorts at or below every tuple beginning
+    /// with `lo`; an exclusive low bound is filtered per entry rather than
+    /// seeked past, because `[lo]` sorts *below* `[lo, x]` and skipping it would
+    /// skip composite keys that belong in the answer.
+    pub fn range_first_col(
+        &self,
+        lo: &crate::store::RangeBound,
+        hi: &crate::store::RangeBound,
+    ) -> Result<Vec<u64>> {
+        let at = match lo.value() {
+            None => 0,
+            Some(v) => self.lower_bound(&[IndexKey(v.clone())])?,
+        };
+        let mut out = Vec::new();
+        for i in at..self.entries {
+            let key = self.key_at(i)?;
+            let Some(first) = key.first() else { continue };
+            if !hi.allows_high(&first.0) {
+                break; // sorted by key — no later entry can qualify
+            }
+            if lo.allows_low(&first.0) {
+                out.extend(self.ids_at(i));
+            }
+        }
+        Ok(out)
+    }
+
     /// Row ids recorded for exactly `key` at the last checkpoint. Callers must
     /// verify each against the live row — see the module note.
     pub fn get(&self, key: &[IndexKey]) -> Result<Vec<u64>> {

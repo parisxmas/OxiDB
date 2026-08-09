@@ -651,13 +651,32 @@ fn handle_request_session_inner(
                 Some(q) => q,
                 None => return err_bytes("missing 'query'"),
             };
+            // `limit` makes a bulk purge expressible: delete at most N matching
+            // documents and stop looking, so a caller can batch a collection
+            // far larger than memory instead of choosing between one and all.
+            let limit = match request.get("limit") {
+                None => None,
+                Some(Value::Null) => None,
+                Some(v) => match v.as_u64() {
+                    Some(n) => Some(n as usize),
+                    None => return err_bytes("'limit' must be a non-negative integer"),
+                },
+            };
             if let Some(tx_id) = *active_tx {
+                // A transaction buffers its writes and applies them at commit;
+                // the limit is applied by the delete path itself, which a
+                // buffered delete does not run. Refused by name rather than
+                // silently ignored — a purge loop that quietly deleted
+                // everything per batch would be worse than an error.
+                if limit.is_some() {
+                    return err_bytes("'limit' is not supported for a delete inside a transaction");
+                }
                 match db.tx_delete(tx_id, col, query) {
                     Ok(()) => ok_bytes(json!("buffered")),
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
-                match db.delete(col, query) {
+                match db.delete_limited(col, query, limit) {
                     Ok(count) => ok_bytes(json!({ "deleted": count })),
                     Err(e) => err_bytes(&e.to_string()),
                 }

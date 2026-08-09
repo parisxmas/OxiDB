@@ -2159,7 +2159,26 @@ impl OxiDb {
         self.delete_limited(collection, query, Some(1))
     }
 
-    fn delete_limited(&self, collection: &str, query: &Value, limit: Option<usize>) -> Result<u64> {
+    /// Delete at most `limit` matching documents (`None` = all of them).
+    ///
+    /// This is how a bulk purge is expressed against a collection far larger
+    /// than memory: the delete path stops looking at the `limit`th match on
+    /// every access path it has (indexed-lazy, indexed candidates, scan), so a
+    /// batch costs the documents it walked rather than the collection. Without
+    /// it the only reachable shapes were "one" and "all", and "all" holds every
+    /// matched document in memory before it writes anything.
+    ///
+    /// **Which** documents, when more match than `limit`, is document-id order —
+    /// not an arbitrary sample. That matters beyond tidiness: in cluster mode a
+    /// limited delete replicates as the same request to every node, and ids are
+    /// assigned by the replicated insert order, so each node selects the same
+    /// set. A limit over a genuinely unordered scan would diverge replicas.
+    pub fn delete_limited(
+        &self,
+        collection: &str,
+        query: &Value,
+        limit: Option<usize>,
+    ) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
         let _occ_guard = self.commit_lock.read(); // see update()
         let emit = self.change_broker.has_subscribers();
@@ -2182,6 +2201,20 @@ impl OxiDb {
             }
         }
         Ok(deleted)
+    }
+
+    /// Run the TTL sweep for one collection now, returning how many documents
+    /// it evicted.
+    ///
+    /// The maintenance thread does this on its own heartbeat; this is for the
+    /// caller who does not want to wait for it — draining a backlog on purpose
+    /// after adding a TTL index to an existing collection, or an embedded
+    /// process with no maintenance thread running. The sweep evicts in chunks,
+    /// releasing the index write locks between them, so calling it on a large
+    /// backlog does not park every other reader behind it.
+    pub fn evict_expired_now(&self, collection: &str) -> Result<usize> {
+        let col = self.get_or_create_collection(collection)?;
+        Ok(col.evict_expired() + col.evict_ttl_indexed())
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {

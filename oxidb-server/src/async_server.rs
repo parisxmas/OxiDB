@@ -715,6 +715,10 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
         "delete" => Some(OxiDbRequest::Delete {
             collection: collection?,
             query: request.get("query")?.clone(),
+            limit: request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
         }),
         "delete_one" => Some(OxiDbRequest::DeleteOne {
             collection: collection?,

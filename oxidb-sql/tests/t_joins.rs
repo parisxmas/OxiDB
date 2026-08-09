@@ -231,38 +231,54 @@ fn hash_join_null_keys_do_not_match() {
 #[test]
 fn join_filter_pushdown_semantics() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE pa (id INT PRIMARY KEY, city TEXT)").unwrap();
-    db.execute("CREATE TABLE pb (id INT PRIMARY KEY, pa_id INT, amt INT)").unwrap();
-    db.execute("INSERT INTO pa VALUES (1,'x'), (2,'y'), (3,'x')").unwrap();
-    db.execute("INSERT INTO pb VALUES (10,1,5), (11,1,50), (12,2,50)").unwrap();
+    db.execute("CREATE TABLE pa (id INT PRIMARY KEY, city TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE pb (id INT PRIMARY KEY, pa_id INT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO pa VALUES (1,'x'), (2,'y'), (3,'x')")
+        .unwrap();
+    db.execute("INSERT INTO pb VALUES (10,1,5), (11,1,50), (12,2,50)")
+        .unwrap();
 
     // INNER join, conjuncts on both tables (both pushed).
     assert_eq!(
-        rows(&db, "SELECT pa.id, pb.id FROM pa JOIN pb ON pa.id = pb.pa_id \
-                   WHERE pa.city = 'x' AND pb.amt > 10 ORDER BY pb.id"),
+        rows(
+            &db,
+            "SELECT pa.id, pb.id FROM pa JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pa.city = 'x' AND pb.amt > 10 ORDER BY pb.id"
+        ),
         vec![vec![i(1), i(11)]]
     );
 
     // LEFT JOIN anti-join: WHERE on the nullable side must NOT be pushed —
     // pa=3 has no pb rows and must survive via the padded row.
     assert_eq!(
-        rows(&db, "SELECT pa.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
-                   WHERE pb.id IS NULL"),
+        rows(
+            &db,
+            "SELECT pa.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pb.id IS NULL"
+        ),
         vec![vec![i(3)]]
     );
 
     // LEFT JOIN with a FROM-side conjunct (pushable) plus a nullable-side
     // predicate in the same WHERE.
     assert_eq!(
-        rows(&db, "SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
-                   WHERE pa.city = 'x' AND pb.amt = 50"),
+        rows(
+            &db,
+            "SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pa.city = 'x' AND pb.amt = 50"
+        ),
         vec![vec![i(1), i(11)]]
     );
 
     // RIGHT JOIN: FROM side is paddable — its conjuncts must not be pushed.
     assert_eq!(
-        rows(&db, "SELECT pb.id FROM pa RIGHT JOIN pb ON pa.id = pb.pa_id AND pa.city = 'zzz' \
-                   WHERE pa.id IS NULL ORDER BY pb.id"),
+        rows(
+            &db,
+            "SELECT pb.id FROM pa RIGHT JOIN pb ON pa.id = pb.pa_id AND pa.city = 'zzz' \
+                   WHERE pa.id IS NULL ORDER BY pb.id"
+        ),
         vec![vec![i(10)], vec![i(11)], vec![i(12)]]
     );
 }
@@ -273,26 +289,39 @@ fn join_filter_pushdown_semantics() {
 #[test]
 fn exists_decorrelation_semantics() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE ca (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE ob (id INT PRIMARY KEY, ca_id INT, amt INT)").unwrap();
-    db.execute("INSERT INTO ca VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    db.execute("CREATE TABLE ca (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE ob (id INT PRIMARY KEY, ca_id INT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO ca VALUES (1,'a'), (2,'b'), (3,'c')")
+        .unwrap();
     // ca=1 has a big order; ca=2 only small; a NULL ca_id row exists.
-    db.execute("INSERT INTO ob VALUES (10,1,900), (11,2,5), (12,NULL,900)").unwrap();
+    db.execute("INSERT INTO ob VALUES (10,1,900), (11,2,5), (12,NULL,900)")
+        .unwrap();
 
     assert_eq!(
-        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
-                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100)"),
+        rows(
+            &db,
+            "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100)"
+        ),
         vec![vec![i(1)]]
     );
     assert_eq!(
-        rows(&db, "SELECT ca.id FROM ca WHERE NOT EXISTS \
-                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100) ORDER BY ca.id"),
+        rows(
+            &db,
+            "SELECT ca.id FROM ca WHERE NOT EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100) ORDER BY ca.id"
+        ),
         vec![vec![i(2)], vec![i(3)]]
     );
     // Projection context: the rewritten form must yield booleans, not NULLs.
     assert_eq!(
-        rows(&db, "SELECT ca.id, EXISTS (SELECT 1 FROM ob WHERE ob.ca_id = ca.id) AS h \
-                   FROM ca ORDER BY ca.id"),
+        rows(
+            &db,
+            "SELECT ca.id, EXISTS (SELECT 1 FROM ob WHERE ob.ca_id = ca.id) AS h \
+                   FROM ca ORDER BY ca.id"
+        ),
         vec![
             vec![i(1), oxidb_sql::Value::Bool(true)],
             vec![i(2), oxidb_sql::Value::Bool(true)],
@@ -304,16 +333,22 @@ fn exists_decorrelation_semantics() {
     // ca=1 has two matching orders (skip 1 leaves one); ca=2 has one (none left).
     db.execute("INSERT INTO ob VALUES (13,1,50)").unwrap();
     assert_eq!(
-        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
-                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id OFFSET 1)"),
+        rows(
+            &db,
+            "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id OFFSET 1)"
+        ),
         vec![vec![i(1)]]
     );
 
     // Correlation used twice (not a single-eq shape): must stay correlated
     // and still be correct.
     assert_eq!(
-        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
-                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.id > ca.id)"),
+        rows(
+            &db,
+            "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.id > ca.id)"
+        ),
         vec![vec![i(1)], vec![i(2)]]
     );
 }
@@ -325,43 +360,60 @@ fn exists_decorrelation_semantics() {
 #[test]
 fn scalar_aggregate_decorrelation_semantics() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE mus (id INT PRIMARY KEY, ad TEXT)").unwrap();
+    db.execute("CREATE TABLE mus (id INT PRIMARY KEY, ad TEXT)")
+        .unwrap();
     db.execute("CREATE TABLE sip (id INT PRIMARY KEY, mid INT, tutar INT, durum INT)")
         .unwrap();
     // mus 3'ün hiç siparişi yok; mus 4 NULL (ilişkisiz).
-    db.execute("INSERT INTO mus VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    db.execute("INSERT INTO mus VALUES (1,'a'), (2,'b'), (3,'c')")
+        .unwrap();
     db.execute("INSERT INTO sip VALUES (10,1,100,1), (11,1,50,0), (12,2,900,1)")
         .unwrap();
 
     // COUNT: eksik anahtar (mus 3) -> 0, NULL değil.
     assert_eq!(
-        rows(&db, "SELECT id, (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) \
-                   FROM mus ORDER BY id"),
+        rows(
+            &db,
+            "SELECT id, (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) \
+                   FROM mus ORDER BY id"
+        ),
         vec![vec![i(1), i(2)], vec![i(2), i(1)], vec![i(3), i(0)]]
     );
     // SUM: eksik anahtar -> NULL.
     assert_eq!(
-        rows(&db, "SELECT id FROM mus WHERE \
-                   (SELECT SUM(tutar) FROM sip WHERE sip.mid = mus.id) IS NULL"),
+        rows(
+            &db,
+            "SELECT id FROM mus WHERE \
+                   (SELECT SUM(tutar) FROM sip WHERE sip.mid = mus.id) IS NULL"
+        ),
         vec![vec![i(3)]]
     );
     // Residual filtre (durum = 1) korelasyon eşitliğinin yanında: mus 1 için
     // yalnızca 100'lük sipariş sayılır.
     assert_eq!(
-        rows(&db, "SELECT id, (SELECT COALESCE(SUM(tutar),0) FROM sip \
-                   WHERE sip.mid = mus.id AND durum = 1) FROM mus ORDER BY id"),
+        rows(
+            &db,
+            "SELECT id, (SELECT COALESCE(SUM(tutar),0) FROM sip \
+                   WHERE sip.mid = mus.id AND durum = 1) FROM mus ORDER BY id"
+        ),
         vec![vec![i(1), i(100)], vec![i(2), i(900)], vec![i(3), i(0)]]
     );
     // MAX: eksik -> NULL; var olan doğru değer.
     assert_eq!(
-        rows(&db, "SELECT id, (SELECT MAX(tutar) FROM sip WHERE sip.mid = mus.id) \
-                   FROM mus WHERE id <= 2 ORDER BY id"),
+        rows(
+            &db,
+            "SELECT id, (SELECT MAX(tutar) FROM sip WHERE sip.mid = mus.id) \
+                   FROM mus WHERE id <= 2 ORDER BY id"
+        ),
         vec![vec![i(1), i(100)], vec![i(2), i(900)]]
     );
     // WHERE'de kullanım: siparişi 2'den az olan müşteriler (decorrelate + filtre).
     assert_eq!(
-        rows(&db, "SELECT id FROM mus WHERE \
-                   (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) < 2 ORDER BY id"),
+        rows(
+            &db,
+            "SELECT id FROM mus WHERE \
+                   (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) < 2 ORDER BY id"
+        ),
         vec![vec![i(2)], vec![i(3)]]
     );
 }
@@ -373,24 +425,39 @@ fn scalar_aggregate_decorrelation_semantics() {
 #[test]
 fn driver_choice_is_result_preserving() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE kucuk (id INT PRIMARY KEY, kat INT)").unwrap();
+    db.execute("CREATE TABLE kucuk (id INT PRIMARY KEY, kat INT)")
+        .unwrap();
     db.execute("CREATE TABLE buyuk (id INT PRIMARY KEY, kid INT, deger INT)")
         .unwrap();
     db.execute("CREATE INDEX b_kid ON buyuk (kid)").unwrap();
-    db.execute("INSERT INTO kucuk VALUES (1,7), (2,9), (3,7)").unwrap();
-    let vals: Vec<String> = (1..=60).map(|i| format!("({i}, {}, {})", i % 3 + 1, i)).collect();
+    db.execute("INSERT INTO kucuk VALUES (1,7), (2,9), (3,7)")
+        .unwrap();
+    let vals: Vec<String> = (1..=60)
+        .map(|i| format!("({i}, {}, {})", i % 3 + 1, i))
+        .collect();
     db.execute(&format!("INSERT INTO buyuk VALUES {}", vals.join(", ")))
         .unwrap();
 
     // İki tablolu join, küçük tarafta filtre — iki yazım da aynı toplamı verir.
-    let a = rows(&db, "SELECT SUM(b.deger) FROM buyuk b JOIN kucuk k ON b.kid = k.id WHERE k.kat = 7");
-    let b = rows(&db, "SELECT SUM(b.deger) FROM kucuk k JOIN buyuk b ON b.kid = k.id WHERE k.kat = 7");
+    let a = rows(
+        &db,
+        "SELECT SUM(b.deger) FROM buyuk b JOIN kucuk k ON b.kid = k.id WHERE k.kat = 7",
+    );
+    let b = rows(
+        &db,
+        "SELECT SUM(b.deger) FROM kucuk k JOIN buyuk b ON b.kid = k.id WHERE k.kat = 7",
+    );
     assert_eq!(a, b);
-    assert_eq!(a, rows(&db, "SELECT SUM(deger) FROM buyuk WHERE kid IN (1, 3)"));
+    assert_eq!(
+        a,
+        rows(&db, "SELECT SUM(deger) FROM buyuk WHERE kid IN (1, 3)")
+    );
 
     // GROUP BY + üç yol (üçüncü tablo) sonuç sırası korunur.
-    db.execute("CREATE TABLE etiket (id INT PRIMARY KEY, ad TEXT)").unwrap();
-    db.execute("INSERT INTO etiket VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    db.execute("CREATE TABLE etiket (id INT PRIMARY KEY, ad TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO etiket VALUES (1,'a'), (2,'b'), (3,'c')")
+        .unwrap();
     let g = rows(
         &db,
         "SELECT k.kat, COUNT(*) FROM buyuk b JOIN kucuk k ON b.kid = k.id \

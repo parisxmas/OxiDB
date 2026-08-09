@@ -779,7 +779,8 @@ fn alter_column_type_casts_existing_rows() {
         .unwrap();
 
     // INT -> TEXT (PG spelling), TEXT -> INT (MySQL spelling).
-    db.execute("ALTER TABLE u ALTER COLUMN n TYPE TEXT").unwrap();
+    db.execute("ALTER TABLE u ALTER COLUMN n TYPE TEXT")
+        .unwrap();
     db.execute("ALTER TABLE u MODIFY COLUMN s INT").unwrap();
 
     assert_eq!(
@@ -791,7 +792,10 @@ fn alter_column_type_casts_existing_rows() {
     assert_eq!(desc[1][1], t("TEXT"));
     assert_eq!(desc[2][1], t("INT"));
     // New writes validate against the new types.
-    assert!(db.execute("INSERT INTO u VALUES (3, 'x', 'not an int')").is_err());
+    assert!(
+        db.execute("INSERT INTO u VALUES (3, 'x', 'not an int')")
+            .is_err()
+    );
     db.execute("INSERT INTO u VALUES (3, 'x', 5)").unwrap();
 }
 
@@ -818,7 +822,10 @@ fn alter_column_type_varchar_shrink_checks_lengths() {
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, s TEXT)")
         .unwrap();
     db.execute("INSERT INTO u VALUES (1, 'hello')").unwrap();
-    assert!(db.execute("ALTER TABLE u ALTER COLUMN s TYPE VARCHAR(3)").is_err());
+    assert!(
+        db.execute("ALTER TABLE u ALTER COLUMN s TYPE VARCHAR(3)")
+            .is_err()
+    );
     db.execute("ALTER TABLE u ALTER COLUMN s TYPE VARCHAR(5)")
         .unwrap();
     // The new length is enforced on writes...
@@ -835,11 +842,21 @@ fn alter_column_type_rejects_keys_and_fks() {
         .unwrap();
     db.execute("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))")
         .unwrap();
-    assert!(db.execute("ALTER TABLE p ALTER COLUMN id TYPE TEXT").is_err()); // pk/auto
-    assert!(db.execute("ALTER TABLE p ALTER COLUMN email TYPE INT").is_err()); // unique
-    assert!(db.execute("ALTER TABLE c ALTER COLUMN pid TYPE TEXT").is_err()); // fk child
+    assert!(
+        db.execute("ALTER TABLE p ALTER COLUMN id TYPE TEXT")
+            .is_err()
+    ); // pk/auto
+    assert!(
+        db.execute("ALTER TABLE p ALTER COLUMN email TYPE INT")
+            .is_err()
+    ); // unique
+    assert!(
+        db.execute("ALTER TABLE c ALTER COLUMN pid TYPE TEXT")
+            .is_err()
+    ); // fk child
     // x is unconstrained — fine.
-    db.execute("ALTER TABLE p ALTER COLUMN x TYPE DOUBLE").unwrap();
+    db.execute("ALTER TABLE p ALTER COLUMN x TYPE DOUBLE")
+        .unwrap();
 }
 
 #[test]
@@ -851,7 +868,8 @@ fn alter_column_type_survives_reopen_and_updates_indexes() {
             .unwrap();
         db.execute("CREATE INDEX ix_n ON u (n)").unwrap();
         db.execute("INSERT INTO u VALUES (1, 5), (2, 30)").unwrap();
-        db.execute("ALTER TABLE u ALTER COLUMN n TYPE TEXT").unwrap();
+        db.execute("ALTER TABLE u ALTER COLUMN n TYPE TEXT")
+            .unwrap();
         // Index rebuilt over the cast values: text ordering now applies.
         assert_eq!(
             rows(&db, "SELECT n FROM u WHERE n = '30'"),

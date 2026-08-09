@@ -16,7 +16,8 @@ fn seed() -> (tempfile::TempDir, oxidb_sql::SqlEngine) {
         "7",
         "",
     ] {
-        db.execute(&format!("INSERT INTO t VALUES ('{s}')")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('{s}')"))
+            .unwrap();
     }
     (dir, db)
 }

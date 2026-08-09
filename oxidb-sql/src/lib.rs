@@ -48,7 +48,7 @@ pub use types::{decode_row_into, decode_row_masked, encode_row};
 
 use catalog::Catalog;
 use rows::RowStore;
-use store::Store;
+use store::{RangeBound, Store};
 use transaction::Transaction;
 use types::IndexKey;
 use wal::{Wal, WalRecord};
@@ -327,6 +327,54 @@ impl SecondaryIndex {
             .iter()
             .map(|&p| IndexKey(cells[p].clone()))
             .collect()
+    }
+
+    /// Row ids that *might* have their first key column inside `[lo, hi]`.
+    ///
+    /// Same contract as [`candidates`](Self::candidates) — a hint from the last
+    /// checkpoint plus the live overlay, every id to be verified by the caller.
+    /// Both sides can answer a range directly: the `.sidx` is ordered by decoded
+    /// key tuple (so `lower_bound` is a real lower bound and the walk stops at
+    /// the first key past `hi`), and the overlay is a `BTreeMap` keyed the same
+    /// way.
+    ///
+    /// Only the index's **first** column is bounded, which is why this takes a
+    /// single pair: a range on a later column of a composite index does not
+    /// select a contiguous run of keys, so it would have to walk the whole index
+    /// to be correct — no better than the table scan it is replacing.
+    fn candidates_range(&self, lo: &RangeBound, hi: &RangeBound) -> Result<Vec<u64>> {
+        let mut ids = match &self.base {
+            Some(base) => base.range_first_col(lo, hi)?,
+            None => Vec::new(),
+        };
+        // The overlay is keyed by the whole tuple, but tuples order by their
+        // first element first, so a bound on the first column is a contiguous
+        // run: seek to it, then stop at the first key past `hi`.
+        //
+        // The start bound is `Included` even for an exclusive `lo`: the
+        // one-element tuple `[v]` sorts below every `[v, ...]`, so excluding it
+        // would not exclude the composite keys that share `v`. The per-key
+        // `allows_low` below drops them — over-seeking by one equal key group is
+        // cheap, being wrong is not.
+        let start = match lo.value() {
+            None => std::ops::Bound::Unbounded,
+            Some(v) => {
+                let k: KeyTuple = std::iter::once(IndexKey(v.clone())).collect();
+                std::ops::Bound::Included(k)
+            }
+        };
+        for (key, extra) in self.map.range((start, std::ops::Bound::Unbounded)) {
+            let Some(first) = key.first() else { continue };
+            if !hi.allows_high(&first.0) {
+                break; // ordered by first column — nothing later can qualify
+            }
+            if lo.allows_low(&first.0) {
+                ids.extend(extra.iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Row ids that *might* match `key`: the mapped base plus the overlay.
@@ -925,6 +973,12 @@ pub struct SqlEngine {
     /// [`EXPIRED_TXN_REMEMBERED`]) so a returning client is told
     /// "expired", not "no such transaction".
     expired_txns: Mutex<std::collections::BTreeSet<u64>>,
+    /// Rows the most recent DML statement examined to find its matches
+    /// ([`SqlEngine::dml_rows_examined`]). Written once per statement, not per
+    /// row, so it costs nothing on the scan path — and it is the only way from
+    /// outside to tell "an index served this" from "this walked the table",
+    /// which is exactly what the streaming DML tests assert.
+    dml_examined: std::sync::atomic::AtomicU64,
     /// Parsed-statement cache: SQL text -> AST. Applications loop over a
     /// small set of parameterized texts, and parsing costs more than an AST
     /// clone; execution works on a clone, so the cached AST is never touched.
@@ -1232,6 +1286,7 @@ impl SqlEngine {
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
             txn_max_idle_ms: std::sync::atomic::AtomicU64::new(txn_max_idle_ms_from_env()),
             expired_txns: Mutex::new(std::collections::BTreeSet::new()),
+            dml_examined: std::sync::atomic::AtomicU64::new(0),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             row_locks: row_locks::RowLocks::default(),
             lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
@@ -2259,6 +2314,17 @@ impl SqlEngine {
             }
         }
         Ok(Some(()))
+    }
+
+    /// Rows the most recent DML statement examined while looking for its
+    /// matches, on this engine.
+    ///
+    /// A diagnostic, in the spirit of `explain`'s examined count: a `DELETE`
+    /// that walked a million rows to remove ten looks identical to one an index
+    /// served, until you can read this. Not per-connection — it reports the last
+    /// DML statement this engine ran, whoever ran it.
+    pub fn dml_rows_examined(&self) -> u64 {
+        self.dml_examined.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of live rows in a table.
@@ -3855,6 +3921,95 @@ impl SqlEngine {
     /// The body behind [`Store::scan_visit`] and [`Store::scan_visit_cols`].
     /// `want` is the query-visible column positions the caller will read, or
     /// `None` for all of them.
+    /// [`scan_visit_inner`] handing the visitor the row id as well.
+    ///
+    /// Deliberately not routed through the resident scan cache: that cache is a
+    /// flat row-major buffer with the ids thrown away, and DML needs the id of
+    /// the row it is about to write. Walking direct is what the cache replaces,
+    /// so this is the same code the first scan of a generation runs.
+    fn scan_visit_ids_inner(
+        &self,
+        table: &str,
+        want: Option<&[usize]>,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        let width = state.rows.logical_width();
+        let mask: Option<Vec<bool>> = want.map(|cols| {
+            let mut m = vec![false; width.max(cols.iter().copied().max().map_or(0, |c| c + 1))];
+            for &c in cols {
+                m[c] = true;
+            }
+            m
+        });
+        state.rows.visit_rows_masked(mask.as_deref(), visit)
+    }
+
+    /// Stream the rows an index selects for a range on `col`, verified against
+    /// the live row. `Ok(None)` when no index qualifies.
+    ///
+    /// An index qualifies when its **first** column is `col`; see
+    /// [`SecondaryIndex::candidates_range`] for why only the first.
+    fn index_visit_range_inner(
+        &self,
+        table: &str,
+        col: &str,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.tables.contains_key(table) {
+            return Err(SqlError::NoSuchTable(table.to_string()));
+        }
+        // Prefer the narrowest qualifying index: every extra column is key
+        // material read per candidate that this range does not constrain.
+        let mut best: Option<&IndexDef> = None;
+        for def in inner.catalog.indexes.values() {
+            if def.table == table
+                && def.columns.first().is_some_and(|c| c == col)
+                && best.is_none_or(|b| def.columns.len() < b.columns.len())
+            {
+                best = Some(def);
+            }
+        }
+        let Some(def) = best else {
+            return Ok(None);
+        };
+        let name = def.name.clone();
+        let state = inner.tables.get(table).expect("checked above");
+        if !state.indexes.contains_key(&name) {
+            return Ok(None);
+        }
+        let state = inner.tables.get_mut(table).expect("checked above");
+        state.populate_index(&name);
+        let state = &*state;
+        let idx = state.indexes.get(&name).expect("checked above");
+        // The bounded column's PHYSICAL position: the range is re-checked
+        // against the live row, and a dropped column makes logical and physical
+        // positions differ (see `index_visit_eq_masked` for the same care).
+        let pos = *idx.col_pos.first().expect("index has >= 1 column");
+        let ids = idx.candidates_range(lo, hi)?;
+        for id in ids {
+            let Some(phys) = state.rows.physical_ref(id) else {
+                continue; // deleted since the checkpoint the base describes
+            };
+            let Some(cell) = phys.get(pos) else { continue };
+            // The base is a hint: an updated row may no longer be in range.
+            if !(lo.allows_low(cell) && hi.allows_high(cell)) {
+                continue;
+            }
+            if !visit(id, &state.rows.logical_ref(phys))? {
+                break;
+            }
+        }
+        Ok(Some(()))
+    }
+
     fn scan_visit_inner(
         &self,
         table: &str,
@@ -3981,6 +4136,36 @@ impl Store for SqlEngine {
         visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
     ) -> Result<()> {
         self.scan_visit_inner(table, Some(want), visit)
+    }
+    fn scan_visit_ids(
+        &self,
+        table: &str,
+        want: Option<&[usize]>,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_visit_ids_inner(table, want, visit)
+    }
+    fn index_visit_eq_ids(
+        &self,
+        table: &str,
+        eqs: &[(String, Value)],
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        self.index_visit_eq_inner(table, eqs, visit)
+    }
+    fn index_visit_range_ids(
+        &self,
+        table: &str,
+        col: &str,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        self.index_visit_range_inner(table, col, lo, hi, visit)
+    }
+    fn note_dml_examined(&self, rows: u64) {
+        self.dml_examined
+            .store(rows, std::sync::atomic::Ordering::Relaxed);
     }
     fn scan_visit_refs(
         &self,
