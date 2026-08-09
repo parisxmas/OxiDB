@@ -4,7 +4,7 @@ go 1.21
 
 require (
 	github.com/jackc/pgx/v5 v5.7.2
-	github.com/parisxmas/OxiDB/go/oxidb v0.0.0
+	github.com/parisxmas/OxiDB/clients/go/oxidb v0.0.0
 )
 
 require (
@@ -14,4 +14,4 @@ require (
 	golang.org/x/text v0.21.0 // indirect
 )
 
-replace github.com/parisxmas/OxiDB/go/oxidb => ../../go/oxidb
+replace github.com/parisxmas/OxiDB/clients/go/oxidb => ../../clients/go/oxidb

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/parisxmas/OxiDB/go/oxiwire"
+	"github.com/parisxmas/OxiDB/clients/go/oxiwire"
 )
 
 // Client is a TCP client for oxidb-server. Thread-safe via mutex.

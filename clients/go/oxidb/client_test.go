@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/parisxmas/OxiDB/go/oxidb"
+	"github.com/parisxmas/OxiDB/clients/go/oxidb"
 )
 
 func getClient(t *testing.T) *oxidb.Client {

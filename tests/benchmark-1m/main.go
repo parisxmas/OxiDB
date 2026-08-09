@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/parisxmas/OxiDB/go/oxidb"
+	"github.com/parisxmas/OxiDB/clients/go/oxidb"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"

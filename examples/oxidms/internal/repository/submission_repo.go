@@ -6,7 +6,7 @@ import (
 
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/db"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/models"
-	"github.com/parisxmas/OxiDB/go/oxidb"
+	"github.com/parisxmas/OxiDB/clients/go/oxidb"
 )
 
 const SubmissionsCollection = "_dms_submissions"

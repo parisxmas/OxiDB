@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/parisxmas/OxiDB/go/oxidb"
+	"github.com/parisxmas/OxiDB/clients/go/oxidb"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════

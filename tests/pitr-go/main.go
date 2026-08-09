@@ -48,7 +48,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/parisxmas/OxiDB/go/oxidb"
+	"github.com/parisxmas/OxiDB/clients/go/oxidb"
 )
 
 const (
