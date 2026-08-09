@@ -12,7 +12,7 @@ Zero dependencies — uses only the Go standard library. Communicates with `oxid
 ## Installation
 
 ```bash
-go get github.com/parisxmas/OxiDB/clients/go/oxidb
+go get github.com/parisxmas/OxiDB/go/oxidb
 ```
 
 ## Quick Start
@@ -22,7 +22,7 @@ package main
 
 import (
     "fmt"
-    "github.com/parisxmas/OxiDB/clients/go/oxidb"
+    "github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 func main() {

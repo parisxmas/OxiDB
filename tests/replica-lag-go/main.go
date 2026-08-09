@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/parisxmas/OxiDB/clients/go/oxidb"
+	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 // Replica Lag Simulation Test for OxiPool

@@ -3,7 +3,7 @@ module github.com/parisxmas/OxiDB/examples/docker_benchmark
 go 1.21
 
 require (
-	github.com/parisxmas/OxiDB/clients/go/oxidb v0.0.0
+	github.com/parisxmas/OxiDB/go/oxidb v0.0.0
 	go.mongodb.org/mongo-driver/v2 v2.1.0
 )
 
@@ -19,4 +19,4 @@ require (
 	golang.org/x/text v0.22.0 // indirect
 )
 
-replace github.com/parisxmas/OxiDB/clients/go/oxidb => ../../clients/go/oxidb
+replace github.com/parisxmas/OxiDB/go/oxidb => ../../clients/go/oxidb

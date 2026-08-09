@@ -8,7 +8,7 @@ import (
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/db"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/models"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/repository"
-	"github.com/parisxmas/OxiDB/clients/go/oxidb"
+	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 type SearchService struct {

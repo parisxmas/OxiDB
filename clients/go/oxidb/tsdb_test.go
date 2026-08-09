@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/parisxmas/OxiDB/clients/go/oxidb"
+	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 // tsdbClient connects to a TSDB-enabled server (OXIDB_TSDB=1). Defaults to the

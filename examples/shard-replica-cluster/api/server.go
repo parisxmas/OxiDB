@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/parisxmas/OxiDB/clients/go/oxidb"
+	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 // HostPort is a "host:port" pair.

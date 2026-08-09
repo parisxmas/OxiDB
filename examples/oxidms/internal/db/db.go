@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/parisxmas/OxiDB/clients/go/oxidb"
+	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 // Pool is a round-robin connection pool for OxiDB with auto-reconnect.

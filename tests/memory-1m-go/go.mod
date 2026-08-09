@@ -2,10 +2,10 @@ module memory-1m-go
 
 go 1.21
 
-require github.com/parisxmas/OxiDB/clients/go/oxidb v0.0.0
+require github.com/parisxmas/OxiDB/go/oxidb v0.0.0
 
-require github.com/parisxmas/OxiDB/clients/go/oxiwire v0.0.0 // indirect
+require github.com/parisxmas/OxiDB/go/oxiwire v0.0.0 // indirect
 
-replace github.com/parisxmas/OxiDB/clients/go/oxidb => ../../clients/go/oxidb
+replace github.com/parisxmas/OxiDB/go/oxidb => ../../go/oxidb
 
-replace github.com/parisxmas/OxiDB/clients/go/oxiwire => ../../clients/go/oxiwire
+replace github.com/parisxmas/OxiDB/go/oxiwire => ../../go/oxiwire
