@@ -525,10 +525,12 @@ impl FtsIndex {
             })
             .collect();
 
+        // Same deterministic tie-break as the collection index.
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)))
         });
         results.truncate(limit);
         results
@@ -582,8 +584,25 @@ pub struct CollectionTextIndex {
     /// already holds. Interning keeps removal O(doc terms) at 8 bytes per
     /// doc-term instead of a String.
     doc_terms: HashMap<DocumentId, Vec<std::sync::Arc<str>>>,
-    /// Sum of all per-doc term counts; cached for BM25 avgdl.
+    /// Sum of the OVERLAY's per-doc term counts (in resident mode, of
+    /// everything); cached for BM25 avgdl.
     total_term_count: u64,
+    /// Disk-first base: the mmap'd `.mtidx` written at the last persist.
+    /// Searches merge it with the overlay above; RAM holds only what was
+    /// written since. `None` = resident mode (or no persist yet).
+    #[cfg(not(target_arch = "wasm32"))]
+    base: Option<crate::mmap_text_index::MmapTextIndex>,
+    /// Documents whose base postings are void: removed or re-indexed since
+    /// the base was written. The base is immutable, so search skips these ids
+    /// (Lucene's deleted-docs bitmap); a persist folds them away.
+    #[cfg(not(target_arch = "wasm32"))]
+    dead: std::collections::HashSet<DocumentId>,
+    /// Σ dl of the dead base docs — keeps live corpus stats exact.
+    #[cfg(not(target_arch = "wasm32"))]
+    dead_terms: u64,
+    /// Where the base lives; `None` = resident mode.
+    #[cfg(not(target_arch = "wasm32"))]
+    path: Option<std::path::PathBuf>,
 }
 
 pub struct DocSearchResult {
@@ -599,6 +618,55 @@ impl CollectionTextIndex {
             doc_term_counts: HashMap::new(),
             doc_terms: HashMap::new(),
             total_term_count: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            base: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dead: std::collections::HashSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dead_terms: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            path: None,
+        }
+    }
+
+    /// A disk-backed index that has no base yet: everything accumulates in
+    /// the overlay until the first [`persist_disk`](Self::persist_disk)
+    /// writes `path`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_disk(fields: Vec<String>, path: std::path::PathBuf) -> Self {
+        let mut idx = Self::new(fields);
+        idx.path = Some(path);
+        idx
+    }
+
+    /// Reopen a persisted index: mmap the base, empty overlay — no
+    /// collection scan, which is the point. Fails on a missing/torn file;
+    /// the caller falls back to the rebuild it always did.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_disk(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let base = crate::mmap_text_index::MmapTextIndex::open(&path)?;
+        let mut idx = Self::new(base.fields().to_vec());
+        idx.base = Some(base);
+        idx.path = Some(path);
+        Ok(idx)
+    }
+
+    /// Live corpus stats across base and overlay: (doc count, token count).
+    /// A doc in the overlay that also existed in the base is in `dead`, so
+    /// the two layers never double-count.
+    fn corpus_stats(&self) -> (u64, u64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (mut docs, mut terms) = (self.doc_term_counts.len() as u64, self.total_term_count);
+            if let Some(base) = &self.base {
+                docs += base.doc_count() as u64 - self.dead.len() as u64;
+                terms += base.total_term_count() - self.dead_terms;
+            }
+            (docs, terms)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            (self.doc_term_counts.len() as u64, self.total_term_count)
         }
     }
 
@@ -668,9 +736,21 @@ impl CollectionTextIndex {
 
     /// Remove a document from the index.
     pub fn remove_doc(&mut self, doc_id: DocumentId) {
+        // Base postings cannot be edited — tombstone the doc; search skips
+        // it, the next persist drops it. `index_doc` re-indexing a base doc
+        // lands here first, so an updated doc is served purely from the
+        // overlay afterwards.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(base) = &self.base
+            && !self.dead.contains(&doc_id)
+            && let Some(dl) = base.doc_len(doc_id)
+        {
+            self.dead.insert(doc_id);
+            self.dead_terms += dl as u64;
+        }
         let removed_terms = match self.doc_term_counts.remove(&doc_id) {
             Some(n) => n,
-            None => return, // not indexed
+            None => return, // not indexed in the overlay
         };
         self.total_term_count = self.total_term_count.saturating_sub(removed_terms as u64);
         match self.doc_terms.remove(&doc_id) {
@@ -703,6 +783,198 @@ impl CollectionTextIndex {
         }
     }
 
+    /// A term's document frequency across base + overlay.
+    ///
+    /// The base count includes dead docs until the next persist — counting
+    /// them out would cost a walk of the posting list before scoring even
+    /// starts. Lucene's docFreq makes the same trade until a segment merge;
+    /// the persist tick keeps the window to seconds.
+    fn term_df(&self, term: &str) -> usize {
+        let overlay = self.postings.get(term).map_or(0, Vec::len);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            overlay
+                + self
+                    .base
+                    .as_ref()
+                    .and_then(|b| b.postings(term).map(|(_, df)| df as usize))
+                    .unwrap_or(0)
+        }
+        #[cfg(target_arch = "wasm32")]
+        overlay
+    }
+
+    /// Fold the overlay and the dead set into a fresh `.mtidx` base and drop
+    /// them from RAM. No-op in resident mode, and skip-clean like every other
+    /// disk index — the periodic tick calls this for free when idle.
+    ///
+    /// The write streams: base terms (sorted in the file) merge-join the
+    /// overlay's sorted vocabulary, each term's postings merging base-minus-
+    /// dead with the overlay's list — nothing document-proportional is
+    /// materialized.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn persist_disk(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(()); // resident mode
+        };
+        if self.base.is_some()
+            && self.doc_term_counts.is_empty()
+            && self.dead.is_empty()
+            && path.exists()
+        {
+            return Ok(());
+        }
+
+        let (doc_count, total_terms) = self.corpus_stats();
+        let mut w = crate::mmap_text_index::MtidxWriter::create(
+            &path,
+            &self.fields,
+            total_terms,
+            doc_count as u32,
+        )?;
+
+        // Doc table: base docs (minus dead) merged with overlay docs, id
+        // order. Both sides are already sorted (base by construction, overlay
+        // sorted here — doc-count-proportional at 12 bytes an entry, the one
+        // transient this write allows itself).
+        let mut overlay_docs: Vec<(u64, u32)> = self
+            .doc_term_counts
+            .iter()
+            .map(|(&id, &dl)| (id, dl))
+            .collect();
+        overlay_docs.sort_unstable_by_key(|&(id, _)| id);
+        {
+            let mut ov = overlay_docs.iter().peekable();
+            let mut push_err: Option<std::io::Error> = None;
+            if let Some(base) = &self.base {
+                base.for_each_doc(|id, dl| {
+                    if push_err.is_some() || self.dead.contains(&id) {
+                        return;
+                    }
+                    while let Some(&&(oid, odl)) = ov.peek() {
+                        if oid < id {
+                            if let Err(e) = w.push_doc(oid, odl) {
+                                push_err = Some(e);
+                                return;
+                            }
+                            ov.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Err(e) = w.push_doc(id, dl) {
+                        push_err = Some(e);
+                    }
+                });
+            }
+            if let Some(e) = push_err {
+                return Err(e);
+            }
+            for &(oid, odl) in ov {
+                w.push_doc(oid, odl)?;
+            }
+        }
+
+        // Term merge-join: overlay vocabulary sorted once; the base walks in
+        // term order already.
+        let mut overlay_terms: Vec<&std::sync::Arc<str>> = self.postings.keys().collect();
+        overlay_terms.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let merged_postings = |term: &str,
+                               base_iter: Option<crate::mmap_text_index::PostingsIter<'_>>|
+         -> Vec<(u64, u32)> {
+            let mut out: Vec<(u64, u32)> = Vec::new();
+            if let Some(iter) = base_iter {
+                out.extend(iter.filter(|(id, _)| !self.dead.contains(id)));
+            }
+            if let Some(list) = self.postings.get(term) {
+                out.extend(list.iter().map(|p| (p.doc_id, p.frequency)));
+            }
+            out.sort_unstable_by_key(|&(id, _)| id);
+            out
+        };
+
+        let mut push_err: Option<std::io::Error> = None;
+        let mut ov = overlay_terms.iter().peekable();
+        if let Some(base) = &self.base {
+            base.for_each_term(|term, base_iter| {
+                if push_err.is_some() {
+                    return;
+                }
+                // Overlay-only terms that sort before this base term.
+                while let Some(o) = ov.peek() {
+                    if o.as_bytes() < term.as_bytes() {
+                        let o = ov.next().unwrap();
+                        let merged = merged_postings(o, None);
+                        if !merged.is_empty()
+                            && let Err(e) = w.push_term(o, merged.into_iter())
+                        {
+                            push_err = Some(e);
+                            return;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // The base term itself, merged with a same-named overlay list.
+                let in_overlay = ov.peek().is_some_and(|o| o.as_bytes() == term.as_bytes());
+                let merged = merged_postings(term, Some(base_iter));
+                if in_overlay {
+                    ov.next();
+                }
+                if !merged.is_empty()
+                    && let Err(e) = w.push_term(term, merged.into_iter())
+                {
+                    push_err = Some(e);
+                }
+            });
+        }
+        if let Some(e) = push_err {
+            return Err(e);
+        }
+        for o in ov {
+            let merged = merged_postings(o, None);
+            if !merged.is_empty() {
+                w.push_term(o, merged.into_iter())?;
+            }
+        }
+        w.finish()?;
+
+        // Reopen the fresh base; the overlay and the dead are inside it now.
+        // The maps are REPLACED, not `.clear()`ed: clear keeps bucket
+        // capacity, and after folding a 1M-doc build the empty skeletons of
+        // these tables alone measured ~180 MB resident.
+        self.base = Some(crate::mmap_text_index::MmapTextIndex::open(&path)?);
+        self.postings = HashMap::new();
+        self.doc_term_counts = HashMap::new();
+        self.doc_terms = HashMap::new();
+        self.total_term_count = 0;
+        self.dead = std::collections::HashSet::new();
+        self.dead_terms = 0;
+        Ok(())
+    }
+
+    /// Documents currently in the RAM overlay — what a bulk builder watches
+    /// to fold to disk periodically instead of materializing the corpus.
+    pub fn overlay_docs(&self) -> usize {
+        self.doc_term_counts.len()
+    }
+
+    /// wasm stubs, mirroring `MmapFieldIndex`'s: `is_disk_first()` is always
+    /// false there, so these are unreachable — they exist so the call sites
+    /// compile on both targets.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_disk(_fields: Vec<String>, _path: std::path::PathBuf) -> Self {
+        unreachable!("disk-first text indexes are not supported on wasm32")
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_disk(_path: std::path::PathBuf) -> std::io::Result<Self> {
+        unreachable!("disk-first text indexes are not supported on wasm32")
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn persist_disk(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Search the index. Returns doc_ids with BM25 scores, sorted by score descending.
     pub fn search(&self, query: &str, limit: usize) -> Vec<DocSearchResult> {
         self.search_capped(query, limit, fts_score_cap())
@@ -713,43 +985,60 @@ impl CollectionTextIndex {
     /// exercise the cap without the process-global env knob.
     fn search_capped(&self, query: &str, limit: usize, cap: usize) -> Vec<DocSearchResult> {
         let mut query_terms = tokenize(query);
-        if query_terms.is_empty() || self.doc_term_counts.is_empty() {
+        let (total_docs, total_terms_live) = self.corpus_stats();
+        if query_terms.is_empty() || total_docs == 0 {
             return Vec::new();
         }
         // Rarest term first. With the cap in play the ORDER is the guarantee:
         // every document matching a rare (high-idf, informative) term is
         // scored before the commonest term can fill the budget, so what the
         // cap cuts is the tail of the least informative posting list.
-        query_terms.sort_by_key(|t| self.postings.get(t.as_str()).map_or(0, Vec::len));
+        query_terms.sort_by_key(|t| self.term_df(t));
 
-        let total_docs = self.doc_term_counts.len() as f64;
-        let avgdl = (self.total_term_count as f64 / total_docs).max(1.0);
+        let total_docs = total_docs as f64;
+        let avgdl = (total_terms_live as f64 / total_docs).max(1.0);
         let mut scores: HashMap<DocumentId, f64> = HashMap::new();
 
         for term in &query_terms {
-            if let Some(postings) = self.postings.get(term.as_str()) {
-                let docs_with_term = postings.len() as f64;
-                let idf = bm25_idf(total_docs, docs_with_term);
-
-                for posting in postings {
-                    if let Some(&total_terms) = self.doc_term_counts.get(&posting.doc_id) {
-                        let dl = total_terms as f64;
-                        let f = posting.frequency as f64;
-                        let contribution = bm25_score(f, dl, avgdl, idf);
-                        // At the cap, documents already scored keep
-                        // accumulating (their ranking stays exact); new ones
-                        // are not admitted.
-                        let at_cap = scores.len() >= cap;
-                        match scores.entry(posting.doc_id) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => {
-                                *e.get_mut() += contribution;
-                            }
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                if !at_cap {
-                                    e.insert(contribution);
-                                }
-                            }
+            let docs_with_term = self.term_df(term) as f64;
+            if docs_with_term == 0.0 {
+                continue;
+            }
+            let idf = bm25_idf(total_docs, docs_with_term);
+            let mut score_one = |doc_id: DocumentId, freq: u32, dl: u32| {
+                let contribution = bm25_score(freq as f64, dl as f64, avgdl, idf);
+                // At the cap, documents already scored keep accumulating
+                // (their ranking stays exact); new ones are not admitted.
+                let at_cap = scores.len() >= cap;
+                match scores.entry(doc_id) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        *e.get_mut() += contribution;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        if !at_cap {
+                            e.insert(contribution);
                         }
+                    }
+                }
+            };
+            // Base layer first (its ids predate the overlay's), dead skipped.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(base) = &self.base
+                && let Some((iter, _df)) = base.postings(term)
+            {
+                for (doc_id, freq) in iter {
+                    if self.dead.contains(&doc_id) {
+                        continue;
+                    }
+                    if let Some(dl) = base.doc_len(doc_id) {
+                        score_one(doc_id, freq, dl);
+                    }
+                }
+            }
+            if let Some(postings) = self.postings.get(term.as_str()) {
+                for posting in postings {
+                    if let Some(&dl) = self.doc_term_counts.get(&posting.doc_id) {
+                        score_one(posting.doc_id, posting.frequency, dl);
                     }
                 }
             }
@@ -760,10 +1049,15 @@ impl CollectionTextIndex {
             .map(|(doc_id, score)| DocSearchResult { doc_id, score })
             .collect();
 
+        // Equal scores tie-break on doc_id: without it the order of ties is
+        // the score map's iteration order — nondeterministic run to run,
+        // which breaks pagination and made disk and resident mode return
+        // different (both "correct") orders.
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         results.truncate(limit);
         results
@@ -778,6 +1072,17 @@ impl CollectionTextIndex {
         // gone.
         self.doc_terms.clear();
         self.total_term_count = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // The rebuild that follows starts from nothing; a stale base file
+            // must not survive a crash between here and the next persist.
+            self.base = None;
+            self.dead.clear();
+            self.dead_terms = 0;
+            if let Some(p) = &self.path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
     }
 }
 
@@ -1698,6 +2003,140 @@ startxref
              contribution was dropped for an admitted doc",
             capped[0].score,
             uncapped_doc1.score
+        );
+    }
+
+    /// Disk mode must be indistinguishable from resident mode — same ops,
+    /// same searches, same scores — with persists (base rewrites) interleaved
+    /// at every stage so base-only, overlay-only and mixed layers are all
+    /// exercised. Scores compare exactly right after a persist (dead set
+    /// empty ⇒ df exact); in the window between persists only membership is
+    /// compared, since base df counting dead docs is a documented
+    /// approximation.
+    #[test]
+    fn disk_mode_matches_resident_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.mtidx");
+        let fields = vec!["text".to_string()];
+        let mut ram = CollectionTextIndex::new(fields.clone());
+        let mut disk = CollectionTextIndex::new_disk(fields, path.clone());
+
+        let doc = |t: &str| serde_json::json!({"text": t});
+        let both = |ram: &mut CollectionTextIndex,
+                    disk: &mut CollectionTextIndex,
+                    f: &dyn Fn(&mut CollectionTextIndex)| {
+            f(ram);
+            f(disk);
+        };
+
+        for i in 1..=30u64 {
+            let text = format!(
+                "ortak belge {} {}",
+                i,
+                if i % 3 == 0 { "nadir" } else { "dolgu" }
+            );
+            both(&mut ram, &mut disk, &|x| x.index_doc(i, &doc(&text)));
+        }
+        disk.persist_disk().unwrap();
+
+        // Mutations across the persisted base: update, remove, insert.
+        both(&mut ram, &mut disk, &|x| {
+            x.index_doc(3, &doc("ortak belge tamamen yeni zümrüt"))
+        });
+        both(&mut ram, &mut disk, &|x| x.remove_doc(6));
+        both(&mut ram, &mut disk, &|x| {
+            x.index_doc(31, &doc("ortak nadir taze"))
+        });
+
+        // Mid-window: membership must agree (scores may differ by the dead-df
+        // approximation, which persist erases below).
+        for q in ["ortak", "nadir", "zümrüt", "taze", "dolgu"] {
+            let r: Vec<u64> = ram.search(q, 100).into_iter().map(|x| x.doc_id).collect();
+            let d: Vec<u64> = disk.search(q, 100).into_iter().map(|x| x.doc_id).collect();
+            let (mut rs, mut ds) = (r.clone(), d.clone());
+            rs.sort_unstable();
+            ds.sort_unstable();
+            assert_eq!(rs, ds, "membership diverged mid-window for {q:?}");
+        }
+
+        disk.persist_disk().unwrap();
+        for q in ["ortak", "nadir", "zümrüt", "taze", "dolgu", "yok"] {
+            let r = ram.search(q, 100);
+            let d = disk.search(q, 100);
+            assert_eq!(r.len(), d.len(), "result count diverged for {q:?}");
+            for (a, b) in r.iter().zip(d.iter()) {
+                assert_eq!(a.doc_id, b.doc_id, "order diverged for {q:?}");
+                assert!(
+                    (a.score - b.score).abs() < 1e-9,
+                    "score diverged for {q:?}: {} vs {}",
+                    a.score,
+                    b.score
+                );
+            }
+        }
+    }
+
+    /// The point of the disk form: reopen mmaps the base instead of scanning
+    /// the collection — and the reopened index answers identically, accepts
+    /// new writes, and persists again.
+    #[test]
+    fn a_persisted_index_reopens_without_a_rebuild_and_keeps_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.mtidx");
+        let doc = |t: &str| serde_json::json!({"text": t});
+
+        let mut idx = CollectionTextIndex::new_disk(vec!["text".into()], path.clone());
+        idx.index_doc(1, &doc("eski kayıt hakkında"));
+        idx.index_doc(2, &doc("eski ama farklı konu"));
+        idx.persist_disk().unwrap();
+        drop(idx);
+
+        let mut idx = CollectionTextIndex::open_disk(path.clone()).unwrap();
+        assert_eq!(idx.fields(), &["text".to_string()]);
+        let r = idx.search("eski", 10);
+        assert_eq!(r.len(), 2);
+
+        // Writes after reopen: a new doc, an update, a delete — all served.
+        idx.index_doc(3, &doc("yepyeni eski"));
+        idx.index_doc(1, &doc("güncellenmiş metin"));
+        idx.remove_doc(2);
+        let ids: Vec<u64> = idx
+            .search("eski", 10)
+            .into_iter()
+            .map(|r| r.doc_id)
+            .collect();
+        assert_eq!(ids, vec![3], "update and delete must void base postings");
+        assert_eq!(idx.search("güncellenmiş", 10)[0].doc_id, 1);
+
+        // And the folded state survives another persist+reopen.
+        idx.persist_disk().unwrap();
+        drop(idx);
+        let idx = CollectionTextIndex::open_disk(path).unwrap();
+        let ids: Vec<u64> = idx
+            .search("eski", 10)
+            .into_iter()
+            .map(|r| r.doc_id)
+            .collect();
+        assert_eq!(ids, vec![3]);
+        assert!(idx.search("farklı", 10).is_empty(), "removed doc came back");
+    }
+
+    /// An idle persist must be free — the maintenance tick calls it every
+    /// second for every collection with a text index.
+    #[test]
+    fn a_clean_persist_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.mtidx");
+        let mut idx = CollectionTextIndex::new_disk(vec!["text".into()], path.clone());
+        idx.index_doc(1, &serde_json::json!({"text": "bir şey"}));
+        idx.persist_disk().unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        idx.persist_disk().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "a clean index rewrote its file"
         );
     }
 

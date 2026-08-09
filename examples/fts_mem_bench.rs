@@ -13,11 +13,13 @@
 //!
 //! Measured history (1M docs, ~120 B text/doc, ~15 distinct terms):
 //!
-//! |                              | before      | after (intern + cap) |
-//! |------------------------------|-------------|----------------------|
-//! | resident index               | 1015 MB     | 785 MB               |
-//! | common-term search peak      | 25.5 MB     | 7.3 MB               |
-//! | two-common-terms search peak | 51.0 MB     | 7.3 MB (flat)        |
+//! |                              | original | intern + cap | .mtidx (disk base) |
+//! |------------------------------|----------|--------------|--------------------|
+//! | resident index               | 1015 MB  | 785 MB       | **0 MB** (mmap)    |
+//! | build peak                   | ~1 GB    | ~800 MB      | 265 MB (200k fold) |
+//! | open: rebuild scan           | yes      | yes          | no — mmap          |
+//! | common-term search peak      | 25.5 MB  | 7.3 MB       | 7.3 MB             |
+//! | common-term search time      | 37 ms    | 24 ms        | 35 ms              |
 //!
 //! (Documents themselves: 38 MB, disk-first. A measurement variant that
 //! skipped `doc_terms` entirely put that structure at 558 MB — interning

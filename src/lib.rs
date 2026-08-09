@@ -24,6 +24,7 @@ pub mod document;
 pub mod engine;
 pub mod error;
 pub mod fts;
+pub mod mmap_text_index;
 pub mod geo;
 #[cfg(feature = "gpu")]
 pub mod gpu;

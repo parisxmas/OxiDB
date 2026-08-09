@@ -429,24 +429,46 @@ impl BTreeCollection {
             Vec::new()
         };
 
-        // Rebuild a text index the collection had before. Only the *definition*
-        // is persisted (which fields), so the postings are rebuilt by reading the
-        // documents once — a text index has to see every document's text either
-        // way. Disk-first otherwise avoids loading all documents, so this cost is
-        // paid only by collections that asked for full-text search.
+        // A text index the collection had before. Disk-first: mmap the
+        // persisted `.mtidx` base — instant, empty overlay, no scan; after
+        // crash recovery (`needs_reindex`), or on a missing/torn file,
+        // rebuild from a document scan AND persist, the `.mfidx` fallback
+        // shape. In-RAM mode only the *definition* persists, so the postings
+        // are rebuilt by reading the documents once, as before. (This scan
+        // used to run on EVERY open — a 1M-doc FTS collection paid ~7s and
+        // rebuilt a NNN-MB resident index each start.)
         let restored_text = persisted_indexes
             .iter()
             .find(|info| info.index_type == "text")
             .map(|info| -> Result<CollectionTextIndex> {
-                let mut idx = CollectionTextIndex::new(info.fields.clone());
+                let tpath = data_dir.join(format!("{}.mtidx", name));
+                if disk_first
+                    && !needs_reindex
+                    && let Ok(idx) = CollectionTextIndex::open_disk(tpath.clone())
+                {
+                    return Ok(idx);
+                }
+                let mut idx = if disk_first {
+                    CollectionTextIndex::new_disk(info.fields.clone(), tpath)
+                } else {
+                    CollectionTextIndex::new(info.fields.clone())
+                };
                 storage.scan_all_while(|_id, bytes| {
                     if let Ok(doc) = crate::codec::decode_doc(bytes)
                         && let Some(id) = doc.get("_id").and_then(|v| v.as_u64())
                     {
                         idx.index_doc(id, &Arc::new(doc));
+                        // Same periodic fold as create_text_index — a crash
+                        // rebuild of a large collection must not spike RAM.
+                        if disk_first && idx.overlay_docs() >= 200_000 {
+                            let _ = idx.persist_disk();
+                        }
                     }
                     Ok(true)
                 })?;
+                if disk_first {
+                    let _ = idx.persist_disk();
+                }
                 Ok(idx)
             })
             .transpose()?;
@@ -995,6 +1017,12 @@ impl BTreeCollection {
                 if idx.building {
                     continue; // written whole at publish; nothing partial on disk
                 }
+                let _ = idx.persist_disk();
+            }
+        }
+        {
+            let mut ti = self.text_index.write();
+            if let Some(ref mut idx) = *ti {
                 let _ = idx.persist_disk();
             }
         }
@@ -4019,6 +4047,9 @@ impl BTreeCollection {
         if name == "_text" {
             let removed = {
                 let mut ti = self.text_index.write();
+                // Best-effort: a stale .mtidx left behind would be adopted by a
+                // later create/reopen with old contents.
+                let _ = std::fs::remove_file(self.data_dir.join(format!("{}.mtidx", self.name)));
                 ti.take().is_some()
             };
             if removed {
@@ -4082,16 +4113,33 @@ impl BTreeCollection {
             return Ok(());
         }
 
-        let mut idx = CollectionTextIndex::new(fields);
+        let mut idx = if self.storage.is_disk_first() {
+            CollectionTextIndex::new_disk(
+                fields,
+                self.data_dir.join(format!("{}.mtidx", self.name)),
+            )
+        } else {
+            CollectionTextIndex::new(fields)
+        };
 
         self.storage.scan_bytes_while(|bytes| {
             let doc: Value = codec::decode_doc(bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
                 let arc = Arc::new(doc);
                 idx.index_doc(id, &arc);
+                // Fold to disk every 200k docs: without this the build
+                // materializes the whole corpus's postings in RAM before the
+                // first persist — the exact peak the disk form exists to
+                // avoid (measured 882 MB at 1M docs; folding bounds it to
+                // one window's overlay).
+                if idx.overlay_docs() >= 200_000 {
+                    let _ = idx.persist_disk();
+                }
             }
             Ok(true)
         })?;
+        // Fold the tail; after this the resident cost is an empty overlay.
+        let _ = idx.persist_disk();
 
         {
             let mut ti = self.text_index.write();
