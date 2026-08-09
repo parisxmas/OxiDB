@@ -1,3 +1,10 @@
+## 0.43.1
+
+Licensing stated precisely: evaluation and development are free; shipping
+an app that includes this package distributes the engine and requires a
+commercial license (the engine's own source-available rule, stated up
+front because embedding is what this package is for).
+
 ## 0.43.0
 
 Version aligned with the OxiDB engine release line — this package wraps the

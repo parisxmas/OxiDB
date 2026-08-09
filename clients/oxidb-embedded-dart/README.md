@@ -127,3 +127,18 @@ cargo build --release -p oxidb-embedded-ffi   # from the repo root
 cd clients/oxidb-embedded-dart
 dart test                                     # OXIDB_FFI_LIB overrides the library path
 ```
+
+## Licensing
+
+**Evaluation and development are free.** Build against this package, run
+tests, prototype — no registration, no key.
+
+**Shipping requires a commercial license.** This package embeds the OxiDB
+engine in your app, so releasing that app (app store, enterprise
+distribution, a device) distributes the engine — the one thing OxiDB's
+source-available license makes commercial. Terms are simple and negotiated
+directly: **barisakin@gmail.com**.
+
+If your users talk to *your servers* instead (the engine never leaves your
+hands), use the free server and a network client such as
+[`oxibase`](https://pub.dev/packages/oxibase).

@@ -1,30 +1,35 @@
-OxiDB Proprietary License
+OxiDB Embedded License
 
 Copyright (c) 2026 Barış AKIN. All rights reserved.
 
-This software, including its source code, binaries, documentation, and
-associated files (the "Software"), is the proprietary property of
-Barış AKIN (the "Licensor").
+This package embeds the OxiDB database engine ("the Engine") in your
+application's process. The Engine is source-available software (see the
+LICENSE in the OxiDB repository); its terms make one thing commercial,
+and an embedded package is that thing by construction:
 
-1. NO LICENSE GRANTED. Except as expressly granted in a separate written
-   agreement with the Licensor (a "Commercial License" — see
-   COMMERCIAL-LICENSE.md), no right is granted to any person or entity
-   to use, copy, modify, merge, publish, distribute, sublicense, sell,
-   or offer as a service the Software, in whole or in part.
+1. EVALUATION AND DEVELOPMENT — FREE. You may use this package to
+   evaluate the Engine, develop against it, run tests and internal
+   prototypes, without charge and without asking anyone.
 
-2. COMMERCIAL LICENSING. Commercial licenses, including embedding,
-   redistribution, and hosted-service rights, are available from the
-   Licensor. See COMMERCIAL-LICENSE.md for how to obtain one.
+2. DISTRIBUTION REQUIRES A COMMERCIAL LICENSE. Shipping an application,
+   device, or offering that includes this package — an app store
+   release, an enterprise deployment to third parties, a product that
+   carries the Engine inside it — is distribution of the Engine, and
+   requires a commercial license from the Licensor. This is the same
+   rule the Engine itself carries; this package merely states it up
+   front, because embedding is what this package is for.
 
-3. PRIOR VERSIONS. Earlier versions of OxiDB were published under
-   open-source licenses: releases up to the MIT-era versions under
-   "MIT OR Apache-2.0", and subsequent releases up to and including
-   v0.32.x under "AGPL-3.0-only". Those grants are irrevocable for
-   those specific published versions, which remain available under
-   their original terms. This proprietary license applies to version
-   0.33.0 and all later versions of the Software.
+3. WHAT STAYS FREE. Applications whose users reach YOUR servers, where
+   the Engine runs server-side for your own business, are governed by
+   the Engine's own source-available terms (free for your own
+   production use). This package's rule concerns the Engine leaving
+   your hands inside a distributed artifact.
 
-4. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+4. COMMERCIAL LICENSING. Terms are negotiated directly and are
+   intentionally simple. Contact: barisakin@gmail.com
+   (see COMMERCIAL-LICENSE.md in the OxiDB repository).
+
+5. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
    ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
    WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
    NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY
