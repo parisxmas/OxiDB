@@ -1,8 +1,15 @@
 //! What an index build now costs a concurrent writer.
 //!
-//! `index_build_barrier` holds writers off for the build, so the honest number
-//! is not the build's own wall time but the **worst latency a writer sees**
-//! while it runs. Both are printed, per collection size.
+//! The build's cost to OTHERS is the number that matters: the worst latency a
+//! concurrent writer sees while it runs. Both are printed, per collection size.
+//!
+//! History, measured here (release, same machine):
+//! - blocking build (0.42.13 fix): writers held for the whole build —
+//!   177 ms @ 200k, 916 ms @ 1M.
+//! - concurrent build (this tree): writers stall at most one backfill chunk,
+//!   ~20-30 ms — plus one final spike proportional to the finished index's
+//!   disk flush at publish (~125 ms @ 1M, disk-first only), which is the
+//!   remaining honest cost.
 //!
 //! ```bash
 //! N=1000000 cargo run --release --example index_build_stall

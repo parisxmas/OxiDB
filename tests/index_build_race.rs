@@ -299,3 +299,94 @@ fn a_unique_index_built_over_a_concurrent_write_still_rejects_duplicates() {
         &accepted_duplicates[..accepted_duplicates.len().min(5)]
     );
 }
+
+/// A query that arrives *while* the build is running must be answered as if
+/// the index did not exist yet — from a scan, completely. The staging index is
+/// partial by definition; a reader that consulted it would silently miss every
+/// document the backfill has not reached. The gate is structural (the staging
+/// index lives under a map key no query can name), and this pins it: a seeded
+/// document from the end of the id range must be findable at every moment of
+/// the build.
+#[test]
+fn a_query_during_the_build_sees_every_document() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(OxiDb::open(dir.path()).unwrap());
+    seed(
+        &db,
+        "live",
+        |i| json!({"i": i, "email": format!("seed{i}@x.com")}),
+    );
+
+    let builder = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.create_index("live", "email").unwrap())
+    };
+
+    // Query throughout the build window. The probe is near the top of the id
+    // range so early in the build it is exactly the kind of document a
+    // partial index would not have yet.
+    let probe = format!("seed{}@x.com", SEED - 1);
+    let mut checks = 0u32;
+    while !builder.is_finished() {
+        assert_eq!(
+            db.find("live", &json!({"email": &probe})).unwrap().len(),
+            1,
+            "a query during the build missed a document (after {checks} good checks)"
+        );
+        checks += 1;
+    }
+    builder.join().unwrap();
+    assert!(
+        checks > 0,
+        "the build finished before any query ran — vacuous"
+    );
+    assert_eq!(db.find("live", &json!({"email": &probe})).unwrap().len(), 1);
+}
+
+/// Index metadata on DISK must not name the index until the build completes:
+/// the metadata file is what reopen trusts, so a crash mid-build must find a
+/// file that simply does not know the index — anything else resurrects a
+/// partial index as ready. The builder itself only saves at completion, so
+/// the test forces a save mid-build the way production would: `drop_index`
+/// of another index (which does not serialize against builds) rewrites the
+/// metadata file from the live index map, and that rewrite must exclude the
+/// staging index.
+#[test]
+fn a_mid_build_metadata_save_does_not_name_the_building_index() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(OxiDb::open(dir.path()).unwrap());
+    seed(
+        &db,
+        "meta",
+        |i| json!({"i": i, "email": format!("seed{i}@x.com")}),
+    );
+    // A second index whose drop will force the metadata rewrite.
+    db.create_index("meta", "i").unwrap();
+
+    let builder = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.create_index("meta", "email").unwrap())
+    };
+    // Let the build register and get into its backfill.
+    std::thread::sleep(Duration::from_millis(30));
+
+    db.drop_index("meta", "i").unwrap();
+    let meta = std::fs::read_to_string(dir.path().join("meta.idx")).unwrap();
+    let done = builder.is_finished();
+    builder.join().unwrap();
+
+    // If the build had already published before our save, "email" in the file
+    // is legitimate — assert only when the save provably ran mid-build.
+    assert!(
+        !done,
+        "the build finished before the mid-build save — widen the window (SEED too small?)"
+    );
+    assert!(
+        !meta.contains("email"),
+        "a metadata save during the build wrote the building index to disk: {meta}"
+    );
+
+    // And at completion the metadata does name it.
+    let meta = std::fs::read_to_string(dir.path().join("meta.idx")).unwrap();
+    assert!(meta.contains("email"));
+}

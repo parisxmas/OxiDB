@@ -60,6 +60,14 @@ enum WriteOp {
 pub struct PagedFieldIndex {
     pub field: String,
     pub unique: bool,
+    /// True while a concurrent (non-blocking) build is backfilling this index.
+    /// A building index lives in the collection's map under a staging key that
+    /// no query can name, so readers never consult it; writers maintain it
+    /// like any other (they iterate the map). The flag exists for the paths
+    /// that *iterate without keying* — persistence and `list_indexes` — which
+    /// must skip an index whose contents are still partial: a partial index
+    /// persisted under its real name would be reopened as ready.
+    pub building: bool,
     /// Main sorted array — contiguous memory, cache-friendly binary search.
     /// Empty when disk-backed (`disk` is `Some`).
     entries: Vec<(IndexValue, DocIdSet)>,
@@ -83,6 +91,7 @@ impl PagedFieldIndex {
     pub fn new(field: String) -> Self {
         Self {
             field,
+            building: false,
             unique: false,
             entries: Vec::new(),
             write_buffer: Vec::new(),
@@ -94,6 +103,7 @@ impl PagedFieldIndex {
     pub fn new_unique(field: String) -> Self {
         Self {
             field,
+            building: false,
             unique: true,
             entries: Vec::new(),
             write_buffer: Vec::new(),
@@ -114,6 +124,7 @@ impl PagedFieldIndex {
         Self {
             field,
             unique,
+            building: false,
             entries: Vec::new(),
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,
@@ -129,6 +140,7 @@ impl PagedFieldIndex {
         Ok(Self {
             field: m.field.clone(),
             unique: m.unique,
+            building: false,
             entries: Vec::new(),
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,
@@ -891,6 +903,7 @@ impl PagedFieldIndex {
         Ok(Self {
             field,
             unique,
+            building: false,
             entries,
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,

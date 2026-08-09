@@ -166,6 +166,12 @@ pub struct BTreeCollection {
     /// other (a read lock); only the checkpoint blocks them, only across the
     /// seal — a rename, not the snapshot write.
     apply_barrier: RwLock<()>,
+    /// Serializes index builds on this collection: two racing `create_index`
+    /// calls on one field must not both scan, and the existence checks are
+    /// only race-free while nothing else is creating. Held for the whole
+    /// build, so it must never be taken by a writer (lock order: this, then
+    /// `apply_barrier`, then the index maps).
+    index_build_serial: Mutex<()>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
     /// Lazy-sync mode: when true, WAL writes skip per-commit fsync and
@@ -518,6 +524,7 @@ impl BTreeCollection {
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(ttl_configs),
             apply_barrier: RwLock::new(()),
+            index_build_serial: Mutex::new(()),
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: wal_backend,
@@ -543,6 +550,7 @@ impl BTreeCollection {
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(Vec::new()),
             apply_barrier: RwLock::new(()),
+            index_build_serial: Mutex::new(()),
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: WalBackend::Memory,
@@ -984,6 +992,9 @@ impl BTreeCollection {
         {
             let mut fi = self.field_indexes.write();
             for idx in fi.values_mut() {
+                if idx.building {
+                    continue; // written whole at publish; nothing partial on disk
+                }
                 let _ = idx.persist_disk();
             }
         }
@@ -1045,7 +1056,7 @@ impl BTreeCollection {
     /// Callers must not hold this across anything that writes: `create_ttl_index`
     /// scopes it to the `create_index` call and evicts afterwards, or the
     /// eviction's own `apply_barrier.read()` would deadlock against it.
-    fn index_build_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+    fn index_build_barrier(&self) -> crate::locks::RwLockWriteGuard<'_, ()> {
         self.apply_barrier.write()
     }
 
@@ -1160,7 +1171,7 @@ impl BTreeCollection {
                 idx.flush_write_buffer();
             }
             let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
-            let field_refs: Vec<&PagedFieldIndex> = fi.values().collect();
+            let field_refs: Vec<&PagedFieldIndex> = fi.values().filter(|i| !i.building).collect();
             let _ = index_persist::save_field_indexes(
                 &fidx_path,
                 &field_refs,
@@ -3622,72 +3633,160 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     /// Create a single-field index. Rebuilds from B-tree cursor scan.
-    pub fn create_index(&self, field: &str) -> Result<()> {
-        {
-            let fi = self.field_indexes.read();
-            if fi.contains_key(field) {
-                return Ok(());
-            }
-        }
+    /// The staging map key a concurrent build registers its index under.
+    ///
+    /// `\0` cannot appear in an indexable field name (`create_index` refuses
+    /// it), so no query can name this key — which is the whole reader-side
+    /// gate: every query path reaches field indexes **by name** (`fi.get`,
+    /// `contains_key`; `query.rs` has no iteration over the map), so a key no
+    /// query can produce makes the partial index structurally invisible to
+    /// reads. Writers, by contrast, maintain indexes by **iterating** the map
+    /// (`values_mut`), so the very same placement makes every writer path —
+    /// insert, update, delete, find_and_modify, both TTL evictors, the
+    /// transaction apply — maintain the staging index with zero new code in
+    /// any of them.
+    fn staging_key(field: &str) -> String {
+        format!("\u{0}building:{field}")
+    }
 
-        // Writers are held off from here to registration — see
-        // `index_build_barrier`. The existence check is repeated under it
-        // because two builders racing on the same field would otherwise both
-        // scan, and the loser's work is pure waste.
-        let _build = self.index_build_barrier();
+    /// Create a (non-unique) field index **without blocking writers for the
+    /// build** — the Postgres-`CREATE INDEX CONCURRENTLY` shape:
+    ///
+    /// 1. Register an empty index in the map under [`Self::staging_key`],
+    ///    marked `building`. From this instant every writer maintains it.
+    /// 2. Backfill in id-window chunks, each under `apply_barrier.write()` +
+    ///    `field_indexes.write()` — the pair every document-mutating path in
+    ///    this file holds (verified path by path; the evictors skip the
+    ///    barrier but hold the map lock across storage+index mutation), so a
+    ///    chunk sees storage and indexes mutually consistent. Writers run
+    ///    freely **between** chunks; a whole-collection build stalls a writer
+    ///    by at most one chunk, not the build.
+    /// 3. Publish: move the index to its real key, clear `building`, persist.
+    ///
+    /// One sweep converges, because ids are monotonic: a document inserted
+    /// during the build has an id above the end bound captured at
+    /// registration, and the writer that created it already indexed it (step
+    /// 1); a document updated or deleted behind the cursor is fixed by its
+    /// writer; ahead of the cursor, the backfill reads the current state.
+    /// Crash mid-build: the metadata (`list_indexes`, which skips `building`)
+    /// was never saved, so reopen simply has no such index — nothing partial
+    /// can be resurrected, which is also why the persistence paths skip
+    /// building indexes.
+    ///
+    /// The caller still blocks until the build completes (as in Postgres —
+    /// CONCURRENTLY is non-blocking for *other* writers, not asynchronous for
+    /// its caller), so "create returned ⇒ index serves queries" still holds.
+    ///
+    /// UNIQUE builds stay on the blocking path: uniqueness cannot be enforced
+    /// against an index that is not complete yet, so a concurrent unique
+    /// build could admit a duplicate it only discovers at publish time.
+    pub fn create_index(&self, field: &str) -> Result<()> {
+        // `\0` is what fences the staging namespace off from real fields.
+        if field.contains('\u{0}') {
+            return Err(Error::InvalidQuery(
+                "index field names may not contain NUL".into(),
+            ));
+        }
+        // One build at a time per collection: two racing builds on the same
+        // field must not both scan, and the existence checks below are only
+        // race-free while nothing else is creating.
+        let _serial = self.index_build_serial.lock();
         if self.field_indexes.read().contains_key(field) {
             return Ok(());
         }
 
-        // Parallel index build: extract (id, IndexValue) pairs from all docs
-        let slices = self.storage.values_as_slices();
-        let field_owned = field.to_string();
+        let staging = Self::staging_key(field);
+        let disk_first = self.storage.is_disk_first();
 
-        let iter_fn = |bytes: &Vec<u8>| -> Option<(IndexValue, u64)> {
-            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
-                let raw = jsonb::RawJsonb::new(bytes);
-                let id = extract_raw_u64(&raw, "_id")?;
-                let iv = extract_raw_index_value(&raw, &field_owned)?;
-                Some((iv, id))
+        // Step 1: register the empty staging index. Under the write barrier so
+        // no writer is anywhere between its storage mutation and its index
+        // maintenance when the index appears.
+        {
+            let _barrier = self.index_build_barrier();
+            let mut fi = self.field_indexes.write();
+            let mut idx = if disk_first {
+                let mpath = self.data_dir.join(format!("{}.{}.mfidx", self.name, field));
+                PagedFieldIndex::new_disk(field.to_string(), false, mpath)
             } else {
-                let doc: Value = codec::decode_doc(bytes).ok()?;
-                let id = doc.get("_id")?.as_u64()?;
-                let val = resolve_field_in_value(&doc, &field_owned)?;
-                Some((IndexValue::from_json(val), id))
+                PagedFieldIndex::new(field.to_string())
+            };
+            idx.building = true;
+            fi.insert(staging.clone(), idx);
+        }
+
+        // The work list, snapshotted ONCE and without any lock: 8 bytes per
+        // document, against the whole collection's bytes the old blocking
+        // build materialized. Snapshot exactness is not needed — an id
+        // deleted before its chunk reads as gone and is skipped, and every
+        // document created after registration was indexed by its own writer.
+        // (A first version paginated with `keys_after` *inside* the exclusive
+        // section instead: an O(n) index pass per chunk, measured as a 140 ms
+        // writer stall at 1M docs — the pagination was the stall.)
+        let mut ids: Vec<u64> = Vec::with_capacity(self.storage.count());
+        self.storage.scan_keys(|k| ids.push(k));
+        ids.sort_unstable();
+
+        // Step 2: chunked backfill. Same chunk size as the TTL evictor, for
+        // the same reason: the hold is one chunk's fetch+decode, not the
+        // table. Fetch, decode and insert stay under one hold — reading the
+        // document and indexing it must be atomic against a concurrent
+        // update of that document, or the stale-entry race returns.
+        const BUILD_CHUNK: usize = 4_096;
+        for chunk in ids.chunks(BUILD_CHUNK) {
+            let _barrier = self.index_build_barrier();
+            let mut fi = self.field_indexes.write();
+            let idx = fi
+                .get_mut(&staging)
+                .expect("staging index registered above; only publish removes it");
+            for &key in chunk {
+                // Gone = deleted since the snapshot; skip, as its writer's
+                // remove_value already kept the staging index right.
+                let Some(bytes) = self.storage.get(key) else {
+                    continue;
+                };
+                if let Ok(doc) = codec::decode_doc(&bytes)
+                    && let Some(val) = resolve_field_in_value(&doc, field)
+                {
+                    idx.insert_raw(key, IndexValue::from_json(val));
+                }
             }
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut pairs: Vec<(IndexValue, u64)> = slices.par_iter().filter_map(iter_fn).collect();
-        #[cfg(target_arch = "wasm32")]
-        let mut pairs: Vec<(IndexValue, u64)> = slices.iter().filter_map(iter_fn).collect();
+        }
 
-        // Sort by IndexValue so build_from_sorted can append in order (no O(n) shifts)
-        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-
-        let sorted_pairs: Vec<(IndexValue, u64)> = pairs;
-        let idx = if self.storage.is_disk_first() {
-            let mpath = self.data_dir.join(format!("{}.{}.mfidx", self.name, field));
-            let mut idx = PagedFieldIndex::new_disk(field.to_string(), false, mpath);
-            for (iv, id) in sorted_pairs {
-                idx.insert_raw(id, iv);
+        // Step 3: publish under the real name. A writer running between the
+        // last chunk and this hold maintained the staging index like any
+        // other, so nothing can be missed in the gap.
+        {
+            let _barrier = self.index_build_barrier();
+            let mut fi = self.field_indexes.write();
+            if let Some(mut idx) = fi.remove(&staging) {
+                idx.building = false;
+                fi.insert(field.to_string(), idx);
             }
-            let _ = idx.persist_disk();
-            idx
-        } else {
-            let mut idx = PagedFieldIndex::new(field.to_string());
-            idx.build_from_sorted(sorted_pairs);
-            idx
-        };
+        }
 
-        let mut fi = self.field_indexes.write();
-        fi.insert(field.to_string(), idx);
-        drop(fi);
+        if disk_first {
+            let mut fi = self.field_indexes.write();
+            if let Some(idx) = fi.get_mut(field) {
+                let _ = idx.persist_disk();
+            }
+        }
         let _ = self.save_index_metadata();
         Ok(())
     }
 
-    /// Create a unique single-field index.
+    /// Create a unique single-field index. Deliberately still a blocking
+    /// build (unlike `create_index`): uniqueness cannot be enforced against
+    /// an index that is not complete, so a concurrent unique build could
+    /// admit a duplicate it only discovers at publish time.
     pub fn create_unique_index(&self, field: &str) -> Result<()> {
+        if field.contains('\u{0}') {
+            return Err(Error::InvalidQuery(
+                "index field names may not contain NUL".into(),
+            ));
+        }
+        // Excludes a concurrent non-blocking build of the same field, whose
+        // staging index the `contains_key` below cannot see.
+        let _serial = self.index_build_serial.lock();
         {
             let fi = self.field_indexes.read();
             if fi.contains_key(field) {
@@ -3806,6 +3905,12 @@ impl BTreeCollection {
         let mut indexes = Vec::new();
         let fi = self.field_indexes.read();
         for idx in fi.values() {
+            // A building index is not queryable and MUST NOT reach the
+            // metadata this list is serialized into: metadata saying "ready"
+            // is exactly how a crashed partial build would be resurrected.
+            if idx.building {
+                continue;
+            }
             indexes.push(IndexInfo {
                 name: idx.field.clone(),
                 index_type: if idx.unique {
