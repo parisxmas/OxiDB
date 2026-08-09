@@ -1,35 +1,30 @@
-OxiDB Embedded License
+OxiDB Embedded License — Commercial
 
 Copyright (c) 2026 Barış AKIN. All rights reserved.
 
 This package embeds the OxiDB database engine ("the Engine") in your
-application's process. The Engine is source-available software (see the
-LICENSE in the OxiDB repository); its terms make one thing commercial,
-and an embedded package is that thing by construction:
+application's process.
 
-1. EVALUATION AND DEVELOPMENT — FREE. You may use this package to
-   evaluate the Engine, develop against it, run tests and internal
-   prototypes, without charge and without asking anyone.
+1. COMMERCIAL LICENSE REQUIRED. Use of this package in any application,
+   device, or offering that is shipped, deployed, or otherwise made
+   available to any third party — an app store release, an enterprise
+   rollout, a product carrying the Engine inside it — requires a
+   commercial license from the Licensor. No such right is granted by
+   this file. Terms are negotiated directly and are intentionally
+   simple. Contact: barisakin@gmail.com (see COMMERCIAL-LICENSE.md in
+   the OxiDB repository).
 
-2. DISTRIBUTION REQUIRES A COMMERCIAL LICENSE. Shipping an application,
-   device, or offering that includes this package — an app store
-   release, an enterprise deployment to third parties, a product that
-   carries the Engine inside it — is distribution of the Engine, and
-   requires a commercial license from the Licensor. This is the same
-   rule the Engine itself carries; this package merely states it up
-   front, because embedding is what this package is for.
+2. EVALUATION. You may use this package solely to evaluate the Engine
+   and develop against it prior to obtaining a commercial license.
+   This permission does not extend to shipping anything.
 
-3. WHAT STAYS FREE. Applications whose users reach YOUR servers, where
-   the Engine runs server-side for your own business, are governed by
-   the Engine's own source-available terms (free for your own
-   production use). This package's rule concerns the Engine leaving
-   your hands inside a distributed artifact.
+3. SERVER-SIDE ALTERNATIVE. Applications whose users reach YOUR
+   servers, where the Engine runs server-side for your own business,
+   are governed by the Engine's own source-available terms — use the
+   OxiDB server and a network client (e.g. the `oxibase` package) for
+   that case.
 
-4. COMMERCIAL LICENSING. Terms are negotiated directly and are
-   intentionally simple. Contact: barisakin@gmail.com
-   (see COMMERCIAL-LICENSE.md in the OxiDB repository).
-
-5. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+4. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
    ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
    WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
    NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY

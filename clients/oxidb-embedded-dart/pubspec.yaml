@@ -4,7 +4,7 @@ description: >-
   (queries, indexes incl. geo, aggregation, full-text search, transactions,
   blob storage, SQL, AES-256-GCM encryption at rest) over dart:ffi.
   A local database in the Hive/Isar weight class, with a server-grade engine.
-version: 0.43.1
+version: 0.43.2
 repository: https://github.com/parisxmas/OxiDB
 
 environment:

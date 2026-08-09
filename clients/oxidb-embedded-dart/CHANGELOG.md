@@ -1,3 +1,9 @@
+## 0.43.2
+
+License rewritten commercial-first: use in anything shipped to third
+parties requires a commercial license (contact in LICENSE); evaluation
+before purchase is a narrow permission, not a headline.
+
 ## 0.43.1
 
 Licensing stated precisely: evaluation and development are free; shipping
