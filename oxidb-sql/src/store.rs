@@ -274,6 +274,38 @@ pub(crate) trait Store {
         Ok(None)
     }
 
+    /// [`index_visit_range_ids`](Store::index_visit_range_ids) for a **read**:
+    /// cells only, and only the `want` columns decoded (as in
+    /// [`scan_visit_cols`](Store::scan_visit_cols) — positions are preserved,
+    /// the rest arrive as `Value::Null` placeholders). `Ok(None)` when the
+    /// caller should scan instead.
+    ///
+    /// Split from the DML form rather than sharing it because the two decide
+    /// differently, not because the walk differs: a read's alternative is a
+    /// streaming scan, so an index selecting most of the table is the worse
+    /// plan and this declines it; DML's alternative is materializing the table,
+    /// so nothing makes scanning better there. An implementation with no index
+    /// (or no opinion) declines, and the caller scans — which is why the
+    /// default is `Ok(None)` and why the transaction store, which buffers
+    /// everything in RAM anyway, simply inherits it.
+    ///
+    /// Rows arrive in ascending row-id order, the same order a scan hands them
+    /// over. That is load-bearing: it makes this a drop-in for the scan in
+    /// callers that break ORDER BY ties by arrival, so switching plans cannot
+    /// switch answers.
+    fn index_visit_range_cols(
+        &self,
+        table: &str,
+        col: &str,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let _ = (table, col, lo, hi, want, visit);
+        Ok(None)
+    }
+
     /// Record how many rows the last DML statement examined to find its
     /// matches. Diagnostic only — it is what makes "the index served this" and
     /// "this walked the table" distinguishable from outside, including in

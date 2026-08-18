@@ -322,6 +322,40 @@ struct SecondaryIndex {
     base: Option<index_file::MappedIndex>,
 }
 
+/// What a caller is walking an index range *for*, which is what decides whether
+/// a large candidate set is still worth taking.
+///
+/// The engine has no statistics, so selectivity cannot be estimated before the
+/// walk — it is measured *during* one, by capping it. Both variants below are a
+/// statement about the alternative plan, not about the data.
+#[derive(Clone, Copy)]
+enum RangePlan {
+    /// A read. The alternative is a streaming scan that allocates nothing per
+    /// row, so an index that barely narrows anything is the *worse* plan: every
+    /// candidate still costs a row locate the scan does not pay, and the
+    /// candidate list is memory this engine holds nowhere else per row.
+    Read,
+    /// A DML match pass. The alternative is materializing the whole table into
+    /// an owned `Vec`, so no candidate count makes scanning the better plan.
+    Write,
+}
+
+impl RangePlan {
+    fn cap(self, rows: usize) -> usize {
+        match self {
+            Self::Write => usize::MAX,
+            // Half the table is where an index has stopped narrowing enough to
+            // pay for itself. The floor keeps small tables on the index (both
+            // plans are trivial there, and declining would make the *shape* of a
+            // query depend on how much data happens to be loaded); the ceiling
+            // is a memory bound — a range over 100M rows would otherwise put
+            // 800 MB of row ids in a process that keeps no per-row structure
+            // resident anywhere else.
+            Self::Read => (rows / 2).clamp(4_096, 1_000_000),
+        }
+    }
+}
+
 impl SecondaryIndex {
     fn key_of(&self, cells: &[Value]) -> KeyTuple {
         self.col_pos
@@ -343,9 +377,24 @@ impl SecondaryIndex {
     /// single pair: a range on a later column of a composite index does not
     /// select a contiguous run of keys, so it would have to walk the whole index
     /// to be correct — no better than the table scan it is replacing.
-    fn candidates_range(&self, lo: &RangeBound, hi: &RangeBound) -> Result<Vec<u64>> {
+    ///
+    /// `cap` bounds the candidate list: `Ok(None)` means the range selects more
+    /// than that and the caller should plan something else. DML passes
+    /// `usize::MAX` — it is replacing a materialization of the whole table, so
+    /// no candidate count makes the scan the better plan — while a read passes a
+    /// real cap, because there the alternative is a *streaming* scan that a
+    /// barely-narrowing index cannot beat.
+    fn candidates_range(
+        &self,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        cap: usize,
+    ) -> Result<Option<Vec<u64>>> {
         let mut ids = match &self.base {
-            Some(base) => base.range_first_col(lo, hi)?,
+            Some(base) => match base.range_first_col(lo, hi, cap)? {
+                Some(ids) => ids,
+                None => return Ok(None),
+            },
             None => Vec::new(),
         };
         // The overlay is keyed by the whole tuple, but tuples order by their
@@ -371,11 +420,18 @@ impl SecondaryIndex {
             }
             if lo.allows_low(&first.0) {
                 ids.extend(extra.iter().copied());
+                // Measured before the dedup below, so an id the base and the
+                // overlay both name can push the count over the cap. Declining
+                // one candidate early costs a plan that was marginal anyway;
+                // deduping first would mean deciding after doing the work.
+                if ids.len() > cap {
+                    return Ok(None);
+                }
             }
         }
         ids.sort_unstable();
         ids.dedup();
-        Ok(ids)
+        Ok(Some(ids))
     }
 
     /// Row ids that *might* match `key`: the mapped base plus the overlay.
@@ -980,6 +1036,14 @@ pub struct SqlEngine {
     /// outside to tell "an index served this" from "this walked the table",
     /// which is exactly what the streaming DML tests assert.
     dml_examined: std::sync::atomic::AtomicU64,
+    /// How many reads an index *range* has served on this engine
+    /// ([`SqlEngine::range_index_reads`]). The same argument as `dml_examined`
+    /// one step further: a `SELECT` narrowed by an index and one that walked
+    /// the table return the identical answer, so without this the only
+    /// observable difference is how long it took — which is not something a
+    /// test can assert on. Monotonic, engine-wide, one relaxed add per
+    /// statement that used the plan.
+    range_index_reads: std::sync::atomic::AtomicU64,
     /// COBRA extension methods installed by the host (ADR-0025 Phase 4);
     /// `db.rec_*` / `db.vector_*` route here.
     native_ext: std::sync::RwLock<Option<std::sync::Arc<dyn store::NativeExt>>>,
@@ -1291,6 +1355,7 @@ impl SqlEngine {
             txn_max_idle_ms: std::sync::atomic::AtomicU64::new(txn_max_idle_ms_from_env()),
             expired_txns: Mutex::new(std::collections::BTreeSet::new()),
             dml_examined: std::sync::atomic::AtomicU64::new(0),
+            range_index_reads: std::sync::atomic::AtomicU64::new(0),
             native_ext: std::sync::RwLock::new(None),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             row_locks: row_locks::RowLocks::default(),
@@ -2340,6 +2405,17 @@ impl SqlEngine {
     /// DML statement this engine ran, whoever ran it.
     pub fn dml_rows_examined(&self) -> u64 {
         self.dml_examined.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many reads an index range has served on this engine, cumulatively.
+    ///
+    /// A diagnostic, like [`dml_rows_examined`](Self::dml_rows_examined): a
+    /// `SELECT` an index narrowed and one that walked the whole table produce
+    /// the same rows, so this is what makes the plan observable at all. It
+    /// counts statements, not rows or candidates.
+    pub fn range_index_reads(&self) -> u64 {
+        self.range_index_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of live rows in a table.
@@ -3969,12 +4045,22 @@ impl SqlEngine {
     ///
     /// An index qualifies when its **first** column is `col`; see
     /// [`SecondaryIndex::candidates_range`] for why only the first.
+    ///
+    /// `want` names the columns the visitor reads, in the same sense as
+    /// [`scan_visit_cols`](Store::scan_visit_cols): the index's own key columns
+    /// are added to it, because verifying a candidate reads them. `plan` decides
+    /// whether a large candidate set is still worth taking; when it is not, this
+    /// answers `Ok(None)`, which reads exactly like "no index qualifies" to the
+    /// caller and is meant to — both answers mean *scan*.
+    #[allow(clippy::too_many_arguments)]
     fn index_visit_range_inner(
         &self,
         table: &str,
         col: &str,
         lo: &RangeBound,
         hi: &RangeBound,
+        want: Option<&[usize]>,
+        plan: RangePlan,
         visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
     ) -> Result<Option<()>> {
         let mut inner = self.inner.lock().unwrap();
@@ -4008,9 +4094,47 @@ impl SqlEngine {
         // against the live row, and a dropped column makes logical and physical
         // positions differ (see `index_visit_eq_masked` for the same care).
         let pos = *idx.col_pos.first().expect("index has >= 1 column");
-        let ids = idx.candidates_range(lo, hi)?;
+        // The caller's columns plus the index's own — the bound check below
+        // reads `pos`, so a mask that skipped it would decode a placeholder and
+        // range-check the wrong thing. Built in physical positions, exactly as
+        // `index_visit_eq_masked` builds its own.
+        let mask: Option<Vec<bool>> = want.map(|cols| {
+            let arity = state.def.columns.len();
+            let hi_col = cols.iter().chain(idx.col_pos.iter()).copied().max();
+            let mut m = vec![false; arity.max(hi_col.map_or(0, |c| c + 1))];
+            for &c in cols.iter().chain(idx.col_pos.iter()) {
+                m[c] = true;
+            }
+            m
+        });
+        let Some(ids) = idx.candidates_range(lo, hi, plan.cap(state.rows.len()))? else {
+            return Ok(None); // too many to be worth it — the caller scans
+        };
+        // Candidates ascend by row id, and so does a scan, so both sources hand
+        // the visitor this table's rows in the same order. Callers depend on
+        // that: an ORDER BY tie broken by arrival order, and any statement
+        // without one, must not change answer because a plan changed.
+        //
+        // Dense sets walk the snapshot forward with one cursor rather than
+        // locating each id — the same trade `index_visit_eq_masked` documents;
+        // it declines (sparse, resident, dropped column) instead of being wrong.
+        if let Some(m) = &mask
+            && let Some(walked) = state
+                .rows
+                .visit_ids_masked(&ids, m, &mut |id, phys| match phys.get(pos) {
+                    Some(c) if lo.allows_low(c) && hi.allows_high(c) => visit(id, phys),
+                    _ => Ok(true),
+                })
+        {
+            walked?;
+            return Ok(Some(()));
+        }
         for id in ids {
-            let Some(phys) = state.rows.physical_ref(id) else {
+            let phys = match &mask {
+                Some(m) => state.rows.physical_ref_masked(id, m),
+                None => state.rows.physical_ref(id),
+            };
+            let Some(phys) = phys else {
                 continue; // deleted since the checkpoint the base describes
             };
             let Some(cell) = phys.get(pos) else { continue };
@@ -4176,7 +4300,31 @@ impl Store for SqlEngine {
         hi: &RangeBound,
         visit: &mut dyn FnMut(u64, &[Value]) -> Result<bool>,
     ) -> Result<Option<()>> {
-        self.index_visit_range_inner(table, col, lo, hi, visit)
+        self.index_visit_range_inner(table, col, lo, hi, None, RangePlan::Write, visit)
+    }
+    fn index_visit_range_cols(
+        &self,
+        table: &str,
+        col: &str,
+        lo: &RangeBound,
+        hi: &RangeBound,
+        want: &[usize],
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let served = self.index_visit_range_inner(
+            table,
+            col,
+            lo,
+            hi,
+            Some(want),
+            RangePlan::Read,
+            &mut |_, cells| visit(cells),
+        )?;
+        if served.is_some() {
+            self.range_index_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(served)
     }
     fn note_dml_examined(&self, rows: u64) {
         self.dml_examined

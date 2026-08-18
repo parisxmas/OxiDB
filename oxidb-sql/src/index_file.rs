@@ -436,15 +436,46 @@ impl MappedIndex {
     /// with `lo`; an exclusive low bound is filtered per entry rather than
     /// seeked past, because `[lo]` sorts *below* `[lo, x]` and skipping it would
     /// skip composite keys that belong in the answer.
+    ///
+    /// `cap` bounds the walk: `Ok(None)` means the range selects more than that
+    /// many ids and the caller should plan something else. It stops **at** the
+    /// cap rather than collecting and then measuring, which is what makes a
+    /// declined plan cost `cap` instead of the whole matching run — the caller
+    /// is about to scan the table anyway, and paying for the index first would
+    /// make the bad case worse rather than better.
+    ///
+    /// Better than that where the file can say so cheaply: the entry table is
+    /// sorted and fixed-stride, so the **span** between the two bounds is two
+    /// binary searches, and every entry holds at least one id. A span already
+    /// past the cap therefore declines in O(log n) without reading a single id.
+    /// That matters because a declined plan is pure waste — the caller scans
+    /// regardless — and a benchmark caught it: a window over 60% of a 1M-row
+    /// table declined *correctly* and still cost 20 ms doing it, turning a 34 ms
+    /// scan into 53 ms. The walk cap below stays, for the low-cardinality index
+    /// where few entries hold many ids and the span says nothing.
     pub fn range_first_col(
         &self,
         lo: &crate::store::RangeBound,
         hi: &crate::store::RangeBound,
-    ) -> Result<Vec<u64>> {
+        cap: usize,
+    ) -> Result<Option<Vec<u64>>> {
         let at = match lo.value() {
             None => 0,
             Some(v) => self.lower_bound(&[IndexKey(v.clone())])?,
         };
+        // An **under**estimate of the qualifying span on both ends: the seek is
+        // by the one-element tuple, which sorts below every key that extends it,
+        // and an exclusive bound is filtered per entry rather than seeked past.
+        // Undercounting only means declining later than strictly necessary;
+        // overcounting would decline a plan that was worth taking, so the
+        // approximation is deliberately in this direction.
+        let end = match hi.value() {
+            None => self.entries,
+            Some(v) => self.lower_bound(&[IndexKey(v.clone())])?,
+        };
+        if end.saturating_sub(at) > cap {
+            return Ok(None);
+        }
         let mut out = Vec::new();
         for i in at..self.entries {
             let key = self.key_at(i)?;
@@ -454,9 +485,12 @@ impl MappedIndex {
             }
             if lo.allows_low(&first.0) {
                 out.extend(self.ids_at(i));
+                if out.len() > cap {
+                    return Ok(None);
+                }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Row ids recorded for exactly `key` at the last checkpoint. Callers must

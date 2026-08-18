@@ -1213,15 +1213,23 @@ fn filter_col_mask(e: &Expr, schema: &[ColRef]) -> Option<Vec<usize>> {
 /// contiguous run of keys for its *first* column, so bounds on two different
 /// columns cannot both be pushed down; the leftover one would have to be
 /// rechecked anyway, which is what the per-row predicate already does.
+///
+/// `key` is the alias an *unbound* filter's column names may be attributed to,
+/// and `None` refuses to attribute them at all — only bound positions
+/// (`Expr::Col`) are read. A read pushing a predicate into one side of a join
+/// must pass `None`: an unqualified name that happens to exist in this table
+/// may resolve to another one, and unlike the per-row recheck that follows,
+/// getting the *candidate set* wrong drops rows rather than merely admitting
+/// them.
 fn range_conjunct(
     expr: &Expr,
-    key: &str,
+    key: Option<&str>,
     params: &[Value],
     def: &crate::catalog::Table,
 ) -> Option<(String, RangeBound, RangeBound)> {
     fn walk(
         e: &Expr,
-        key: &str,
+        key: Option<&str>,
         params: &[Value],
         def: &crate::catalog::Table,
         found: &mut Option<(String, RangeBound, RangeBound)>,
@@ -1284,14 +1292,18 @@ fn range_conjunct(
 }
 
 /// The column name an expression names, if it is a plain column of `key`'s
-/// table that actually exists.
-fn bound_col(e: &Expr, key: &str, def: &crate::catalog::Table) -> Option<String> {
+/// table that actually exists. With no `key`, only a bound position counts —
+/// see [`range_conjunct`].
+fn bound_col(e: &Expr, key: Option<&str>, def: &crate::catalog::Table) -> Option<String> {
     match e {
-        Expr::Column { table, name } if table.as_deref().map(|t| t == key).unwrap_or(true) => def
-            .columns
-            .iter()
-            .any(|c| c.name == *name)
-            .then(|| name.clone()),
+        Expr::Column { table, name }
+            if key.is_some_and(|k| table.as_deref().map(|t| t == k).unwrap_or(true)) =>
+        {
+            def.columns
+                .iter()
+                .any(|c| c.name == *name)
+                .then(|| name.clone())
+        }
         // After resolution the filter carries bound positions, not names.
         Expr::Col(i) => def.columns.get(*i).map(|c| c.name.clone()),
         _ => None,
@@ -1427,7 +1439,7 @@ fn collect_dml_matches<S: Store>(
         }
         // 2. A range on an indexed column — the shape a purge is written in
         //    (`WHERE created_at < ?`), and the one that used to force a scan.
-        if let Some((col, lo, hi)) = range_conjunct(expr, key, params, def) {
+        if let Some((col, lo, hi)) = range_conjunct(expr, Some(key), params, def) {
             let served = store.index_visit_range_ids(table, &col, &lo, &hi, &mut |id, cells| {
                 acc.feed(filter, schema, params, id, cells)
             })?;
@@ -6297,6 +6309,21 @@ fn streamed_aggregate<S: Store>(
         })?,
         None => None,
     };
+    // An equality is the more selective probe, so a range is only tried when
+    // none applied. An aggregate reads every matching row by definition — there
+    // is no early exit for an index to displace here.
+    let served = match served {
+        Some(()) => Some(()),
+        None => match seekable_range(store, &from.name, filter.as_ref(), params) {
+            Some((col, lo, hi)) => {
+                store.index_visit_range_cols(&from.name, &col, &lo, &hi, &want, &mut |cells| {
+                    fold_row(cells, &cells)?;
+                    Ok(true)
+                })?
+            }
+            None => None,
+        },
+    };
     if served.is_none() {
         // Which of those columns does *evaluation* need? Everything except a
         // plain-column group key, which is compared straight from the row. That
@@ -6533,7 +6560,12 @@ fn streamed_chunk<S: Store>(
         let mut kbuf: Vec<Value> = Vec::with_capacity(keys.len());
         let mut seq = 0usize;
         let simple = filter.as_ref().and_then(SimpleFilter::build);
-        store.scan_visit_cols(&from.name, keep, &mut |row| {
+        // A top-N cutoff has to see every matching row before it knows which N
+        // survive, so unlike the early-stopping branch this one has nothing to
+        // lose to an index — and `seq` stays meaningful because both sources
+        // arrive in row-id order.
+        let range = seekable_range(store, &from.name, filter.as_ref(), params);
+        visit_base_rows(store, &from.name, range.as_ref(), keep, &mut |row| {
             let keep_row = match (&simple, &filter) {
                 (Some(s), _) => s.passes(row)?,
                 (None, Some(f)) => truthy(&eval_scalar(f, full, row, params)?),
@@ -6588,6 +6620,52 @@ fn streamed_chunk<S: Store>(
     }
 }
 
+/// The rows of one table for a join-free read: narrowed by an index range when
+/// the (bound) predicate carries a bound one can seek, else the table scan.
+///
+/// Both sources hand the visitor rows in ascending row-id order and decode only
+/// `want`, which is what makes this a drop-in for the scan — see
+/// [`Store::index_visit_range_cols`]. It also declines *before* visiting
+/// anything, so a caller never sees a partial index walk followed by a full
+/// scan of the same table.
+///
+/// The index narrows; it never decides. Every caller re-applies the whole
+/// predicate per row, so a candidate set that is a **superset** of the matching
+/// rows is all this has to produce — which is what makes an index key's
+/// cross-type ordering safe here even where it disagrees with SQL comparison
+/// (`total_order` ranks a `Text` above every number; `cmp_values` calls the
+/// pair unknown). The direction that would be a wrong answer is the other one,
+/// dropping a row the predicate accepts, and no such pair exists: wherever
+/// `cmp_values` returns a verdict at all, the two orders are the same
+/// comparison.
+fn visit_base_rows<S: Store>(
+    store: &S,
+    table: &str,
+    range: Option<&(String, RangeBound, RangeBound)>,
+    want: &[usize],
+    visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+) -> Result<()> {
+    if let Some((col, lo, hi)) = range
+        && store
+            .index_visit_range_cols(table, col, lo, hi, want, visit)?
+            .is_some()
+    {
+        return Ok(());
+    }
+    store.scan_visit_cols(table, want, visit)
+}
+
+/// The index range a bound, single-table predicate offers, if any.
+fn seekable_range<S: Store>(
+    store: &S,
+    table: &str,
+    filter: Option<&Expr>,
+    params: &[Value],
+) -> Option<(String, RangeBound, RangeBound)> {
+    let filter = filter?; // before `table_def`, which clones the whole schema
+    range_conjunct(filter, None, params, &store.table_def(table)?)
+}
+
 /// Scan `table` keeping only rows that pass `filter` (already bound against
 /// the table's full schema), cloning just the `keep` columns. Rows are
 /// evaluated borrowed via [`Store::scan_visit`]; `stop_after` ends the scan
@@ -6605,10 +6683,18 @@ fn filtered_scan<S: Store>(
     let mut n = 0usize;
     // The predicate's per-row decisions are made once where its shape allows it.
     let simple = filter.and_then(SimpleFilter::build);
+    // An index range, but only for a caller that must see every match. One that
+    // can stop early (a LIMIT with no ORDER BY) is already output-bounded, and
+    // the candidate list is built in full before the first row comes back — so
+    // there an index would trade an early exit for guaranteed up-front work.
+    let range = match stop_after {
+        Some(_) => None,
+        None => seekable_range(store, table, filter, params),
+    };
     // Only the columns this statement reads are decoded. `keep` comes from
     // `collect_needed`, which walks the filter as well as the projection, so the
     // predicate evaluated below can never want a column that was skipped.
-    store.scan_visit_cols(table, keep, &mut |row| {
+    visit_base_rows(store, table, range.as_ref(), keep, &mut |row| {
         let keep_row = match (&simple, filter) {
             (Some(s), _) => s.passes(row)?,
             (None, Some(f)) => truthy(&eval_scalar(f, full, row, params)?),
@@ -9419,6 +9505,110 @@ fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
             let (x, y) = (as_f64(a)?, as_f64(b)?);
             x.partial_cmp(&y)
         }
+    }
+}
+
+#[cfg(test)]
+mod range_candidate_tests {
+    //! An index range narrows; the per-row predicate decides. That division is
+    //! only safe if the candidate set is a **superset** of the rows the
+    //! predicate accepts — and the two sides do not use the same comparison.
+    //!
+    //! An index key is ordered by [`Value::total_order`], which ranks the types
+    //! against each other (Null < Bool < numeric < Text < Bytes) so that every
+    //! pair has an answer. SQL comparison is [`cmp_values`], which calls most
+    //! mixed pairs *unknown* and excludes the row. Where they disagree, the
+    //! index admitting a row the predicate then drops is free. The other
+    //! direction — the index excluding a row the predicate would have accepted
+    //! — is a silently wrong answer, and no query would ever look wrong enough
+    //! to notice.
+    //!
+    //! So this asserts the implication over every (cell, bound, operator)
+    //! triple the value matrix can make, which is the argument the read path
+    //! rests on rather than a sample of it.
+    use super::*;
+
+    fn variants() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Double(-1.5),
+            Value::Double(0.0),
+            Value::Double(2.0),
+            Value::Double(f64::NAN),
+            Value::Timestamp(0),
+            Value::Timestamp(1_704_067_200_000),
+            Value::Decimal(Box::new(Decimal::parse("2.00").unwrap())),
+            Value::Decimal(Box::new(Decimal::parse("-19.90").unwrap())),
+            Value::Text("".into()),
+            Value::Text("2".into()),
+            Value::Text("zz".into()),
+            Value::Bytes(vec![].into()),
+            Value::Bytes(vec![2].into()),
+        ]
+    }
+
+    /// The four comparison operators a range conjunct is built from, as
+    /// `range_conjunct` maps them onto bounds.
+    fn bounds(op: BinOp, v: &Value) -> (RangeBound, RangeBound) {
+        match op {
+            BinOp::Gt => (RangeBound::Excluded(v.clone()), RangeBound::Unbounded),
+            BinOp::Ge => (RangeBound::Included(v.clone()), RangeBound::Unbounded),
+            BinOp::Lt => (RangeBound::Unbounded, RangeBound::Excluded(v.clone())),
+            BinOp::Le => (RangeBound::Unbounded, RangeBound::Included(v.clone())),
+            other => panic!("not a range operator: {other:?}"),
+        }
+    }
+
+    /// Does SQL's comparison accept `cell <op> bound`? `None` (unknown) is not
+    /// acceptance — the row is dropped, as a three-valued WHERE requires.
+    fn predicate_accepts(cell: &Value, op: BinOp, bound: &Value) -> bool {
+        let Some(ord) = cmp_values(cell, bound) else {
+            return false;
+        };
+        match op {
+            BinOp::Gt => ord.is_gt(),
+            BinOp::Ge => ord.is_ge(),
+            BinOp::Lt => ord.is_lt(),
+            BinOp::Le => ord.is_le(),
+            other => panic!("not a range operator: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_candidate_set_never_drops_a_row_the_predicate_accepts() {
+        let vals = variants();
+        let mut checked = 0usize;
+        let mut narrowed = 0usize;
+        for cell in &vals {
+            for bound in &vals {
+                for op in [BinOp::Gt, BinOp::Ge, BinOp::Lt, BinOp::Le] {
+                    let (lo, hi) = bounds(op, bound);
+                    let candidate = lo.allows_low(cell) && hi.allows_high(cell);
+                    let accepted = predicate_accepts(cell, op, bound);
+                    assert!(
+                        !accepted || candidate,
+                        "index would drop a matching row: {cell:?} {op:?} {bound:?}"
+                    );
+                    checked += 1;
+                    if !candidate {
+                        narrowed += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, vals.len() * vals.len() * 4);
+        // Vacuity guard: an implementation that called everything a candidate
+        // would satisfy the implication above and narrow nothing.
+        assert!(
+            narrowed * 3 > checked,
+            "the bounds excluded almost nothing ({narrowed}/{checked}) — \
+             this test would pass against a range that never narrows"
+        );
     }
 }
 
