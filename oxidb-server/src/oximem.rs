@@ -19,42 +19,17 @@ use crate::resp::{self, RespValue};
 use oxidb::OxiDb;
 use serde_json::json;
 
-/// Entry with optional expiration.
+/// A string value. Expiry is NOT here: a key's lifetime is a property of the
+/// key, not of the value it happens to hold, and keeping it in the string
+/// entry is what made TTL/EXPIRE/PERSIST/RENAME silently string-only while
+/// EXISTS/TYPE/SCAN saw all five types. See `OxiMemStore::expires`.
 struct KvEntry {
     value: String,
-    expires_at: Option<Instant>,
 }
 
 impl KvEntry {
     fn new(value: String) -> Self {
-        Self {
-            value,
-            expires_at: None,
-        }
-    }
-    fn with_ttl(value: String, secs: u64) -> Self {
-        Self {
-            value,
-            expires_at: Some(Instant::now() + std::time::Duration::from_secs(secs)),
-        }
-    }
-    fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|e| Instant::now() >= e)
-            .unwrap_or(false)
-    }
-    fn ttl_secs(&self) -> i64 {
-        match self.expires_at {
-            Some(e) => {
-                let now = Instant::now();
-                if now >= e {
-                    -2
-                } else {
-                    (e - now).as_secs() as i64
-                }
-            }
-            None => -1,
-        }
+        Self { value }
     }
 }
 
@@ -164,6 +139,15 @@ pub struct OxiMemStore {
     lists: RwLock<HashMap<String, VecDeque<String>>>,
     sets: RwLock<HashMap<String, HashSet<String>>>,
     sorted_sets: RwLock<HashMap<String, SortedSet>>,
+    /// Expiry deadlines, keyed by NAME and independent of the value's type —
+    /// a hash, list, set or zset expires exactly as a string does. Redis keeps
+    /// the same split (a per-db `expires` dict beside the keyspace dict).
+    ///
+    /// LOCK ORDER: this is the INNERMOST lock. It may be taken while a type
+    /// map is held; a type map must never be taken while this one is held.
+    /// Every deadline-mutating command establishes existence first (type maps),
+    /// then writes here, so that order falls out naturally.
+    expires: RwLock<HashMap<String, Instant>>,
     pubsub: Mutex<HashMap<String, Vec<PubSubSender>>>,
     /// PSUBSCRIBE pattern subscribers: (glob pattern, compiled regex, senders).
     psubs: Mutex<Vec<(String, regex::Regex, Vec<PubSubSender>)>>,
@@ -218,6 +202,7 @@ impl OxiMemStore {
             lists: RwLock::new(HashMap::new()),
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
+            expires: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
             psubs: Mutex::new(Vec::new()),
             retained: RwLock::new(HashMap::new()),
@@ -251,6 +236,7 @@ impl OxiMemStore {
             lists: RwLock::new(HashMap::new()),
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
+            expires: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
             psubs: Mutex::new(Vec::new()),
             retained: RwLock::new(HashMap::new()),
@@ -409,7 +395,11 @@ impl OxiMemStore {
                     match r["_exp"].as_u64() {
                         Some(exp) if exp <= now => continue,
                         Some(exp) => {
-                            s.insert(k.to_string(), KvEntry::with_ttl(v.to_string(), exp - now));
+                            s.insert(k.to_string(), KvEntry::new(v.to_string()));
+                            self.expires.write().unwrap().insert(
+                                k.to_string(),
+                                Instant::now() + std::time::Duration::from_secs(exp - now),
+                            );
                         }
                         None => {
                             s.insert(k.to_string(), KvEntry::new(v.to_string()));
@@ -471,20 +461,127 @@ impl OxiMemStore {
         }
     }
 
-    /// Remove expired string keys eagerly, returning them so the caller can
-    /// emit `expired` keyspace events. Run from a periodic sweeper thread.
-    pub fn sweep_expired(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut s = self.strings.write().unwrap();
-        s.retain(|k, e| {
-            if e.is_expired() {
-                out.push(k.clone());
-                false
-            } else {
-                true
+    // === Expiry (type-independent; see the `expires` field) ===
+
+    /// The key's deadline, if it has one. Takes only the innermost lock.
+    fn deadline(&self, key: &str) -> Option<Instant> {
+        self.expires.read().unwrap().get(key).copied()
+    }
+
+    /// Whether the key is past its deadline. False for a key with no deadline
+    /// AND for a key that does not exist — "expired" is a statement about a
+    /// deadline, not about existence; callers that need existence ask for it.
+    fn is_expired(&self, key: &str) -> bool {
+        match self.deadline(key) {
+            Some(d) => Instant::now() >= d,
+            None => false,
+        }
+    }
+
+    fn set_deadline(&self, key: &str, at: Instant) {
+        self.expires.write().unwrap().insert(key.to_string(), at);
+    }
+
+    /// Drop a key's deadline. Returns whether there was one.
+    fn clear_deadline(&self, key: &str) -> bool {
+        self.expires.write().unwrap().remove(key).is_some()
+    }
+
+    /// Remove every trace of a key from the five type maps. Returns whether
+    /// anything was there. The deadline is dropped too — a later re-creation
+    /// of the same name must not inherit the dead key's lifetime.
+    fn drop_key(&self, key: &str) -> bool {
+        let mut gone = self.strings.write().unwrap().remove(key).is_some();
+        gone |= self.hashes.write().unwrap().remove(key).is_some();
+        gone |= self.lists.write().unwrap().remove(key).is_some();
+        gone |= self.sets.write().unwrap().remove(key).is_some();
+        gone |= self.sorted_sets.write().unwrap().remove(key).is_some();
+        self.clear_deadline(key);
+        gone
+    }
+
+    /// Lazy expiry: if the key is past its deadline, delete it (all types) and
+    /// emit the `expired` event, exactly as the sweeper would. The common case
+    /// — a key with no deadline at all — costs one uncontended read lock and a
+    /// hash lookup, and takes no type-map lock.
+    fn purge_if_expired(&self, key: &str) -> bool {
+        if !self.is_expired(key) {
+            return false;
+        }
+        let existed = self.drop_key(key);
+        self.bump_version(key);
+        if self.notify.load(Ordering::Relaxed) {
+            self.publish(&format!("__keyspace@0__:{key}"), "expired");
+            self.publish("__keyevent@0__:expired", key);
+        }
+        if existed && self.sql_enabled() {
+            mirror_kv_del(self, key);
+            mirror_hash_del(self, key);
+            mirror_list_del(self, key);
+            mirror_set_del(self, key);
+        }
+        existed
+    }
+
+    /// TTL in milliseconds under the Redis contract: `-2` = no such key,
+    /// `-1` = the key exists but has no deadline, else the time remaining.
+    fn ttl_ms(&self, key: &str) -> i64 {
+        if !self.key_exists(key) {
+            return -2;
+        }
+        match self.deadline(key) {
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    -2
+                } else {
+                    (d - now).as_millis() as i64
+                }
             }
-        });
-        drop(s);
+            None => -1,
+        }
+    }
+
+    /// Drop deadlines whose key no longer exists. A collection that empties
+    /// (LPOP to zero, SREM of the last member, …) removes its own map entry
+    /// but knows nothing about expiry, so its deadline would otherwise linger
+    /// and be inherited by the next key created under that name.
+    fn reconcile_deadline(&self, key: &str) {
+        if self.deadline(key).is_some() && !self.key_exists(key) {
+            self.clear_deadline(key);
+        }
+    }
+
+    /// Remove expired keys of EVERY type eagerly, returning them so the caller
+    /// can emit `expired` keyspace events. Run from a periodic sweeper thread.
+    pub fn sweep_expired(&self) -> Vec<String> {
+        let due: Vec<String> = {
+            let now = Instant::now();
+            self.expires
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|(_, d)| now >= **d)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for k in due {
+            self.drop_key(&k);
+            out.push(k);
+        }
+        // Deadlines orphaned by a collection emptying out (see
+        // `reconcile_deadline`) — the sweep is the backstop for any path the
+        // post-write reconcile does not cover.
+        // The candidate list is snapshotted and the guard dropped BEFORE any
+        // `key_exists` call: the expires lock is innermost and must never be
+        // held while a type map is taken.
+        let tracked: Vec<String> = self.expires.read().unwrap().keys().cloned().collect();
+        for k in tracked {
+            if !self.key_exists(&k) {
+                self.clear_deadline(&k);
+            }
+        }
         for k in &out {
             self.bump_version(k);
             if self.notify.load(Ordering::Relaxed) {
@@ -509,13 +606,14 @@ impl OxiMemStore {
     /// Serialize the whole store to JSON (fast-mode snapshot persistence).
     pub fn snapshot_json(&self) -> String {
         let now = now_secs();
+        let live: HashSet<String> = self.all_live_keys().into_iter().collect();
         let strings: Vec<serde_json::Value> = self
-            .strings.read().unwrap().iter()
-            .filter(|(_, e)| !e.is_expired())
-            .map(|(k, e)| {
-                let t = e.ttl_secs();
-                json!({"k": k, "v": e.value, "exp": if t >= 0 { Some(now + t as u64) } else { None }})
-            })
+            .strings
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| live.contains(k.as_str()))
+            .map(|(k, e)| json!({"k": k, "v": e.value}))
             .collect();
         let hashes: Vec<serde_json::Value> = self
             .hashes
@@ -549,7 +647,19 @@ impl OxiMemStore {
                 json!({"k": k, "z": pairs})
             })
             .collect();
-        json!({"s": strings, "h": hashes, "l": lists, "t": sets, "z": zsets}).to_string()
+        // Deadlines are their own section now that they are not a property of
+        // the string entry — one `[key, absolute_secs]` pair per expiring key,
+        // whatever type it holds.
+        let expires: Vec<serde_json::Value> = {
+            let e = self.expires.read().unwrap();
+            let mono = Instant::now();
+            e.iter()
+                .filter(|(k, _)| live.contains(k.as_str()))
+                .map(|(k, d)| json!([k, now + (*d - mono).as_secs()]))
+                .collect()
+        };
+        json!({"s": strings, "h": hashes, "l": lists, "t": sets, "z": zsets, "x": expires})
+            .to_string()
     }
 
     /// Restore a snapshot produced by `snapshot_json` (expired keys skipped).
@@ -563,10 +673,17 @@ impl OxiMemStore {
             let mut s = self.strings.write().unwrap();
             for it in arr {
                 if let (Some(k), Some(val)) = (it["k"].as_str(), it["v"].as_str()) {
+                    // `exp` is the pre-0.43.2 per-string deadline; snapshots
+                    // written since carry every type's deadline in `x`. Both
+                    // are honoured so an old snapshot still restores its TTLs.
                     match it["exp"].as_u64() {
                         Some(exp) if exp <= now => continue,
                         Some(exp) => {
-                            s.insert(k.into(), KvEntry::with_ttl(val.into(), exp - now));
+                            s.insert(k.into(), KvEntry::new(val.into()));
+                            self.expires.write().unwrap().insert(
+                                k.into(),
+                                Instant::now() + std::time::Duration::from_secs(exp - now),
+                            );
                         }
                         None => {
                             s.insert(k.into(), KvEntry::new(val.into()));
@@ -616,6 +733,20 @@ impl OxiMemStore {
                 }
             }
         }
+        if let Some(arr) = v["x"].as_array() {
+            let mut e = self.expires.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(exp)) = (it[0].as_str(), it[1].as_u64()) {
+                    if exp <= now {
+                        continue;
+                    }
+                    e.insert(
+                        k.into(),
+                        Instant::now() + std::time::Duration::from_secs(exp - now),
+                    );
+                }
+            }
+        }
         if let Some(arr) = v["z"].as_array() {
             let mut zm = self.sorted_sets.write().unwrap();
             for it in arr {
@@ -631,23 +762,25 @@ impl OxiMemStore {
         }
     }
 
-    /// All live keys across every type map (strings filtered by expiry).
+    /// All live keys across every type map, past-deadline keys filtered out.
+    /// This is what KEYS, DBSIZE, RANDOMKEY and SCAN all answer from, so they
+    /// cannot disagree with each other about which keys exist.
     fn all_live_keys(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        {
-            let s = self.strings.read().unwrap();
-            out.extend(
-                s.iter()
-                    .filter(|(_, e)| !e.is_expired())
-                    .map(|(k, _)| k.clone()),
-            );
-        }
+        out.extend(self.strings.read().unwrap().keys().cloned());
         out.extend(self.hashes.read().unwrap().keys().cloned());
         out.extend(self.lists.read().unwrap().keys().cloned());
         out.extend(self.sets.read().unwrap().keys().cloned());
         out.extend(self.sorted_sets.read().unwrap().keys().cloned());
         out.sort();
         out.dedup();
+        // One snapshot of the deadlines rather than a lock per key; taken
+        // after every type-map guard is dropped (expires is innermost).
+        let now = Instant::now();
+        let exp = self.expires.read().unwrap();
+        if !exp.is_empty() {
+            out.retain(|k| exp.get(k).map(|d| now < *d).unwrap_or(true));
+        }
         out
     }
 
@@ -662,18 +795,12 @@ impl OxiMemStore {
 
     /// Whether the key currently holds a live value of any type.
     fn key_exists(&self, key: &str) -> bool {
-        {
-            let s = self.strings.read().unwrap();
-            if let Some(e) = s.get(key)
-                && !e.is_expired()
-            {
-                return true;
-            }
-        }
-        self.hashes.read().unwrap().contains_key(key)
+        let present = self.strings.read().unwrap().contains_key(key)
+            || self.hashes.read().unwrap().contains_key(key)
             || self.lists.read().unwrap().contains_key(key)
             || self.sets.read().unwrap().contains_key(key)
-            || self.sorted_sets.read().unwrap().contains_key(key)
+            || self.sorted_sets.read().unwrap().contains_key(key);
+        present && !self.is_expired(key)
     }
 }
 
@@ -789,7 +916,7 @@ fn pipeline_get(store: &OxiMemStore, args_list: &[&[RespValue]]) -> Vec<RespValu
         .map(|args| {
             let key = args.first().and_then(|a| a.as_str()).unwrap_or("");
             match map.get(key) {
-                Some(e) if !e.is_expired() => resp::bulk_string(&e.value),
+                Some(e) if !store.is_expired(key) => resp::bulk_string(&e.value),
                 _ => resp::null(),
             }
         })
@@ -811,16 +938,24 @@ fn pipeline_set(store: &OxiMemStore, args_list: &[&[RespValue]]) -> Vec<RespValu
             {
                 if opt.eq_ignore_ascii_case("EX") {
                     if let Some(secs) = args[3].as_str().and_then(|s| s.parse::<u64>().ok()) {
-                        map.insert(key, KvEntry::with_ttl(value, secs));
+                        store.set_deadline(
+                            &key,
+                            Instant::now() + std::time::Duration::from_secs(secs),
+                        );
+                        map.insert(key, KvEntry::new(value));
                         return resp::ok();
                     }
                 } else if opt.eq_ignore_ascii_case("PX")
                     && let Some(ms) = args[3].as_str().and_then(|s| s.parse::<u64>().ok())
                 {
-                    map.insert(key, KvEntry::with_ttl(value, ms / 1000));
+                    store
+                        .set_deadline(&key, Instant::now() + std::time::Duration::from_millis(ms));
+                    map.insert(key, KvEntry::new(value));
                     return resp::ok();
                 }
             }
+            // A plain SET discards any previous TTL, as Redis does.
+            store.clear_deadline(&key);
             map.insert(key, KvEntry::new(value));
             resp::ok()
         })
@@ -833,13 +968,13 @@ fn pipeline_incr(store: &OxiMemStore, args_list: &[&[RespValue]]) -> Vec<RespVal
         .iter()
         .map(|args| {
             let key = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            if store.is_expired(key) {
+                map.remove(key);
+                store.clear_deadline(key);
+            }
             let entry = map
                 .entry(key.to_string())
                 .or_insert_with(|| KvEntry::new("0".to_string()));
-            if entry.is_expired() {
-                entry.value = "0".to_string();
-                entry.expires_at = None;
-            }
             match entry.value.parse::<i64>() {
                 Ok(n) => {
                     entry.value = (n + 1).to_string();
@@ -1255,6 +1390,57 @@ fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
     }
 }
 
+/// Argument positions that name keys, reads included — the lazy-expiry hook.
+///
+/// The bias is deliberate: **over-inclusion is harmless** (purging a key that
+/// is already past its deadline is the right answer no matter which command
+/// asked, and a name that is not a key simply has no deadline), while
+/// under-inclusion is what would let an expired hash/list/set/zset still be
+/// read. So the default is "argument 1 is a key" and only the commands whose
+/// first argument is provably not one opt out.
+fn key_arg_indices(cmd: &str, args: &[RespValue]) -> Vec<usize> {
+    let argc = args.len();
+    let numkeys_at = |i: usize| -> usize {
+        args.get(i)
+            .and_then(|a| a.as_str())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    match cmd {
+        // Argument 1 is a channel, a pattern, a cursor, a script or nothing.
+        "PING" | "ECHO" | "QUIT" | "SELECT" | "COMMAND" | "CLIENT" | "AUTH" | "HELLO" | "INFO"
+        | "DBSIZE" | "FLUSHALL" | "FLUSHDB" | "RANDOMKEY" | "KEYS" | "SCAN" | "MULTI" | "EXEC"
+        | "DISCARD" | "UNWATCH" | "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
+        | "PUBLISH" | "PUBSUB" | "SCRIPT" | "CONFIG" | "TIME" | "SAVE" | "BGSAVE" | "SHUTDOWN"
+        | "MEMORY" | "SLOWLOG" | "ACL" | "LATENCY" | "DEBUG" | "REPLICAOF" | "SLAVEOF" => vec![],
+        // `... numkeys key [key ...]`
+        "EVAL" | "EVALSHA" => (3..(3 + numkeys_at(2)).min(argc)).collect(),
+        "ZUNIONSTORE" | "ZINTERSTORE" => std::iter::once(1)
+            .chain(3..(3 + numkeys_at(2)).min(argc))
+            .collect(),
+        "LMPOP" | "ZMPOP" => (2..(2 + numkeys_at(1)).min(argc)).collect(),
+        // Every argument is a key.
+        "DEL" | "UNLINK" | "EXISTS" | "TOUCH" | "MGET" | "WATCH" | "SINTER" | "SUNION"
+        | "SDIFF" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "PFCOUNT" | "PFMERGE" => {
+            (1..argc).collect()
+        }
+        // Key/value pairs.
+        "MSET" | "MSETNX" => (1..argc).step_by(2).collect(),
+        // Two keys, then options.
+        "RENAME" | "RENAMENX" | "COPY" | "SMOVE" | "RPOPLPUSH" | "LMOVE" | "BLMOVE"
+        | "BRPOPLPUSH" => vec![1, 2],
+        // Keys, then a trailing timeout.
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" => (1..argc.saturating_sub(1)).collect(),
+        _ => {
+            if argc > 1 {
+                vec![1]
+            } else {
+                vec![]
+            }
+        }
+    }
+}
+
 /// Minimum argc (command name included) for queue-time arity validation.
 fn min_args(cmd: &str) -> usize {
     match cmd {
@@ -1289,6 +1475,13 @@ fn bump_write_versions(store: &OxiMemStore, args: &[RespValue]) {
             for i in idxs {
                 if let Some(k) = args.get(i).and_then(|a| a.as_str()) {
                     store.bump_version(k);
+                    // Same pass reconciles the deadline: this is exactly the
+                    // set of keys the command may have deleted, including the
+                    // collection that just emptied itself out (LPOP to zero,
+                    // SREM of the last member, LTRIM to nothing). Without it
+                    // the dead key's TTL would linger and kill off whatever
+                    // is next created under that name.
+                    store.reconcile_deadline(k);
                 }
             }
         }
@@ -1373,6 +1566,25 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         Some(s) => s.to_uppercase(),
         None => return resp::err("invalid command"),
     };
+
+    // Lazy expiry, before the command sees the keyspace. The four type maps
+    // have no per-entry deadline to consult, so a hash/list/set/zset command
+    // cannot filter an expired key out the way the string paths do — it has
+    // to be gone by the time the command runs. Commands not in the key table
+    // are covered by the sweeper instead. When nothing in the store has a
+    // deadline at all this costs one uncontended read lock for the whole
+    // command, which is why the emptiness check is here and not per key.
+    // Bound to a local rather than tested inline: the guard must be released
+    // before `purge_if_expired` re-reads the same lock, and that should not
+    // rest on when a temporary in an `if` condition happens to drop.
+    let any_deadlines = !store.expires.read().unwrap().is_empty();
+    if any_deadlines {
+        for i in key_arg_indices(&cmd, args) {
+            if let Some(k) = args.get(i).and_then(|a| a.as_str()) {
+                store.purge_if_expired(k);
+            }
+        }
+    }
 
     match cmd.as_str() {
         // -- Connection --
@@ -1693,9 +1905,7 @@ fn cmd_set(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let mut map = store.strings.write().unwrap();
 
     // Clean expired
-    if let Some(entry) = map.get(key)
-        && entry.is_expired()
-    {
+    if store.is_expired(key) {
         map.remove(key);
     }
 
@@ -1706,11 +1916,14 @@ fn cmd_set(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         return resp::null();
     }
 
-    let entry = match ttl_secs {
-        Some(t) => KvEntry::with_ttl(value.clone(), t),
-        None => KvEntry::new(value.clone()),
-    };
-    map.insert(key.to_string(), entry);
+    match ttl_secs {
+        Some(t) => store.set_deadline(key, Instant::now() + std::time::Duration::from_secs(t)),
+        // SET without EX/PX discards any TTL the key had, as Redis does.
+        None => {
+            store.clear_deadline(key);
+        }
+    }
+    map.insert(key.to_string(), KvEntry::new(value.clone()));
     drop(map);
 
     mirror_kv_set(store, key, &value, ttl_secs);
@@ -1728,10 +1941,11 @@ fn cmd_get(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
     let mut map = store.strings.write().unwrap();
     if let Some(entry) = map.get(key) {
-        if entry.is_expired() {
+        if store.is_expired(key) {
             let k = key.to_string();
             map.remove(&k);
             drop(map);
+            store.clear_deadline(&k);
             mirror_kv_del(store, &k);
             return resp::null();
         }
@@ -1761,10 +1975,9 @@ fn cmd_setnx(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
     let mut map = store.strings.write().unwrap();
     // Clean expired
-    if let Some(entry) = map.get(key)
-        && entry.is_expired()
-    {
+    if store.is_expired(key) {
         map.remove(key);
+        store.clear_deadline(key);
     }
     if map.contains_key(key) {
         return resp::integer(0);
@@ -1796,7 +2009,8 @@ fn cmd_setex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         .strings
         .write()
         .unwrap()
-        .insert(key.to_string(), KvEntry::with_ttl(value.clone(), seconds));
+        .insert(key.to_string(), KvEntry::new(value.clone()));
+    store.set_deadline(key, Instant::now() + std::time::Duration::from_secs(seconds));
     mirror_kv_set(store, key, &value, Some(seconds));
     resp::ok()
 }
@@ -1820,7 +2034,8 @@ fn cmd_psetex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         .strings
         .write()
         .unwrap()
-        .insert(key.to_string(), KvEntry::with_ttl(value.clone(), secs));
+        .insert(key.to_string(), KvEntry::new(value.clone()));
+    store.set_deadline(key, Instant::now() + std::time::Duration::from_millis(ms));
     mirror_kv_set(store, key, &value, Some(secs));
     resp::ok()
 }
@@ -1842,6 +2057,8 @@ fn cmd_mset(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
                 None => continue,
             },
         };
+        // Each pair is a SET, so it discards the key's previous TTL.
+        store.clear_deadline(key);
         map.insert(key.to_string(), KvEntry::new(value));
     }
     drop(map);
@@ -1863,7 +2080,7 @@ fn cmd_mget(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         .map(|arg| {
             let key = arg.as_str().unwrap_or("");
             match map.get(key) {
-                Some(entry) if !entry.is_expired() => resp::bulk_string(&entry.value),
+                Some(entry) if !store.is_expired(key) => resp::bulk_string(&entry.value),
                 _ => resp::null(),
             }
         })
@@ -1882,10 +2099,9 @@ fn cmd_incr(store: &OxiMemStore, args: &[RespValue], delta: i64) -> RespValue {
 
     let mut map = store.strings.write().unwrap();
     // Clean expired
-    if let Some(entry) = map.get(key)
-        && entry.is_expired()
-    {
+    if store.is_expired(key) {
         map.remove(key);
+        store.clear_deadline(key);
     }
 
     let current: i64 = match map.get(key) {
@@ -1898,15 +2114,9 @@ fn cmd_incr(store: &OxiMemStore, args: &[RespValue], delta: i64) -> RespValue {
 
     let new_val = current + delta;
     let val_str = new_val.to_string();
-    // Preserve TTL if existing
-    let entry = match map.get(key).and_then(|e| e.expires_at) {
-        Some(exp) => KvEntry {
-            value: val_str.clone(),
-            expires_at: Some(exp),
-        },
-        None => KvEntry::new(val_str.clone()),
-    };
-    map.insert(key.to_string(), entry);
+    // The TTL is not part of the value, so replacing the value keeps it —
+    // which is what Redis does for INCR/DECR.
+    map.insert(key.to_string(), KvEntry::new(val_str.clone()));
     drop(map);
 
     mirror_kv_set(store, key, &val_str, None);
@@ -1950,7 +2160,7 @@ fn cmd_incrbyfloat(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
     let mut map = store.strings.write().unwrap();
     let current: f64 = match map.get(key) {
-        Some(entry) if !entry.is_expired() => entry.value.parse().unwrap_or(0.0),
+        Some(entry) if !store.is_expired(key) => entry.value.parse().unwrap_or(0.0),
         _ => 0.0,
     };
 
@@ -1975,7 +2185,7 @@ fn cmd_append(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
     let mut map = store.strings.write().unwrap();
     let new_val = match map.get(key) {
-        Some(entry) if !entry.is_expired() => format!("{}{}", entry.value, suffix),
+        Some(entry) if !store.is_expired(key) => format!("{}{}", entry.value, suffix),
         _ => suffix.to_string(),
     };
     let len = new_val.len() as i64;
@@ -1993,7 +2203,7 @@ fn cmd_strlen(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let key = args[0].as_str().unwrap_or("");
     let map = store.strings.read().unwrap();
     match map.get(key) {
-        Some(entry) if !entry.is_expired() => resp::integer(entry.value.len() as i64),
+        Some(entry) if !store.is_expired(key) => resp::integer(entry.value.len() as i64),
         _ => resp::integer(0),
     }
 }
@@ -2008,7 +2218,7 @@ fn cmd_getrange(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
     let map = store.strings.read().unwrap();
     let val = match map.get(key) {
-        Some(entry) if !entry.is_expired() => &entry.value,
+        Some(entry) if !store.is_expired(key) => &entry.value,
         _ => return resp::bulk_string(""),
     };
 
@@ -2060,6 +2270,13 @@ fn cmd_del(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
             }
         }
     }
+    // A deleted key's lifetime dies with it, or the next key created under
+    // that name would inherit it.
+    for arg in args {
+        if let Some(key) = arg.as_str() {
+            store.clear_deadline(key);
+        }
+    }
     if store.sql_enabled() {
         for arg in args {
             if let Some(key) = arg.as_str() {
@@ -2074,19 +2291,10 @@ fn cmd_del(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 }
 
 fn cmd_exists(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
-    let strings = store.strings.read().unwrap();
-    let hashes = store.hashes.read().unwrap();
-    let lists = store.lists.read().unwrap();
-    let sets = store.sets.read().unwrap();
-    let zsets = store.sorted_sets.read().unwrap();
     let mut count = 0i64;
     for arg in args {
         if let Some(key) = arg.as_str()
-            && (strings.get(key).map(|e| !e.is_expired()).unwrap_or(false)
-                || hashes.contains_key(key)
-                || lists.contains_key(key)
-                || sets.contains_key(key)
-                || zsets.contains_key(key))
+            && store.key_exists(key)
         {
             count += 1;
         }
@@ -2107,14 +2315,11 @@ fn cmd_expire(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::err("value is not an integer or out of range"),
     };
 
-    let mut map = store.strings.write().unwrap();
-    if let Some(entry) = map.get_mut(key)
-        && !entry.is_expired()
-    {
-        entry.expires_at = Some(Instant::now() + std::time::Duration::from_secs(seconds));
-        return resp::integer(1);
+    if !store.key_exists(key) {
+        return resp::integer(0);
     }
-    resp::integer(0)
+    store.set_deadline(key, Instant::now() + std::time::Duration::from_secs(seconds));
+    resp::integer(1)
 }
 
 fn cmd_pexpire(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -2130,14 +2335,11 @@ fn cmd_pexpire(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::err("value is not an integer or out of range"),
     };
 
-    let mut map = store.strings.write().unwrap();
-    if let Some(entry) = map.get_mut(key)
-        && !entry.is_expired()
-    {
-        entry.expires_at = Some(Instant::now() + std::time::Duration::from_millis(ms));
-        return resp::integer(1);
+    if !store.key_exists(key) {
+        return resp::integer(0);
     }
-    resp::integer(0)
+    store.set_deadline(key, Instant::now() + std::time::Duration::from_millis(ms));
+    resp::integer(1)
 }
 
 fn cmd_expireat(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -2154,23 +2356,25 @@ fn cmd_expireat(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     };
 
     let now = now_secs();
-    let mut map = store.strings.write().unwrap();
+    if !store.key_exists(key) {
+        return resp::integer(0);
+    }
+    // A deadline already in the past deletes the key outright, as Redis does.
     if timestamp <= now {
-        if map.remove(key).is_some() {
-            drop(map);
+        store.drop_key(key);
+        if store.sql_enabled() {
             mirror_kv_del(store, key);
+            mirror_hash_del(store, key);
+            mirror_list_del(store, key);
+            mirror_set_del(store, key);
         }
         return resp::integer(1);
     }
-
-    let ttl = timestamp - now;
-    if let Some(entry) = map.get_mut(key)
-        && !entry.is_expired()
-    {
-        entry.expires_at = Some(Instant::now() + std::time::Duration::from_secs(ttl));
-        return resp::integer(1);
-    }
-    resp::integer(0)
+    store.set_deadline(
+        key,
+        Instant::now() + std::time::Duration::from_secs(timestamp - now),
+    );
+    resp::integer(1)
 }
 
 fn cmd_persist(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -2182,15 +2386,10 @@ fn cmd_persist(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::integer(0),
     };
 
-    let mut map = store.strings.write().unwrap();
-    if let Some(entry) = map.get_mut(key)
-        && !entry.is_expired()
-        && entry.expires_at.is_some()
-    {
-        entry.expires_at = None;
-        return resp::integer(1);
+    if !store.key_exists(key) {
+        return resp::integer(0);
     }
-    resp::integer(0)
+    resp::integer(store.clear_deadline(key) as i64)
 }
 
 fn cmd_ttl(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -2198,33 +2397,19 @@ fn cmd_ttl(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         return resp::err("wrong number of arguments for 'ttl' command");
     }
     let key = args[0].as_str().unwrap_or("");
-    let map = store.strings.read().unwrap();
-    match map.get(key) {
-        Some(entry) if !entry.is_expired() => resp::integer(entry.ttl_secs()),
-        _ => resp::integer(-2),
-    }
+    // Seconds, rounding UP as Redis does: a 900 ms remainder is 1, not 0,
+    // because 0 would read as "expires now" to a caller polling on it.
+    resp::integer(match store.ttl_ms(key) {
+        n if n < 0 => n,
+        ms => (ms as u64).div_ceil(1000) as i64,
+    })
 }
 
 fn cmd_pttl(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     if args.is_empty() {
         return resp::err("wrong number of arguments for 'pttl' command");
     }
-    let key = args[0].as_str().unwrap_or("");
-    let map = store.strings.read().unwrap();
-    match map.get(key) {
-        Some(entry) if !entry.is_expired() => match entry.expires_at {
-            Some(exp) => {
-                let now = Instant::now();
-                if now >= exp {
-                    resp::integer(-2)
-                } else {
-                    resp::integer((exp - now).as_millis() as i64)
-                }
-            }
-            None => resp::integer(-1),
-        },
-        _ => resp::integer(-2),
-    }
+    resp::integer(store.ttl_ms(args[0].as_str().unwrap_or("")))
 }
 
 fn cmd_type(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -2233,14 +2418,11 @@ fn cmd_type(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     }
     let key = args[0].as_str().unwrap_or("");
 
-    if store
-        .strings
-        .read()
-        .unwrap()
-        .get(key)
-        .map(|e| !e.is_expired())
-        .unwrap_or(false)
-    {
+    // An expired key has no type, whatever map still holds its remains.
+    if store.is_expired(key) {
+        return RespValue::SimpleString("none".to_string());
+    }
+    if store.strings.read().unwrap().contains_key(key) {
         return RespValue::SimpleString("string".to_string());
     }
     if store.hashes.read().unwrap().contains_key(key) {
@@ -2266,13 +2448,11 @@ fn cmd_keys(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         Err(_) => return resp::array(vec![]),
     };
 
-    let map = store.strings.read().unwrap();
-    let keys: Vec<RespValue> = map
+    let keys: Vec<RespValue> = store
+        .all_live_keys()
         .iter()
-        .filter(|(_, e)| !e.is_expired())
-        .map(|(k, _)| k.as_str())
         .filter(|k| re.is_match(k))
-        .map(resp::bulk_string)
+        .map(|k| resp::bulk_string(k))
         .collect();
     resp::array(keys)
 }
@@ -2290,48 +2470,99 @@ fn cmd_rename(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::err("invalid key"),
     };
 
-    let mut map = store.strings.write().unwrap();
-    match map.remove(old_key) {
-        Some(entry) if !entry.is_expired() => {
-            map.remove(new_key);
-            map.insert(new_key.to_string(), entry);
-            drop(map);
-            if store.sql_enabled() {
-                mirror_kv_del(store, old_key);
-                // Re-read to mirror
-                let val = {
-                    let map = store.strings.read().unwrap();
-                    map.get(new_key).map(|e| e.value.clone())
-                };
-                if let Some(v) = val {
-                    mirror_kv_set(store, new_key, &v, None);
+    if !store.key_exists(old_key) {
+        return resp::err("no such key");
+    }
+    if old_key == new_key {
+        return resp::ok();
+    }
+    // The destination is replaced whatever its type, so it is cleared first;
+    // then whichever map owns the source moves its entry across.
+    store.drop_key(new_key);
+
+    let moved_string = {
+        let mut s = store.strings.write().unwrap();
+        match s.remove(old_key) {
+            Some(e) => {
+                let v = e.value.clone();
+                s.insert(new_key.to_string(), e);
+                Some(v)
+            }
+            None => None,
+        }
+    };
+    if moved_string.is_none() {
+        let mut h = store.hashes.write().unwrap();
+        if let Some(v) = h.remove(old_key) {
+            h.insert(new_key.to_string(), v);
+        } else {
+            drop(h);
+            let mut l = store.lists.write().unwrap();
+            if let Some(v) = l.remove(old_key) {
+                l.insert(new_key.to_string(), v);
+            } else {
+                drop(l);
+                let mut st = store.sets.write().unwrap();
+                if let Some(v) = st.remove(old_key) {
+                    st.insert(new_key.to_string(), v);
+                } else {
+                    drop(st);
+                    let mut z = store.sorted_sets.write().unwrap();
+                    if let Some(v) = z.remove(old_key) {
+                        z.insert(new_key.to_string(), v);
+                    }
                 }
             }
-            resp::ok()
         }
-        _ => resp::err("no such key"),
+    }
+
+    // The TTL follows the value — Redis keeps it on RENAME.
+    if let Some(d) = store.deadline(old_key) {
+        store.clear_deadline(old_key);
+        store.set_deadline(new_key, d);
+    }
+
+    if store.sql_enabled() {
+        mirror_kv_del(store, old_key);
+        mirror_hash_del(store, old_key);
+        mirror_list_del(store, old_key);
+        mirror_set_del(store, old_key);
+        if let Some(v) = moved_string {
+            mirror_kv_set(store, new_key, &v, None);
+        } else {
+            mirror_rename_collections(store, new_key);
+        }
+    }
+    resp::ok()
+}
+
+/// Re-mirror a non-string key after a rename, from whichever map now owns it.
+fn mirror_rename_collections(store: &OxiMemStore, key: &str) {
+    let h = store.hashes.read().unwrap().get(key).cloned();
+    if let Some(m) = h {
+        mirror_hash_save(store, key, &m);
+        return;
+    }
+    let l = store.lists.read().unwrap().get(key).cloned();
+    if let Some(v) = l {
+        mirror_list_save(store, key, &v);
+        return;
+    }
+    let s = store.sets.read().unwrap().get(key).cloned();
+    if let Some(v) = s {
+        mirror_set_save(store, key, &v);
     }
 }
 
 fn cmd_randomkey(store: &OxiMemStore) -> RespValue {
-    let map = store.strings.read().unwrap();
-    for (k, e) in map.iter() {
-        if !e.is_expired() {
-            return resp::bulk_string(k);
-        }
+    match store.all_live_keys().first() {
+        Some(k) => resp::bulk_string(k),
+        None => resp::null(),
     }
-    resp::null()
 }
 
 fn cmd_dbsize(store: &OxiMemStore) -> RespValue {
-    let count = store
-        .strings
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|(_, e)| !e.is_expired())
-        .count();
-    resp::integer(count as i64)
+    resp::integer(store.all_live_keys().len() as i64)
 }
 
 fn cmd_flushdb(store: &OxiMemStore) -> RespValue {
@@ -2340,6 +2571,7 @@ fn cmd_flushdb(store: &OxiMemStore) -> RespValue {
     store.lists.write().unwrap().clear();
     store.sets.write().unwrap().clear();
     store.sorted_sets.write().unwrap().clear();
+    store.expires.write().unwrap().clear();
     mirror_flush(store);
     resp::ok()
 }
@@ -2909,22 +3141,25 @@ fn cmd_scard(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
 fn cmd_info(store: &OxiMemStore) -> RespValue {
     let mode = if store.sql_enabled() { "sql" } else { "raw" };
-    let kv_count = store
-        .strings
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|(_, e)| !e.is_expired())
-        .count();
+    let live = store.all_live_keys();
+    let kv_count = live.len();
+    // `expires` is the number of live keys carrying a deadline — it was a
+    // hardcoded 0 while expiry was a string-entry field with nothing counting
+    // it. Derived from the live set so it can never exceed `keys`.
+    let expiring = {
+        let e = store.expires.read().unwrap();
+        live.iter().filter(|k| e.contains_key(*k)).count()
+    };
+    let version = env!("CARGO_PKG_VERSION");
 
     let info = format!(
         "# Server\r\n\
-         oxidb_version:0.19.3\r\n\
+         oxidb_version:{version}\r\n\
          oximem_mode:{mode}\r\n\
          resp_compat:true\r\n\
          \r\n\
          # Keyspace\r\n\
-         db0:keys={kv_count},expires=0\r\n"
+         db0:keys={kv_count},expires={expiring}\r\n"
     );
     resp::bulk_string(&info)
 }
@@ -3763,8 +3998,11 @@ fn cmd_decrbyfloatge(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::err("value is not a valid float"),
     };
     let mut map = store.strings.write().unwrap();
+    if store.is_expired(key) {
+        return resp::null();
+    }
     let e = match map.get_mut(key) {
-        Some(e) if !e.is_expired() => e,
+        Some(e) => e,
         _ => return resp::null(),
     };
     let cur: f64 = match e.value.parse() {
@@ -3790,9 +4028,12 @@ fn cmd_getdel(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::err("wrong number of arguments for 'getdel' command"),
     };
     let mut map = store.strings.write().unwrap();
-    match map.remove(key) {
-        Some(e) if !e.is_expired() => {
-            drop(map);
+    let was_expired = store.is_expired(key);
+    let removed = map.remove(key);
+    drop(map);
+    store.clear_deadline(key);
+    match removed {
+        Some(e) if !was_expired => {
             mirror_kv_del(store, key);
             resp::bulk_string(&e.value)
         }
@@ -3843,22 +4084,24 @@ fn cmd_pexpireat(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let mut map = store.strings.write().unwrap();
-    if ts_ms <= now_ms {
-        if map.remove(key).is_some() {
-            drop(map);
-            mirror_kv_del(store, key);
-            return resp::integer(1);
-        }
+    if !store.key_exists(key) {
         return resp::integer(0);
     }
-    if let Some(entry) = map.get_mut(key)
-        && !entry.is_expired()
-    {
-        entry.expires_at = Some(Instant::now() + std::time::Duration::from_millis(ts_ms - now_ms));
+    if ts_ms <= now_ms {
+        store.drop_key(key);
+        if store.sql_enabled() {
+            mirror_kv_del(store, key);
+            mirror_hash_del(store, key);
+            mirror_list_del(store, key);
+            mirror_set_del(store, key);
+        }
         return resp::integer(1);
     }
-    resp::integer(0)
+    store.set_deadline(
+        key,
+        Instant::now() + std::time::Duration::from_millis(ts_ms - now_ms),
+    );
+    resp::integer(1)
 }
 
 /// COPY src dst [REPLACE] — copies a value of any type.
@@ -3879,7 +4122,7 @@ fn cmd_copy(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     {
         let s = store.strings.read().unwrap();
         if let Some(e) = s.get(src)
-            && !e.is_expired()
+            && !store.is_expired(src)
         {
             let val = e.value.clone();
             drop(s);
@@ -4614,10 +4857,12 @@ fn cmd_getex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         Some(k) => k,
         None => return resp::err("wrong number of arguments"),
     };
-    let mut map = store.strings.write().unwrap();
-    let e = match map.get_mut(key) {
-        Some(e) if !e.is_expired() => e,
-        _ => return resp::null(),
+    if store.is_expired(key) {
+        return resp::null();
+    }
+    let value = match store.strings.read().unwrap().get(key) {
+        Some(e) => e.value.clone(),
+        None => return resp::null(),
     };
     let num = |i: usize| -> Option<u64> {
         args.get(i)
@@ -4631,19 +4876,21 @@ fn cmd_getex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     {
         Some(ref s) if s == "EX" => {
             if let Some(secs) = num(2) {
-                e.expires_at = Some(Instant::now() + std::time::Duration::from_secs(secs));
+                store.set_deadline(key, Instant::now() + std::time::Duration::from_secs(secs));
             }
         }
         Some(ref s) if s == "PX" => {
             if let Some(ms) = num(2) {
-                e.expires_at = Some(Instant::now() + std::time::Duration::from_millis(ms));
+                store.set_deadline(key, Instant::now() + std::time::Duration::from_millis(ms));
             }
         }
         Some(ref s) if s == "EXAT" => {
             if let Some(at) = num(2) {
                 let now = now_secs();
-                e.expires_at =
-                    Some(Instant::now() + std::time::Duration::from_secs(at.saturating_sub(now)));
+                store.set_deadline(
+                    key,
+                    Instant::now() + std::time::Duration::from_secs(at.saturating_sub(now)),
+                );
             }
         }
         Some(ref s) if s == "PXAT" => {
@@ -4652,15 +4899,18 @@ fn cmd_getex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                e.expires_at = Some(
+                store.set_deadline(
+                    key,
                     Instant::now() + std::time::Duration::from_millis(at_ms.saturating_sub(now_ms)),
                 );
             }
         }
-        Some(ref s) if s == "PERSIST" => e.expires_at = None,
+        Some(ref s) if s == "PERSIST" => {
+            store.clear_deadline(key);
+        }
         _ => {}
     }
-    resp::bulk_string(&e.value)
+    resp::bulk_string(&value)
 }
 
 fn cmd_setbit(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -4699,7 +4949,7 @@ fn cmd_getbit(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let map = store.strings.read().unwrap();
     let bit = map
         .get(key)
-        .filter(|e| !e.is_expired())
+        .filter(|_| !store.is_expired(key))
         .map(|e| {
             let bytes = e.value.as_bytes();
             let bi = off / 8;
@@ -4718,7 +4968,7 @@ fn cmd_bitcount(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let map = store.strings.read().unwrap();
     let n = map
         .get(key)
-        .filter(|e| !e.is_expired())
+        .filter(|_| !store.is_expired(key))
         .map(|e| {
             let bytes = e.value.as_bytes();
             let len = bytes.len() as isize;
@@ -5258,6 +5508,281 @@ fn glob_to_regex(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Type-independent key expiry (0.43.2) ----
+    //
+    // Before this, `expires_at` lived in `KvEntry`, so EXPIRE/TTL/PERSIST/
+    // RENAME only ever saw strings while EXISTS/TYPE/SCAN saw all five types
+    // — one server contradicting itself. KEYS/DBSIZE/RANDOMKEY read the
+    // string map alone for the same reason.
+
+    fn ints(r: &RespValue) -> i64 {
+        match r {
+            RespValue::Integer(n) => *n,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    /// One key of each type, so a string-only implementation is visible as a
+    /// count of 1 rather than 5.
+    fn one_of_each(store: &OxiMemStore) {
+        execute(store, &c(&["SET", "k:str", "v"]));
+        execute(store, &c(&["HSET", "k:hash", "f", "v"]));
+        execute(store, &c(&["RPUSH", "k:list", "a"]));
+        execute(store, &c(&["SADD", "k:set", "m"]));
+        execute(store, &c(&["ZADD", "k:zset", "1", "m"]));
+    }
+
+    #[test]
+    fn keys_dbsize_randomkey_and_scan_agree_across_all_types() {
+        let store = OxiMemStore::new();
+        one_of_each(&store);
+
+        assert_eq!(ints(&execute(&store, &c(&["DBSIZE"]))), 5);
+        let keys = match execute(&store, &c(&["KEYS", "*"])) {
+            RespValue::Array(a) => a.len(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(keys, 5, "KEYS must not be string-only");
+
+        // Deleting the only string must leave the other four reachable —
+        // this is the exact shape the string-only versions got wrong.
+        execute(&store, &c(&["DEL", "k:str"]));
+        assert_eq!(ints(&execute(&store, &c(&["DBSIZE"]))), 4);
+        assert!(
+            execute(&store, &c(&["RANDOMKEY"])).as_str().is_some(),
+            "RANDOMKEY must find a non-string key"
+        );
+    }
+
+    #[test]
+    fn expire_ttl_and_persist_work_on_every_type() {
+        for key in ["k:str", "k:hash", "k:list", "k:set", "k:zset"] {
+            let store = OxiMemStore::new();
+            one_of_each(&store);
+
+            // -1 = exists, no deadline. NOT -2, which means "no such key" and
+            // is what a caller polling TTL for existence would misread.
+            assert_eq!(ints(&execute(&store, &c(&["TTL", key]))), -1, "{key}");
+
+            assert_eq!(ints(&execute(&store, &c(&["EXPIRE", key, "100"]))), 1, "{key}");
+            let ttl = ints(&execute(&store, &c(&["TTL", key])));
+            assert!((99..=100).contains(&ttl), "{key} ttl={ttl}");
+            let pttl = ints(&execute(&store, &c(&["PTTL", key])));
+            assert!(pttl > 99_000 && pttl <= 100_000, "{key} pttl={pttl}");
+
+            assert_eq!(ints(&execute(&store, &c(&["PERSIST", key]))), 1, "{key}");
+            assert_eq!(ints(&execute(&store, &c(&["TTL", key]))), -1, "{key}");
+            // Nothing to persist the second time.
+            assert_eq!(ints(&execute(&store, &c(&["PERSIST", key]))), 0, "{key}");
+        }
+    }
+
+    #[test]
+    fn ttl_of_a_missing_key_is_minus_two_and_expire_refuses_it() {
+        let store = OxiMemStore::new();
+        assert_eq!(ints(&execute(&store, &c(&["TTL", "nope"]))), -2);
+        assert_eq!(ints(&execute(&store, &c(&["PTTL", "nope"]))), -2);
+        assert_eq!(ints(&execute(&store, &c(&["EXPIRE", "nope", "10"]))), 0);
+        assert_eq!(ints(&execute(&store, &c(&["PERSIST", "nope"]))), 0);
+    }
+
+    #[test]
+    fn an_expired_key_of_any_type_is_gone_from_every_read_path() {
+        for (key, probe) in [
+            ("k:str", vec!["GET", "k:str"]),
+            ("k:hash", vec!["HGET", "k:hash", "f"]),
+            ("k:list", vec!["LLEN", "k:list"]),
+            ("k:set", vec!["SCARD", "k:set"]),
+            ("k:zset", vec!["ZCARD", "k:zset"]),
+        ] {
+            let store = OxiMemStore::new();
+            one_of_each(&store);
+            execute(&store, &c(&["PEXPIRE", key, "1"]));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            assert_eq!(ints(&execute(&store, &c(&["EXISTS", key]))), 0, "{key}");
+            assert_eq!(ints(&execute(&store, &c(&["DBSIZE"]))), 4, "{key}");
+            assert_eq!(
+                execute(&store, &c(&["TYPE", key])),
+                RespValue::SimpleString("none".into()),
+                "{key}"
+            );
+            // The type-specific read must not resurrect it. A hash/list/set/
+            // zset has no per-entry deadline to filter on, so this only holds
+            // because the key is purged before the command runs.
+            let r = execute(&store, &c(&probe));
+            let empty = matches!(r, RespValue::Integer(0)) || r.as_str().is_none();
+            assert!(empty, "{key} still readable: {r:?}");
+        }
+    }
+
+    #[test]
+    fn rename_moves_every_type_and_carries_the_ttl() {
+        let store = OxiMemStore::new();
+        one_of_each(&store);
+        for key in ["k:str", "k:hash", "k:list", "k:set", "k:zset"] {
+            execute(&store, &c(&["EXPIRE", key, "200"]));
+            let renamed = format!("moved:{key}");
+            assert!(is_ok(&execute(&store, &c(&["RENAME", key, &renamed]))), "{key}");
+            assert_eq!(ints(&execute(&store, &c(&["EXISTS", key]))), 0, "{key}");
+            assert_eq!(ints(&execute(&store, &c(&["EXISTS", &renamed]))), 1, "{key}");
+            let ttl = ints(&execute(&store, &c(&["TTL", &renamed])));
+            assert!((199..=200).contains(&ttl), "{key} ttl={ttl}");
+            // The source name keeps nothing behind.
+            assert_eq!(ints(&execute(&store, &c(&["TTL", key]))), -2, "{key}");
+        }
+        assert_eq!(
+            execute(&store, &c(&["TYPE", "moved:k:zset"])),
+            RespValue::SimpleString("zset".into())
+        );
+    }
+
+    #[test]
+    fn rename_replaces_a_destination_of_a_different_type() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "dst", "old"]));
+        execute(&store, &c(&["HSET", "src", "f", "v"]));
+        assert!(is_ok(&execute(&store, &c(&["RENAME", "src", "dst"]))));
+        assert_eq!(
+            execute(&store, &c(&["TYPE", "dst"])),
+            RespValue::SimpleString("hash".into())
+        );
+        assert_eq!(execute(&store, &c(&["HGET", "dst", "f"])).as_str().unwrap(), "v");
+        assert!(matches!(
+            execute(&store, &c(&["RENAME", "gone", "x"])),
+            RespValue::Error(_)
+        ));
+    }
+
+    /// The hazard the separate expiry map introduces: a collection that
+    /// empties out drops its own map entry but knows nothing about the
+    /// deadline, so without reconciliation the NEXT key created under that
+    /// name inherits a lifetime it never asked for and dies early.
+    #[test]
+    fn a_recreated_key_does_not_inherit_the_dead_keys_ttl() {
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["RPUSH", "k", "a"], &["LPOP", "k"]),
+            (&["SADD", "k", "m"], &["SREM", "k", "m"]),
+            (&["ZADD", "k", "1", "m"], &["ZREM", "k", "m"]),
+            (&["HSET", "k", "f", "v"], &["HDEL", "k", "f"]),
+            (&["SET", "k", "v"], &["DEL", "k"]),
+        ];
+        for (create, empty) in cases {
+            let store = OxiMemStore::new();
+            execute(&store, &c(create));
+            execute(&store, &c(&["EXPIRE", "k", "100"]));
+            execute(&store, &c(empty));
+            assert_eq!(
+                ints(&execute(&store, &c(&["EXISTS", "k"]))),
+                0,
+                "{create:?} should have emptied out"
+            );
+            execute(&store, &c(create));
+            assert_eq!(
+                ints(&execute(&store, &c(&["TTL", "k"]))),
+                -1,
+                "{create:?} inherited the dead key's deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn set_discards_the_ttl_but_incr_and_append_keep_it() {
+        // Redis semantics, and the behaviour is no longer a side effect of
+        // whether a command happens to rebuild the entry struct.
+        let store = OxiMemStore::new();
+
+        for discarding in [vec!["SET", "k", "new"], vec!["GETSET", "k", "new"]] {
+            execute(&store, &c(&["SET", "k", "v"]));
+            execute(&store, &c(&["EXPIRE", "k", "100"]));
+            execute(&store, &c(&discarding));
+            assert_eq!(ints(&execute(&store, &c(&["TTL", "k"]))), -1, "{discarding:?}");
+        }
+
+        for keeping in [
+            vec!["INCR", "k"],
+            vec!["INCRBY", "k", "3"],
+            vec!["APPEND", "k", "x"],
+        ] {
+            execute(&store, &c(&["SET", "k", "5"]));
+            execute(&store, &c(&["EXPIRE", "k", "100"]));
+            execute(&store, &c(&keeping));
+            let ttl = ints(&execute(&store, &c(&["TTL", "k"])));
+            assert!((99..=100).contains(&ttl), "{keeping:?} ttl={ttl}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_round_trip_keeps_every_types_deadline() {
+        let store = OxiMemStore::new();
+        one_of_each(&store);
+        for key in ["k:str", "k:hash", "k:list", "k:set", "k:zset"] {
+            execute(&store, &c(&["EXPIRE", key, "3000"]));
+        }
+        execute(&store, &c(&["SET", "forever", "v"]));
+        let snap = store.snapshot_json();
+
+        let restored = OxiMemStore::new();
+        restored.load_snapshot_json(&snap);
+        assert_eq!(ints(&execute(&restored, &c(&["DBSIZE"]))), 6);
+        for key in ["k:str", "k:hash", "k:list", "k:set", "k:zset"] {
+            let ttl = ints(&execute(&restored, &c(&["TTL", key])));
+            assert!((2990..=3000).contains(&ttl), "{key} ttl={ttl}");
+        }
+        assert_eq!(ints(&execute(&restored, &c(&["TTL", "forever"]))), -1);
+    }
+
+    #[test]
+    fn a_pre_0_43_2_snapshot_still_restores_its_string_ttls() {
+        // Written by the version that kept the deadline inside the string
+        // entry: TTLs live in each string's `exp`, and there is no `x`
+        // section at all.
+        let now = now_secs();
+        let legacy = format!(
+            r#"{{"s":[{{"k":"live","v":"a","exp":{}}},
+                     {{"k":"plain","v":"b","exp":null}},
+                     {{"k":"dead","v":"c","exp":{}}}],
+                "h":[{{"k":"h","m":{{"f":"v"}}}}],"l":[],"t":[],"z":[]}}"#,
+            now + 2000,
+            now - 10
+        );
+        let store = OxiMemStore::new();
+        store.load_snapshot_json(&legacy);
+
+        let ttl = ints(&execute(&store, &c(&["TTL", "live"])));
+        assert!((1990..=2000).contains(&ttl), "ttl={ttl}");
+        assert_eq!(ints(&execute(&store, &c(&["TTL", "plain"]))), -1);
+        assert_eq!(ints(&execute(&store, &c(&["EXISTS", "dead"]))), 0);
+        assert_eq!(ints(&execute(&store, &c(&["EXISTS", "h"]))), 1);
+    }
+
+    #[test]
+    fn the_sweeper_collects_expired_keys_of_every_type() {
+        let store = OxiMemStore::new();
+        one_of_each(&store);
+        for key in ["k:str", "k:hash", "k:list", "k:set", "k:zset"] {
+            execute(&store, &c(&["PEXPIRE", key, "1"]));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let swept = store.sweep_expired();
+        assert_eq!(swept.len(), 5, "swept {swept:?}");
+        assert_eq!(ints(&execute(&store, &c(&["DBSIZE"]))), 0);
+        // And the deadlines go with them rather than accumulating.
+        assert!(store.expires.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expireat_in_the_past_deletes_a_key_of_any_type() {
+        let store = OxiMemStore::new();
+        one_of_each(&store);
+        let past = (now_secs() - 60).to_string();
+        for key in ["k:hash", "k:list", "k:set", "k:zset"] {
+            assert_eq!(ints(&execute(&store, &c(&["EXPIREAT", key, &past]))), 1, "{key}");
+            assert_eq!(ints(&execute(&store, &c(&["EXISTS", key]))), 0, "{key}");
+        }
+        assert_eq!(ints(&execute(&store, &c(&["DBSIZE"]))), 1);
+    }
 
     #[test]
     fn test_glob_to_regex() {
